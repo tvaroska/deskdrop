@@ -1,0 +1,253 @@
+openapi: 3.0.3
+info:
+  title: DeskDrop Control Plane API
+  version: 1.0.0
+  description: >-
+    Wire-compatible relay API exposed identically under /v1/* and /desktop/v1/*.
+    Backed by an atomic JSON FileStore and hot-reloadable RECIPES_URI catalog.
+servers:
+  - url: https://relay.example.com
+  - url: https://relay.example.com/desktop
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    APIError:
+      type: object
+      required: [ok, error]
+      properties:
+        ok:
+          type: boolean
+          enum: [false]
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+    FieldRule:
+      type: object
+      properties:
+        selector: { type: string }
+        closest: { type: string }
+        attr: { type: string }
+        regex: { type: string }
+        group: { type: integer }
+        fallback_regex: { type: string }
+        fallback_group: { type: integer }
+        parse: { type: string, enum: ["", string, number, float] }
+        prefix: { type: string }
+        suffix: { type: string }
+        max_chars: { type: integer }
+        optional: { type: boolean }
+    ItemRule:
+      type: object
+      required: [container, fields]
+      properties:
+        container: { type: string }
+        anchor_closest: { type: string }
+        dedupe_by: { type: string }
+        limit: { type: integer }
+        fields:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/FieldRule"
+    Recipe:
+      type: object
+      required: [name, topic, steps]
+      properties:
+        name: { type: string }
+        topic: { type: string }
+        description: { type: string }
+        allow_computer_use_fallback: { type: boolean, default: true }
+        allowed_domains:
+          type: array
+          items: { type: string }
+        steps:
+          type: array
+          items:
+            type: object
+            required: [id]
+            properties:
+              id: { type: string }
+              url: { type: string }
+              match_tab_url: { type: string }
+              click_if_present: { type: string }
+              fields:
+                type: object
+                additionalProperties:
+                  $ref: "#/components/schemas/FieldRule"
+              items:
+                $ref: "#/components/schemas/ItemRule"
+    FallbackAction:
+      type: object
+      required: [action]
+      properties:
+        action: { type: string, enum: [scroll, wait, click] }
+        selector: { type: string }
+        delta_y: { type: integer }
+        wait_ms: { type: integer, minimum: 1, maximum: 5000 }
+    FallbackPlan:
+      type: object
+      required: [allowed_domain, target_url, actions]
+      properties:
+        allowed_domain: { type: string }
+        target_url: { type: string }
+        step_id: { type: string }
+        reason: { type: string }
+        actions:
+          type: array
+          minItems: 1
+          maxItems: 3
+          items:
+            $ref: "#/components/schemas/FallbackAction"
+    RecipePatchProposal:
+      type: object
+      required: [id, recipe_name, status, verified, proposed_recipe]
+      properties:
+        id: { type: string }
+        recipe_name: { type: string }
+        task_id: { type: string }
+        diagnostic_id: { type: string }
+        status: { type: string, enum: [pending, approved, rejected] }
+        rationale: { type: string }
+        verified: { type: boolean }
+        iterations: { type: integer }
+        proposed_recipe:
+          $ref: "#/components/schemas/Recipe"
+paths:
+  /healthz:
+    get:
+      summary: Relay health probe
+      responses:
+        "200":
+          description: Healthy
+  /v1/recipes:
+    get:
+      summary: List approved declarative recipes from RECIPES_URI
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Approved recipes
+  /v1/tasks:
+    post:
+      summary: Enqueue an extraction task for an approved recipe
+      security: [{ bearerAuth: [] }]
+      responses:
+        "201": { description: Created }
+        "403": { description: Unapproved recipe or target URL }
+        "422": { description: Validation or air-gap violation }
+    get:
+      summary: List tasks
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Task list }
+  /v1/tasks/claim:
+    post:
+      summary: Lease next runnable extraction or fallback task
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Claimed task or empty response }
+  /v1/tasks/{id}/complete:
+    post:
+      summary: Submit validated DropReport and complete task
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Completed }
+  /v1/tasks/{id}/fail:
+    post:
+      summary: Report failure + optional scrubbed debug.zip (triggers healer strictly on SELECTOR_DRIFT)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Triaged }
+        "422": { description: Air-gap violation }
+  /v1/tasks/{id}/fallback-result:
+    post:
+      summary: Submit scrubbed Tier-2 fallback snapshot for Tier-1 offline extraction
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Processed }
+  /v1/proposals:
+    get:
+      summary: List verified recipe patch proposals
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Proposal list }
+  /v1/proposals/{id}/approve:
+    post:
+      summary: Approve a verified proposal and write back atomically to RECIPES_URI
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Approved and written back }
+        "403": { description: Domain pivot blocked }
+        "409": { description: Proposal already reviewed }
+        "422": { description: Proposal unverified or air-gap violation }
+  /v1/proposals/{id}/reject:
+    post:
+      summary: Reject a pending proposal without touching RECIPES_URI
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Rejected }
+  /v1/drops:
+    post:
+      summary: Upload a structured DropReport
+      security: [{ bearerAuth: [] }]
+      responses:
+        "201": { description: Stored }
+    get:
+      summary: List stored drops
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Drop list }
+  /v1/messages:
+    get:
+      summary: Read message board inbox
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Message list }
+    post:
+      summary: Post air-gapped message
+      security: [{ bearerAuth: [] }]
+      responses:
+        "201": { description: Posted }
+  /v1/breakers:
+    get:
+      summary: List open per-domain AUTH_EXPIRED circuit breakers
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Breaker list }
+  /v1/status:
+    get:
+      summary: Relay version, worker readiness, pending tasks, and pending proposals summary
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Status summary }

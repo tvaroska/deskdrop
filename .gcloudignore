@@ -1,0 +1,10 @@
+.git/
+dist/
+bin/
+*.exe
+*.zip
+.env
+.env.*
+deskdrop.json
+deskdrop.local.json
+!.gitignore

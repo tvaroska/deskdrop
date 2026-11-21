@@ -1,0 +1,197 @@
+steps:
+  - name: "golang:1.26-bookworm"
+    id: "test-and-cross-build"
+    waitFor: ["-"]
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+        CB_TAG="${TAG_NAME}"
+        CB_MANUAL_TAG="${_TAG}"
+        VERSION_STR="$${CB_TAG:-$${CB_MANUAL_TAG:-${_VERSION}}}"
+        test -z "$$(gofmt -s -l .)"
+        go vet ./...
+        go test -race ./...
+        mkdir -p dist/latest
+        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=$${VERSION_STR}" -o dist/latest/deskdrop ./cmd/deskdrop
+        CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=$${VERSION_STR}" -o dist/latest/deskdrop.exe ./cmd/deskdrop
+        cp deskdrop.example.json dist/latest/deskdrop.example.json
+        (cd dist/latest && sha256sum deskdrop deskdrop.exe deskdrop.example.json > SHA256SUMS.txt)
+        cp -r dist/latest "dist/$${VERSION_STR}"
+
+  - name: "gcr.io/cloud-builders/docker"
+    id: "pull-cache"
+    waitFor: ["-"]
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        docker pull "${_REGION}-docker.pkg.dev/${PROJECT_ID}/containers/deskdrop:latest" || true
+
+  - name: "gcr.io/cloud-builders/docker"
+    id: "docker-build-and-push"
+    waitFor:
+      - "test-and-cross-build"
+      - "pull-cache"
+    entrypoint: "bash"
+    env:
+      - DOCKER_BUILDKIT=1
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+        IMAGE_REPO="${_REGION}-docker.pkg.dev/${PROJECT_ID}/containers/deskdrop"
+        CB_TAG="${TAG_NAME}"
+        CB_MANUAL_TAG="${_TAG}"
+        CB_COMMIT="${COMMIT_SHA}"
+        RESOLVED_TAG="$${CB_TAG:-$${CB_MANUAL_TAG}}"
+        BUILD_TAG="$${RESOLVED_TAG:-$${CB_COMMIT:-${_VERSION}}}"
+
+        docker build \
+          --cache-from "$${IMAGE_REPO}:latest" \
+          --build-arg "VERSION=$${BUILD_TAG}" \
+          --target server \
+          -t "deskdrop:ci" \
+          -t "$${IMAGE_REPO}:$${BUILD_TAG}" \
+          -t "$${IMAGE_REPO}:latest" \
+          .
+
+  - name: "gcr.io/cloud-builders/docker"
+    id: "verify-nonroot-and-healthcheck"
+    waitFor:
+      - "docker-build-and-push"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+        USER_CFG="$$(docker image inspect --format '{{.Config.User}}' deskdrop:ci)"
+        test "$${USER_CFG}" = "65532:65532"
+        docker run -d --name deskdrop-smoke \
+          -e STORE_BACKEND=memory \
+          -e STORAGE_BACKEND=memory \
+          -e HEALER_ENABLED=false \
+          -e ADMIN_TOKEN=ci-smoke-token \
+          deskdrop:ci
+        trap "docker rm -f deskdrop-smoke >/dev/null 2>&1 || true" EXIT
+        for i in $$(seq 1 20); do
+          if docker run --rm --network="container:deskdrop-smoke" --entrypoint curl gcr.io/cloud-builders/docker -fsS http://127.0.0.1:8080/healthz >/dev/null \
+            && docker run --rm --network="container:deskdrop-smoke" --entrypoint curl gcr.io/cloud-builders/docker -fsS http://127.0.0.1:8080/desktop/healthz >/dev/null; then
+            echo "Health probes passed on attempt $$i"
+            exit 0
+          fi
+          sleep 1
+        done
+        docker logs deskdrop-smoke || true
+        exit 1
+
+  - name: "gcr.io/cloud-builders/docker"
+    id: "trivy-vulnerability-scan"
+    waitFor:
+      - "docker-build-and-push"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+        docker run --rm \
+          -v /var/run/docker.sock:/var/run/docker.sock \
+          aquasec/trivy:0.58.1 image \
+          --scanners vuln \
+          --severity HIGH,CRITICAL \
+          --ignore-unfixed \
+          --exit-code 1 \
+          deskdrop:ci
+
+  - name: "gcr.io/cloud-builders/docker"
+    id: "push-release-image"
+    waitFor:
+      - "verify-nonroot-and-healthcheck"
+      - "trivy-vulnerability-scan"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+        IMAGE_REPO="${_REGION}-docker.pkg.dev/${PROJECT_ID}/containers/deskdrop"
+        CB_TAG="${TAG_NAME}"
+        CB_MANUAL_TAG="${_TAG}"
+        CB_COMMIT="${COMMIT_SHA}"
+        RESOLVED_TAG="$${CB_TAG:-$${CB_MANUAL_TAG}}"
+        BUILD_TAG="$${RESOLVED_TAG:-$${CB_COMMIT:-${_VERSION}}}"
+
+        if [[ -n "$${RESOLVED_TAG}" || "${_PUSH}" == "true" ]]; then
+          docker push "$${IMAGE_REPO}:$${BUILD_TAG}"
+          if [[ "$${RESOLVED_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            docker push "$${IMAGE_REPO}:latest"
+          fi
+        else
+          echo "Skipping Artifact Registry push (TAG_NAME and _TAG are empty, _PUSH=${_PUSH})"
+        fi
+
+  - name: "${_REGION}-docker.pkg.dev/${PROJECT_ID}/containers/ops-flux-cli:v2.4.0"
+    id: "flux-reconcile"
+    waitFor:
+      - "push-release-image"
+    args:
+      - "${TAG_NAME}"
+      - "${_TAG}"
+      - "deskdrop"
+      - "deskdrop"
+
+  - id: ghcr-token
+    name: "gcr.io/google.com/cloudsdktool/google-cloud-cli:slim"
+    waitFor:
+      - "push-release-image"
+    allowFailure: true
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+        CB_TAG="${TAG_NAME}"
+        CB_MANUAL_TAG="${_TAG}"
+        RESOLVED_TAG="$${CB_TAG:-$${CB_MANUAL_TAG}}"
+        if [[ ! "$${RESOLVED_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          exit 0
+        fi
+        if ! gcloud secrets versions access latest --secret=ghcr-push-token --project=${PROJECT_ID} > /workspace/.ghcr-token; then
+          rm -f /workspace/.ghcr-token
+          exit 0
+        fi
+
+  - id: mirror-to-ghcr
+    name: "gcr.io/cloud-builders/docker"
+    waitFor:
+      - "ghcr-token"
+    allowFailure: true
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+        if [[ ! -s /workspace/.ghcr-token ]]; then
+          rm -f /workspace/.ghcr-token
+          exit 0
+        fi
+        CB_TAG="${TAG_NAME}"
+        CB_MANUAL_TAG="${_TAG}"
+        RESOLVED_TAG="$${CB_TAG:-$${CB_MANUAL_TAG}}"
+        IMAGE_REPO="${_REGION}-docker.pkg.dev/${PROJECT_ID}/containers/deskdrop"
+        docker login ghcr.io -u tvaroska --password-stdin < /workspace/.ghcr-token
+        rm -f /workspace/.ghcr-token
+        docker pull "$${IMAGE_REPO}:$${RESOLVED_TAG}"
+        docker tag "$${IMAGE_REPO}:$${RESOLVED_TAG}" "ghcr.io/tvaroska/deskdrop:$${RESOLVED_TAG}"
+        docker push "ghcr.io/tvaroska/deskdrop:$${RESOLVED_TAG}"
+
+substitutions:
+  _REGION: "us-central1"
+  _VERSION: "v1.0.0"
+  _TAG: ""
+  _PUSH: "auto"
+
+options:
+  dynamicSubstitutions: true
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8

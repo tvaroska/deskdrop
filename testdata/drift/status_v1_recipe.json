@@ -1,0 +1,45 @@
+{
+  "name": "service-status-board",
+  "topic": "ops-status",
+  "description": "Extracts service health rows and summary uptime from a declarative status dashboard.",
+  "allow_computer_use_fallback": true,
+  "steps": [
+    {
+      "id": "status_overview",
+      "url": "https://status.example.com/overview",
+      "match_tab_url": "status.example.com/overview",
+      "reuse_open_tab": false,
+      "wait_selector": ".metric-row",
+      "fields": {
+        "overall_status": {
+          "selector": ".banner-state"
+        },
+        "active_incidents": {
+          "selector": ".incident-count",
+          "parse": "number"
+        }
+      },
+      "items": {
+        "container": ".metric-row",
+        "dedupe_by": "service",
+        "limit": 20,
+        "fields": {
+          "service": {
+            "selector": ".svc-name"
+          },
+          "state": {
+            "selector": ".svc-state"
+          },
+          "uptime_pct": {
+            "selector": ".svc-uptime",
+            "parse": "float"
+          }
+        }
+      },
+      "expect": {
+        "min_items": 3,
+        "required_fields": ["overall_status"]
+      }
+    }
+  ]
+}

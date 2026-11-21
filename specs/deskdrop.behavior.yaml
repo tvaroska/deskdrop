@@ -1,0 +1,69 @@
+contract_version: "1.0"
+service: deskdrop
+invariants:
+  - "cmd/deskdrop links zero non-stdlib Go packages (CGO_ENABLED=0)"
+  - "eval_js is disallowed in Recipe schemas (strict unknown-field rejection)"
+  - "Happy-path extraction emits zero screenshots, zero HTML dumps, and zero LLM tokens"
+  - "Unapproved recipes or ad-hoc URLs outside RECIPES_URI return HTTP 403"
+  - "Tier-2 fallback tasks execute at most 3 safe actions (scroll, wait, click) on the allowlisted domain"
+  - "RecipePatchProposal write-back to RECIPES_URI requires explicit human approval and verified == true"
+
+state_machines:
+  task_lifecycle:
+    initial: pending
+    states: [pending, claimed, succeeded, failed_diagnostic, dead_letter]
+    transitions:
+      - from: pending
+        to: claimed
+        action: claim_next_task
+        requires:
+          - "next_run_at <= now"
+          - "domain breaker state != paused_auth"
+      - from: claimed
+        to: succeeded
+        action: complete_task
+        ensures:
+          - "drop record persisted atomically"
+          - "domain auth breaker cleared"
+      - from: claimed
+        to: pending
+        action: fail_task_auth_expired
+        requires:
+          - "triage.code == AUTH_EXPIRED"
+        ensures:
+          - "domain breaker set to paused_auth"
+          - "attempt counter not burned"
+      - from: claimed
+        to: failed_diagnostic
+        action: fail_task_selector_drift
+        requires:
+          - "triage.code == SELECTOR_DRIFT"
+        ensures:
+          - "scrubbed diagnostic zip persisted"
+          - "exception healer invoked only when allow_computer_use_fallback == true"
+      - from: claimed
+        to: dead_letter
+        action: fail_task_transient_exhausted
+        requires:
+          - "triage.code == CDP_TRANSIENT"
+          - "attempt >= max_attempts"
+
+  proposal_lifecycle:
+    initial: pending
+    states: [pending, approved, rejected]
+    transitions:
+      - from: pending
+        to: approved
+        action: approve_proposal
+        requires:
+          - "proposal.verified == true"
+          - "all proposed recipe domains match existing approved domains"
+          - "air-gap guard passes"
+        ensures:
+          - "RECIPES_URI updated atomically"
+          - "audit message recorded on /v1/messages"
+      - from: pending
+        to: rejected
+        action: reject_proposal
+        ensures:
+          - "RECIPES_URI untouched"

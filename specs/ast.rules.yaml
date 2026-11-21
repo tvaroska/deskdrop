@@ -1,0 +1,43 @@
+id: no-postgres-driver-import
+language: go
+severity: error
+message: "DeskDrop retired PostgreSQL in favor of atomic JSON FileStore (ADR-003); do not import lib/pq or database/sql."
+rule:
+  kind: import_spec
+  any:
+    - has:
+        pattern: '"github.com/lib/pq"'
+    - has:
+        pattern: '"database/sql"'
+metadata:
+  test_path: hygiene_test.go
+  invalid_examples:
+    - |
+      package p
+      import _ "github.com/lib/pq"
+  valid_examples:
+    - |
+      package p
+      import "encoding/json"
+---
+id: no-shell-command-injection
+language: go
+severity: error
+message: "Do not execute shell interpreters via exec.Command; invoke target binaries directly."
+rule:
+  any:
+    - pattern: exec.Command("sh", "-c", $$$)
+    - pattern: exec.Command("bash", "-c", $$$)
+    - pattern: exec.Command("cmd", "/C", $$$)
+metadata:
+  test_path: hygiene_test.go
+  invalid_examples:
+    - |
+      package p
+      import "os/exec"
+      func f() { _ = exec.Command("sh", "-c", "ls") }
+  valid_examples:
+    - |
+      package p
+      import "os/exec"
+      func f() { _ = exec.Command("google-chrome", "--no-first-run") }

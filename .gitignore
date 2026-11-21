@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+deskdrop.json
+deskdrop.local.json
+browser-drop.json
+browser-drop.local.json
+dist/
+bin/
+*.exe
+*.zip
+.DS_Store
+/tmp/

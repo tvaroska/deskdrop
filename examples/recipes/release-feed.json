@@ -1,0 +1,50 @@
+{
+  "name": "release-feed",
+  "topic": "releases",
+  "description": "Extracts recent release tags, publication dates, and download counts from a release feed.",
+  "allow_computer_use_fallback": true,
+  "defaults": {
+    "org": "example-org",
+    "repo": "example-repo"
+  },
+  "steps": [
+    {
+      "id": "releases",
+      "url": "https://releases.example.com/{{org}}/{{repo}}",
+      "match_tab_url": "releases.example.com/{{org}}/{{repo}}",
+      "reuse_open_tab": false,
+      "wait_selector": "article.release",
+      "click_if_present": "button[data-dismiss='cookie-banner']",
+      "wait_ms": 800,
+      "items": {
+        "container": "article.release",
+        "dedupe_by": "tag",
+        "limit": 10,
+        "fields": {
+          "tag": {
+            "selector": "a.release-tag",
+            "regex": "(v\\d+\\.\\d+\\.\\d+)"
+          },
+          "url": {
+            "selector": "a.release-tag",
+            "attr": "href",
+            "prefix": "https://releases.example.com"
+          },
+          "published_at": {
+            "selector": "time[datetime]",
+            "attr": "datetime"
+          },
+          "downloads": {
+            "selector": ".download-count",
+            "parse": "number",
+            "optional": true
+          }
+        }
+      },
+      "expect": {
+        "not_url_contains": ["/login"],
+        "min_items": 1
+      }
+    }
+  ]
+}

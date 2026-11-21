@@ -1,0 +1,10 @@
+{
+  "from": "desktop-worker",
+  "default_to": "agents",
+  "service_url": "https://relay.example.com/desktop",
+  "service_token": "REPLACE_WITH_DESKTOP_CLIENT_TOKEN",
+  "browser": "chrome",
+  "chrome_session": "Default",
+  "fallback_gate": "tray",
+  "send_error_bundle": true
+}

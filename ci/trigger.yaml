@@ -1,0 +1,24 @@
+# Cloud Build trigger definitions for DeskDrop (2nd-gen GitHub connection)
+#
+# Apply with:
+#   gcloud builds triggers import \
+#     --project=<PROJECT_ID> \
+#     --region=us-central1 \
+#     --source=ci/trigger.yaml
+name: deskdrop-tag
+description: Release test, cross-build, container scan, Artifact Registry push, and Flux GitOps rollout on vX.Y.Z tag
+filename: cloudbuild.yaml
+repositoryEventConfig:
+  repository: projects/sites-470716/locations/us-central1/connections/Github/repositories/tvaroska-deskdrop
+  push:
+    tag: ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$
+serviceAccount: projects/sites-470716/serviceAccounts/cloudbuild-gitops-sa@sites-470716.iam.gserviceaccount.com
+---
+name: deskdrop-main
+description: Continuous integration test and build verification on main branch (no release push)
+filename: cloudbuild.yaml
+repositoryEventConfig:
+  repository: projects/sites-470716/locations/us-central1/connections/Github/repositories/tvaroska-deskdrop
+  push:
+    branch: ^main$
+serviceAccount: projects/sites-470716/serviceAccounts/1076807043236-compute@developer.gserviceaccount.com

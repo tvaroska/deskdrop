@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+<head><title>Example Status v2</title></head>
+<body>
+  <main>
+    <header data-testid="global-health">All Systems Operational</header>
+    <span data-testid="open-incidents">0</span>
+    <section class="service-grid-v2">
+      <article class="service-card" data-service-id="gw">
+        <h3 class="card-title">API Gateway</h3>
+        <span class="badge-health">Operational</span>
+        <span data-kpi="uptime">99.99%</span>
+      </article>
+      <article class="service-card" data-service-id="relay">
+        <h3 class="card-title">Worker Relay</h3>
+        <span class="badge-health">Operational</span>
+        <span data-kpi="uptime">99.97%</span>
+      </article>
+      <article class="service-card" data-service-id="blob">
+        <h3 class="card-title">Blob Storage</h3>
+        <span class="badge-health">Operational</span>
+        <span data-kpi="uptime">99.91%</span>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

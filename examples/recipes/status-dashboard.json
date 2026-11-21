@@ -1,0 +1,47 @@
+{
+  "name": "status-dashboard",
+  "topic": "ops-status",
+  "description": "Extracts overall service health and per-component uptime from a status dashboard.",
+  "allow_computer_use_fallback": true,
+  "steps": [
+    {
+      "id": "overview",
+      "url": "https://status.example.com/overview",
+      "match_tab_url": "status.example.com",
+      "reuse_open_tab": true,
+      "wait_selector": "main",
+      "wait_ms": 1000,
+      "fields": {
+        "overall_status": {
+          "selector": "[data-testid='global-health']"
+        },
+        "active_incidents": {
+          "selector": "[data-testid='open-incidents']",
+          "parse": "number"
+        }
+      },
+      "items": {
+        "container": "article.service-card",
+        "dedupe_by": "service",
+        "limit": 25,
+        "fields": {
+          "service": {
+            "selector": "h3.card-title"
+          },
+          "state": {
+            "selector": "span.badge-health"
+          },
+          "uptime_pct": {
+            "selector": "span[data-kpi='uptime']",
+            "parse": "float"
+          }
+        }
+      },
+      "expect": {
+        "not_url_contains": ["/login", "/signin"],
+        "min_items": 1,
+        "required_fields": ["overall_status"]
+      }
+    }
+  ]
+}

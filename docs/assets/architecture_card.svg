@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="100%" height="100%">
+  <rect x="0" y="0" width="1600" height="900" fill="#F8FAFC"/>
+  <rect x="24" y="24" width="1552" height="852" rx="16" fill="#FFFFFF" stroke="#0F172A" stroke-width="2.5"/>
+
+  <rect x="24" y="24" width="1552" height="108" rx="14" fill="#0F172A"/>
+  <rect x="24" y="100" width="1552" height="32" fill="#0F172A"/>
+  <text x="64" y="90" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="36" font-weight="800" fill="#FFFFFF">DeskDrop</text>
+  <text x="278" y="89" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="24" font-weight="600" fill="#94A3B8">$0 Deterministic Extraction, Exception-Only Healing</text>
+
+  <!-- Desktop Worker Zone -->
+  <rect x="64" y="168" width="440" height="672" rx="16" fill="#EFF6FF" stroke="#2563EB" stroke-width="3"/>
+  <rect x="64" y="168" width="440" height="76" rx="14" fill="#DBEAFE"/>
+  <rect x="64" y="220" width="440" height="24" fill="#DBEAFE"/>
+  <rect x="64" y="243" width="440" height="3" fill="#2563EB"/>
+  <text x="284" y="218" text-anchor="middle" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="25" font-weight="800" fill="#1E3A8A">Desktop Worker (0 Deps)</text>
+
+  <rect x="96" y="276" width="376" height="118" rx="12" fill="#ECFDF5" stroke="#10B981" stroke-width="2.5"/>
+  <text x="284" y="324" text-anchor="middle" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="22" font-weight="800" fill="#065F46">Declarative CDP Extractor</text>
+  <text x="284" y="362" text-anchor="middle" font-family="'JetBrains Mono', 'Fira Code', monospace" font-size="19" font-weight="700" fill="#047857">$0 tokens · 0 screenshots</text>
+
+  <rect x="96" y="424" width="376" height="118" rx="12" fill="#FFFFFF" stroke="#60A5FA" stroke-width="2.5"/>
+  <text x="284" y="472" text-anchor="middle" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="22" font-weight="800" fill="#1E3A8A">TargetDriver Port</text>
+  <text x="284" y="510" text-anchor="middle" font-family="'JetBrains Mono', 'Fira Code', monospace" font-size="19" font-weight="700" fill="#2563EB">CDP today · UIA next</text>
+
+  <rect x="96" y="572" width="376" height="118" rx="12" fill="#FFFBEB" stroke="#F59E0B" stroke-width="2.5"/>
+  <text x="284" y="620" text-anchor="middle" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="22" font-weight="800" fill="#92400E">Privacy Scrubber + Gate</text>
+  <text x="284" y="658" text-anchor="middle" font-family="'JetBrains Mono', 'Fira Code', monospace" font-size="19" font-weight="700" fill="#B45309">--fallback-gate=auto|tray</text>
+
+  <rect x="96" y="718" width="376" height="90" rx="12" fill="#F1F5F9" stroke="#64748B" stroke-width="2"/>
+  <text x="284" y="772" text-anchor="middle" font-family="'JetBrains Mono', 'Fira Code', monospace" font-size="19" font-weight="700" fill="#334155">Stateless scratch-tab close</text>
+
+  <!-- Arrows Desktop <-> Relay -->
+  <rect x="504" y="330" width="70" height="6" fill="#10B981"/>
+  <polygon points="572,320 594,333 572,346" fill="#10B981"/>
+  <text x="548" y="314" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-size="17" font-weight="800" fill="#047857">JSON</text>
+
+  <rect x="504" y="626" width="70" height="6" fill="#D97706"/>
+  <polygon points="572,616 594,629 572,642" fill="#D97706"/>
+  <text x="548" y="610" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-size="17" font-weight="800" fill="#B45309">DRIFT</text>
+
+  <!-- Relay Control Plane Zone -->
+  <rect x="596" y="168" width="440" height="672" rx="16" fill="#0F172A" stroke="#F59E0B" stroke-width="3.5"/>
+  <rect x="596" y="168" width="440" height="76" rx="14" fill="#1E293B"/>
+  <rect x="596" y="220" width="440" height="24" fill="#1E293B"/>
+  <rect x="596" y="243" width="440" height="3" fill="#F59E0B"/>
+  <text x="816" y="218" text-anchor="middle" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="25" font-weight="800" fill="#FDE68A">Relay Server (64Mi)</text>
+
+  <rect x="628" y="276" width="376" height="118" rx="12" fill="#1E293B" stroke="#10B981" stroke-width="2.5"/>
+  <text x="816" y="324" text-anchor="middle" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="22" font-weight="800" fill="#A7F3D0">Atomic JSON FileStore</text>
+  <text x="816" y="362" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-size="19" font-weight="700" fill="#34D399">/data/state.json · 0 Postgres</text>
+
+  <rect x="628" y="424" width="376" height="118" rx="12" fill="#1E293B" stroke="#60A5FA" stroke-width="2.5"/>
+  <text x="816" y="472" text-anchor="middle" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="22" font-weight="800" fill="#BFDBFE">Hot-Reload RECIPES_URI</text>
+  <text x="816" y="510" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-size="19" font-weight="700" fill="#93C5FD">403 unapproved URLs</text>
+
+  <rect x="628" y="572" width="376" height="118" rx="12" fill="#1E293B" stroke="#F59E0B" stroke-width="2.5"/>
+  <text x="816" y="620" text-anchor="middle" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="22" font-weight="800" fill="#FDE68A">Dual Wire API + Breakers</text>
+  <text x="816" y="658" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-size="19" font-weight="700" fill="#FCD34D">/v1/* + /desktop/v1/*</text>
+
+  <rect x="628" y="718" width="376" height="90" rx="12" fill="#1E293B" stroke="#A78BFA" stroke-width="2.5"/>
+  <text x="816" y="772" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-size="19" font-weight="700" fill="#DDD6FE">Approve Gate -> Write-Back</text>
+
+  <!-- Arrow Relay <-> Healer -->
+  <rect x="1036" y="626" width="70" height="6" fill="#7C3AED"/>
+  <polygon points="1104,616 1126,629 1104,642" fill="#7C3AED"/>
+
+  <rect x="1056" y="760" width="70" height="6" fill="#7C3AED"/>
+  <polygon points="1058,750 1036,763 1058,776" fill="#7C3AED"/>
+
+  <!-- Exception-Only ADK Healer Zone -->
+  <rect x="1128" y="168" width="408" height="672" rx="16" fill="#F5F3FF" stroke="#7C3AED" stroke-width="3"/>
+  <rect x="1128" y="168" width="408" height="76" rx="14" fill="#EDE9FE"/>
+  <rect x="1128" y="220" width="408" height="24" fill="#EDE9FE"/>
+  <rect x="1128" y="243" width="408" height="3" fill="#7C3AED"/>
+  <text x="1332" y="218" text-anchor="middle" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="25" font-weight="800" fill="#5B21B6">Exception Healer (adk-go)</text>
+
+  <rect x="1160" y="276" width="344" height="118" rx="12" fill="#FFFFFF" stroke="#8B5CF6" stroke-width="2.5"/>
+  <text x="1332" y="324" text-anchor="middle" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="22" font-weight="800" fill="#4C1D95">Tier 1: Offline Snapshot</text>
+  <text x="1332" y="362" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-size="18" font-weight="700" fill="#6D28D9">screenshot + dom.html</text>
+
+  <rect x="1160" y="424" width="344" height="118" rx="12" fill="#FFFFFF" stroke="#8B5CF6" stroke-width="2.5"/>
+  <text x="1332" y="472" text-anchor="middle" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="22" font-weight="800" fill="#4C1D95">Tier 2: Bounded Re-Open</text>
+  <text x="1332" y="510" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-size="18" font-weight="700" fill="#6D28D9">&lt;= 3 safe actions</text>
+
+  <rect x="1160" y="572" width="344" height="118" rx="12" fill="#ECFDF5" stroke="#10B981" stroke-width="2.5"/>
+  <text x="1332" y="620" text-anchor="middle" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="22" font-weight="800" fill="#065F46">LoopAgent (Max 3)</text>
+  <text x="1332" y="658" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-size="18" font-weight="700" fill="#047857">Pure-Go HTML Verifier</text>
+
+  <rect x="1160" y="718" width="344" height="90" rx="12" fill="#FFFFFF" stroke="#7C3AED" stroke-width="2.5"/>
+  <text x="1332" y="772" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-size="19" font-weight="700" fill="#5B21B6">Verified Patch Proposal</text>
+</svg>
