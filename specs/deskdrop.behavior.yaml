@@ -3,8 +3,10 @@ service: deskdrop
 invariants:
   - "cmd/deskdrop links zero non-stdlib Go packages (CGO_ENABLED=0)"
   - "eval_js is disallowed in Recipe schemas (strict unknown-field rejection)"
-  - "Happy-path extraction emits zero screenshots, zero HTML dumps, and zero LLM tokens"
+  - "Happy-path extraction emits zero screenshots, zero HTML dumps, zero AXTree dumps, and zero LLM tokens"
   - "Unapproved recipes or ad-hoc URLs outside RECIPES_URI return HTTP 403"
+  - "Declarative pagination executes at most 20 pages, remains on the step's allowlisted domain, and halts when Next is disabled or yields zero new items/rows"
+  - "Exception-route AXTree snapshots redact sensitive input values and flag unlabelled <canvas>/WebGL blind spots"
   - "Tier-2 fallback tasks execute at most 3 safe actions (scroll, wait, click) on the allowlisted domain"
   - "RecipePatchProposal write-back to RECIPES_URI requires explicit human approval and verified == true"
 

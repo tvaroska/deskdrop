@@ -145,6 +145,7 @@ type Step struct {
 	Selectors      map[string]string    `json:"selectors,omitempty"`
 	Fields         map[string]FieldRule `json:"fields,omitempty"`
 	Items          *ItemRule            `json:"items,omitempty"`
+	Pagination     *PaginationRule      `json:"pagination,omitempty"`
 	IncludeTables  *bool                `json:"include_tables,omitempty"`
 	IncludeCards   *bool                `json:"include_cards,omitempty"`
 	MaxTextChars   int                  `json:"max_text_chars,omitempty"`
@@ -185,17 +186,18 @@ type TableData struct {
 
 // StepResult holds structured declarative DOM output from a single recipe step.
 type StepResult struct {
-	StepID      string            `json:"step_id"`
-	Title       string            `json:"title"`
-	URL         string            `json:"url"`
-	ReusedTab   bool              `json:"reused_tab,omitempty"`
-	Headings    []string          `json:"headings,omitempty"`
-	Metrics     []MetricPair      `json:"metrics,omitempty"`
-	Selectors   map[string]string `json:"selectors,omitempty"`
-	Fields      map[string]any    `json:"fields,omitempty"`
-	Items       []map[string]any  `json:"items,omitempty"`
-	Tables      []TableData       `json:"tables,omitempty"`
-	TextExcerpt string            `json:"text_excerpt,omitempty"`
+	StepID       string            `json:"step_id"`
+	Title        string            `json:"title"`
+	URL          string            `json:"url"`
+	ReusedTab    bool              `json:"reused_tab,omitempty"`
+	PagesVisited int               `json:"pages_visited,omitempty"`
+	Headings     []string          `json:"headings,omitempty"`
+	Metrics      []MetricPair      `json:"metrics,omitempty"`
+	Selectors    map[string]string `json:"selectors,omitempty"`
+	Fields       map[string]any    `json:"fields,omitempty"`
+	Items        []map[string]any  `json:"items,omitempty"`
+	Tables       []TableData       `json:"tables,omitempty"`
+	TextExcerpt  string            `json:"text_excerpt,omitempty"`
 }
 
 // DropReport is the top-level structured extraction payload delivered to the relay.
@@ -308,6 +310,13 @@ func ResolveRecipe(r Recipe, cliVars map[string]string) (Recipe, error) {
 			}
 			ir.Fields = resolvedFields
 			s.Items = &ir
+		}
+		if s.Pagination != nil {
+			resolvedPag, err := resolvePaginationRule(s.ID, s.Pagination, sub)
+			if err != nil {
+				return Recipe{}, err
+			}
+			s.Pagination = resolvedPag
 		}
 		steps[i] = s
 	}

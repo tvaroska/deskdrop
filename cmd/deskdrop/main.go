@@ -72,6 +72,8 @@ func run(args []string) error {
 		return cmdRun(args[1:])
 	case "sync":
 		return cmdSync(args[1:])
+	case "schedule":
+		return cmdSchedule(args[1:])
 	case "status":
 		return cmdStatus(args[1:])
 	case "update":
@@ -86,7 +88,8 @@ func printUsage() {
 
 Usage:
   deskdrop tray         [--interval 20s] [--fallback-gate auto|tray] [--cdp <url>] [--config <path>] [--console]
-  deskdrop sync         [--interval 0s] [--max-tasks 0] [--fallback-gate auto|tray] [--cdp <url>] [--config <path>]
+  deskdrop sync         [--interval 0s] [--max-tasks 0] [--fallback-gate auto|tray] [--quiet-cdp] [--hide-console] [--cdp <url>] [--config <path>]
+  deskdrop schedule     <install|uninstall|status> [--every 15m] [--mode sync|logon] [--task-name DeskDropSync] [--dry-run]
   deskdrop run          <recipe-file.json|approved-name> [--var key=val ...] [--to <agents>] [--dry-run]
   deskdrop recipes      [--config <path>]
   deskdrop status       [--cdp <url>] [--config <path>]
@@ -290,8 +293,13 @@ func cmdSync(args []string) error {
 	interval := fs.Duration("interval", 0, "Poll interval for continuous worker mode (0 = drain once)")
 	maxTasks := fs.Int("max-tasks", 0, "Maximum tasks to execute before exiting (0 = unlimited)")
 	fallbackGate := fs.String("fallback-gate", "", "Tier-2 fallback gate (auto|tray)")
+	quietCDP := fs.Bool("quiet-cdp", false, "Never prompt Chrome 144+ DevToolsActivePort; exit 0 cleanly if browser is closed")
+	hideConsole := fs.Bool("hide-console", false, "Hide console window on Windows (for Task Scheduler runs)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *hideConsole {
+		hideConsoleWindow()
 	}
 
 	cfg, err := loadConfig(*cfgPath)
@@ -327,8 +335,18 @@ func cmdSync(args []string) error {
 	drv := cdp.NewDriver(pool, cfg)
 	approver := makeFallbackApprover(cfg.NormalizedFallbackGate())
 
-	// Single startup attempt for explicit CLI sync.
-	_, _ = pool.Acquire(ctx, cfg.CDPURL, cfg.UserDataDir)
+	if *quietCDP {
+		conn, _ := pool.ProbeQuiet(ctx, cfg.CDPURL)
+		if !conn && *interval <= 0 {
+			ws := collectWorkerStatus(ctx, drv, cfg, hostLabel, false, "scheduled-sync", "")
+			_ = svcClient.ReportWorkerStatus(ctx, ws)
+			fmt.Println("Browser not connected on quiet CDP endpoint; reported idle heartbeat.")
+			return nil
+		}
+	} else {
+		// Single startup attempt for explicit interactive CLI sync.
+		_, _ = pool.Acquire(ctx, cfg.CDPURL, cfg.UserDataDir)
+	}
 
 	processed := 0
 	for {

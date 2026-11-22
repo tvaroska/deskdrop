@@ -56,6 +56,15 @@ components:
           type: object
           additionalProperties:
             $ref: "#/components/schemas/FieldRule"
+    PaginationRule:
+      type: object
+      required: [next_selector]
+      properties:
+        next_selector: { type: string }
+        max_pages: { type: integer, minimum: 1, maximum: 20, default: 3 }
+        wait_ms: { type: integer, minimum: 0, maximum: 10000, default: 600 }
+        wait_selector: { type: string }
+        stop_on_no_new: { type: boolean, default: true }
     Recipe:
       type: object
       required: [name, topic, steps]
@@ -83,6 +92,8 @@ components:
                   $ref: "#/components/schemas/FieldRule"
               items:
                 $ref: "#/components/schemas/ItemRule"
+              pagination:
+                $ref: "#/components/schemas/PaginationRule"
     FallbackAction:
       type: object
       required: [action]

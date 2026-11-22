@@ -5,13 +5,13 @@
 - The relay uses an atomic JSON `FileStore` (`/data/state.json`), never PostgreSQL or `github.com/lib/pq`.
 
 ## 2. Declarative Extraction Only & Approved Use-Cases (`RECIPES_URI`)
-- `eval_js` is retired completely (`contract.ParseJSONStrict` hard-rejects unknown fields). All extraction uses declarative `selectors`, `fields` (`FieldRule`), and `items` (`ItemRule`) evaluated identically in browser JS and pure Go (`internal/verify`).
+- `eval_js` is retired completely (`contract.ParseJSONStrict` hard-rejects unknown fields). All extraction uses declarative `selectors`, `fields` (`FieldRule`), `items` (`ItemRule`), and bounded `pagination` (`PaginationRule`, `1..20` pages on the same allowlisted domain) evaluated identically in browser JS and pure Go (`internal/verify`).
 - Unapproved recipes or ad-hoc URLs outside `RECIPES_URI` are rejected with `HTTP 403`.
 
 ## 3. Privacy-Scrubbed Exception Diagnostics & Stateless Tabs
-- Happy-path runs capture `0` screenshots, `0` HTML dumps, and consume `$0` LLM tokens.
-- On failure, `<script>`, `<style>`, `<svg>`, `<noscript>`, `<input value=...>`, and `<textarea>` contents are scrubbed from `dom.html`, `contract.EnforceAirGap` runs on both client and server (`HTTP 422`), and every scratch tab closes immediately.
-- Passive background probes must never re-dial Chrome 144+ `DevToolsActivePort` without an explicit user reconnect (single-attempt approval latch).
+- Happy-path runs capture `0` screenshots, `0` HTML dumps, `0` `AXTree` dumps, and consume `$0` LLM tokens.
+- On failure, `<script>`, `<style>`, `<svg>`, `<noscript>`, `<input value=...>`, and `<textarea>` contents are scrubbed from `dom.html`, editable input values in `axtree.txt` (`Accessibility.getFullAXTree`) are redacted to `[REDACTED]`, `contract.EnforceAirGap` runs on both client and server (`HTTP 422`), and every scratch tab closes immediately.
+- Passive background probes and scheduled `deskdrop sync --quiet-cdp` runs must never re-dial Chrome 144+ `DevToolsActivePort` without an explicit user reconnect (single-attempt approval latch).
 
 ## 4. Bounded Exception Healing & Human Approval Gate
 - `adk-go` runs strictly on `SELECTOR_DRIFT` when `allow_computer_use_fallback` is `true`.

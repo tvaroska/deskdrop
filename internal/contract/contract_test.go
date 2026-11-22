@@ -101,3 +101,117 @@ func TestClassifyExtractionError(t *testing.T) {
 		t.Fatalf("expected FALLBACK_DECLINED, got %+v", got)
 	}
 }
+
+func TestFormatCompactAXTreeRedactsInputsAndDetectsCanvasBlindSpot(t *testing.T) {
+	raw := []byte(`{
+		"nodes": [
+			{"nodeId": "1", "role": {"value": "RootWebArea"}, "name": {"value": "Portal"}, "childIds": ["2", "3", "4", "5"]},
+			{"nodeId": "2", "ignored": true, "role": {"value": "generic"}, "childIds": ["6"]},
+			{"nodeId": "6", "role": {"value": "heading"}, "name": {"value": "Overview"}, "properties": [{"name": "level", "value": {"value": 1}}], "childIds": ["7"]},
+			{"nodeId": "7", "role": {"value": "StaticText"}, "name": {"value": "Overview"}, "childIds": ["8"]},
+			{"nodeId": "8", "role": {"value": "InlineTextBox"}, "name": {"value": "Overview"}},
+			{"nodeId": "3", "role": {"value": "textbox"}, "name": {"value": "API Token"}, "value": {"value": "super-secret-value"}},
+			{"nodeId": "4", "role": {"value": "generic"}, "childIds": ["9"]},
+			{"nodeId": "9", "role": {"value": "button"}, "name": {"value": "Next page"}, "properties": [{"name": "disabled", "value": {"value": true}}]},
+			{"nodeId": "5", "role": {"value": "canvas"}}
+		]
+	}`)
+	nodes, err := ParseAXTreeJSON(raw)
+	if err != nil {
+		t.Fatalf("ParseAXTreeJSON failed: %v", err)
+	}
+	compact, stats := FormatCompactAXTree(nodes, len(raw))
+	if strings.Contains(compact, "super-secret-value") {
+		t.Fatalf("FormatCompactAXTree leaked textbox value:\n%s", compact)
+	}
+	if !strings.Contains(compact, "[REDACTED]") {
+		t.Fatalf("expected [REDACTED] for textbox value:\n%s", compact)
+	}
+	if strings.Contains(compact, "InlineTextBox") {
+		t.Fatalf("expected InlineTextBox to be stripped:\n%s", compact)
+	}
+	if !strings.Contains(compact, "[UNGROUNDED_PIXEL_SURFACE]") || stats.UnlabelledCanvases != 1 {
+		t.Fatalf("expected unlabelled canvas marker, stats=%+v\n%s", stats, compact)
+	}
+	if !strings.Contains(compact, `(disabled=true)`) {
+		t.Fatalf("expected salient disabled property in compact output:\n%s", compact)
+	}
+	if !stats.CanvasBlindSpot {
+		t.Fatalf("expected CanvasBlindSpot=true when unlabelled canvas has <=3 text nodes, got %+v", stats)
+	}
+}
+
+func TestPaginationContractValidationAndMergeDedupe(t *testing.T) {
+	rcp, err := ResolveRecipe(Recipe{
+		Name:  "paged",
+		Topic: "releases",
+		Defaults: map[string]string{
+			"next_btn": "button.next-page",
+		},
+		Steps: []Step{
+			{
+				ID:  "s1",
+				URL: "https://example.com/releases",
+				Items: &ItemRule{
+					Container: "article.rel",
+					DedupeBy:  "tag",
+					Limit:     3,
+					Fields:    map[string]FieldRule{"tag": {Selector: "a"}},
+				},
+				Pagination: &PaginationRule{
+					NextSelector: "{{next_btn}}",
+				},
+			},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("ResolveRecipe failed: %v", err)
+	}
+	if rcp.Steps[0].Pagination.NextSelector != "button.next-page" || rcp.Steps[0].Pagination.MaxPages != DefaultPaginationMaxPages {
+		t.Fatalf("unexpected resolved pagination: %+v", rcp.Steps[0].Pagination)
+	}
+
+	// Reject unbounded max_pages > 20.
+	_, err = ResolveRecipe(Recipe{
+		Name:  "bad-paged",
+		Topic: "t",
+		Steps: []Step{
+			{
+				ID:         "s1",
+				URL:        "https://example.com",
+				Pagination: &PaginationRule{NextSelector: "a.next", MaxPages: 99},
+			},
+		},
+	}, nil)
+	if err == nil {
+		t.Fatal("expected max_pages > 20 to fail validation")
+	}
+
+	p1 := StepResult{
+		StepID: "s1",
+		Items: []map[string]any{
+			{"tag": "v1.0.0"},
+			{"tag": "v1.0.1"},
+		},
+		Tables: []TableData{{Headers: []string{"Col"}, Rows: [][]string{{"R1"}}}},
+	}
+	p2 := StepResult{
+		StepID: "s1",
+		Items: []map[string]any{
+			{"tag": "v1.0.1"}, // duplicate across page boundary
+			{"tag": "v1.0.2"},
+			{"tag": "v1.0.3"}, // should be capped by Limit=3
+		},
+		Tables: []TableData{{Headers: []string{"Col"}, Rows: [][]string{{"R1"}, {"R2"}}}},
+	}
+	merged, added, reachedLimit := MergePaginatedStepResult(p1, p2, rcp.Steps[0].Items)
+	if len(merged.Items) != 3 || !reachedLimit {
+		t.Fatalf("merged items = %d (reachedLimit=%v), want 3 (true)", len(merged.Items), reachedLimit)
+	}
+	if added != 2 {
+		t.Fatalf("added = %d, want 2 (1 unique item + 1 unique table row)", added)
+	}
+	if len(merged.Tables[0].Rows) != 2 {
+		t.Fatalf("merged table rows = %d, want 2", len(merged.Tables[0].Rows))
+	}
+}

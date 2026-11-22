@@ -15,6 +15,7 @@ type HealRequest struct {
 	ErrorMsg      string
 	DiagnosticID  string
 	DOMHTML       string
+	AXTreeText    string
 	ScreenshotPNG []byte
 	AllowTier2    bool
 }

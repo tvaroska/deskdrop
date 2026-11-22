@@ -1,0 +1,7 @@
+{
+  "nodes": [
+    {"nodeId": "1", "role": {"type": "internalRole", "value": "RootWebArea"}, "name": {"type": "computedString", "value": "WebGL Telemetry Surface"}, "childIds": ["2", "3"]},
+    {"nodeId": "2", "role": {"type": "role", "value": "heading"}, "name": {"type": "computedString", "value": "Telemetry Surface"}, "properties": [{"name": "level", "value": {"type": "integer", "value": 1}}]},
+    {"nodeId": "3", "role": {"type": "role", "value": "canvas"}, "childIds": []}
+  ]
+}

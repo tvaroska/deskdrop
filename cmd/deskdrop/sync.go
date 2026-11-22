@@ -297,6 +297,7 @@ func execFallbackTask(
 		Err:           errors.New("tier-2 fallback snapshot"),
 		ScreenshotPNG: fbRes.ScreenshotPNG,
 		DOMHTML:       fbRes.DOMHTML,
+		AXTreeText:    fbRes.AXTreeText,
 	}, cfg.ForbiddenTerms)
 	if zerr != nil {
 		_, _, _ = svcClient.FailTask(parentCtx, task.ID, contract.FailReportMetadata{

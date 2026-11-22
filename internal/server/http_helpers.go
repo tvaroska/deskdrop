@@ -166,13 +166,13 @@ func parseFailRequest(r *http.Request) (contract.FailReportMetadata, []byte, err
 	return meta, nil, nil
 }
 
-func inspectDiagnosticZip(zipBytes []byte) (domHTML string, screenshotPNG []byte, err error) {
+func inspectDiagnosticZip(zipBytes []byte) (domHTML string, axTreeText string, screenshotPNG []byte, err error) {
 	if len(zipBytes) == 0 {
-		return "", nil, nil
+		return "", "", nil, nil
 	}
 	zr, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
 	if err != nil {
-		return "", nil, err
+		return "", "", nil, err
 	}
 	for _, f := range zr.File {
 		switch f.Name {
@@ -183,6 +183,13 @@ func inspectDiagnosticZip(zipBytes []byte) (domHTML string, screenshotPNG []byte
 				_ = rc.Close()
 				domHTML = contract.ScrubHTML(string(raw))
 			}
+		case "axtree.txt":
+			rc, oerr := f.Open()
+			if oerr == nil {
+				raw, _ := io.ReadAll(io.LimitReader(rc, 256*1024))
+				_ = rc.Close()
+				axTreeText = strings.TrimSpace(string(raw))
+			}
 		case "screenshot.png":
 			rc, oerr := f.Open()
 			if oerr == nil {
@@ -191,7 +198,7 @@ func inspectDiagnosticZip(zipBytes []byte) (domHTML string, screenshotPNG []byte
 			}
 		}
 	}
-	return domHTML, screenshotPNG, nil
+	return domHTML, axTreeText, screenshotPNG, nil
 }
 
 func formatDropBusBody(rec contract.DropRecord, baseURL string) string {

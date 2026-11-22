@@ -28,6 +28,7 @@ type FallbackExecResult struct {
 	StepResult    contract.StepResult
 	ScreenshotPNG []byte
 	DOMHTML       string
+	AXTreeText    string
 	ActionsRun    int
 }
 
@@ -49,6 +50,7 @@ type StepExecError struct {
 	Err           error
 	ScreenshotPNG []byte
 	DOMHTML       string
+	AXTreeText    string
 }
 
 func (e *StepExecError) Error() string {
@@ -89,6 +91,15 @@ func BuildDiagnosticZip(recipeName string, stepErr *StepExecError, extraForbidde
 			return nil, err
 		}
 		if err := writeZipEntry(zw, "dom.html", []byte(scrubbed)); err != nil {
+			return nil, err
+		}
+	}
+
+	if stepErr.AXTreeText != "" {
+		if err := contract.EnforceAirGap(stepErr.AXTreeText, extraForbidden); err != nil {
+			return nil, err
+		}
+		if err := writeZipEntry(zw, "axtree.txt", []byte(stepErr.AXTreeText)); err != nil {
 			return nil, err
 		}
 	}

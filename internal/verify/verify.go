@@ -143,6 +143,9 @@ func ExtractStepFromHTML(step contract.Step, htmlDoc string, landedURL string) (
 		Tables:      tables,
 		TextExcerpt: excerpt,
 	}
+	if step.Pagination != nil {
+		res.PagesVisited = 1
+	}
 	if len(res.Fields) == 0 {
 		res.Fields = nil
 	}

@@ -68,6 +68,7 @@ func TestBuildDiagnosticZipScrubsHTMLAndEnforcesAirGap(t *testing.T) {
 		Err:    errors.New("step \"metrics\" extracted 0 item(s), expected >= 1"),
 		DOMHTML: `<html><head><script>secretScript()</script><style>body{}</style></head>` +
 			`<body><svg><rect/></svg><input value="my-secret-pass"><div class="card">Hello</div></body></html>`,
+		AXTreeText:    "[RootWebArea] \"Dash\"\n  [heading] \"Hello\" (level=1)",
 		ScreenshotPNG: []byte{0x89, 0x50, 0x4E, 0x47},
 	}
 
@@ -89,7 +90,7 @@ func TestBuildDiagnosticZipScrubsHTMLAndEnforcesAirGap(t *testing.T) {
 		_ = rc.Close()
 		entries[f.Name] = raw
 	}
-	for _, name := range []string{"error.json", "dom.html", "screenshot.png"} {
+	for _, name := range []string{"error.json", "dom.html", "axtree.txt", "screenshot.png"} {
 		if _, ok := entries[name]; !ok {
 			t.Fatalf("missing %s in diagnostic zip", name)
 		}
@@ -140,6 +141,13 @@ func TestExecuteStepAndFallbackCloseScratchTabOnFailure(t *testing.T) {
 			return map[string]any{"success": true}, nil
 		case "Page.captureScreenshot":
 			return map[string]any{"data": base64.StdEncoding.EncodeToString([]byte{0x89, 0x50, 0x4E, 0x47})}, nil
+		case "Accessibility.getFullAXTree":
+			return map[string]any{
+				"nodes": []map[string]any{
+					{"nodeId": "1", "role": map[string]any{"value": "RootWebArea"}, "name": map[string]any{"value": "Dash"}, "childIds": []string{"2"}},
+					{"nodeId": "2", "role": map[string]any{"value": "heading"}, "name": map[string]any{"value": "Dash"}},
+				},
+			}, nil
 		case "Runtime.evaluate":
 			expr, _ := params["expression"].(string)
 			switch {
@@ -195,6 +203,9 @@ func TestExecuteStepAndFallbackCloseScratchTabOnFailure(t *testing.T) {
 	if !strings.Contains(execErr.DOMHTML, "Data") {
 		t.Fatalf("expected scrubbed DOMHTML on error, got %q", execErr.DOMHTML)
 	}
+	if !strings.Contains(execErr.AXTreeText, `[heading] "Dash"`) {
+		t.Fatalf("expected compact AXTreeText on error, got %q", execErr.AXTreeText)
+	}
 	mu.Lock()
 	gotClosed := closedTargetID
 	mu.Unlock()
@@ -228,6 +239,121 @@ func TestExecuteStepAndFallbackCloseScratchTabOnFailure(t *testing.T) {
 	mu.Unlock()
 	if gotClosed != "scratch-1" {
 		t.Fatalf("expected fallback scratch tab closed immediately, got %q", gotClosed)
+	}
+}
+
+func TestHappyPathSkipsAXTreeAndPaginationLoopsUntilDisabled(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		axCalls  int
+		curPage  = 1
+		nextHits int
+	)
+
+	srv := newMockCDPServer(t, func(method string, params map[string]any) (any, error) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch method {
+		case "Target.getTargets":
+			return map[string]any{"targetInfos": []TargetInfo{}}, nil
+		case "Target.createTarget":
+			return map[string]any{"targetId": "scratch-paged"}, nil
+		case "Target.attachToTarget":
+			return map[string]any{"sessionId": "sess-paged"}, nil
+		case "Target.closeTarget":
+			return map[string]any{"success": true}, nil
+		case "Accessibility.getFullAXTree":
+			axCalls++
+			return map[string]any{"nodes": []any{}}, nil
+		case "Runtime.evaluate":
+			expr, _ := params["expression"].(string)
+			switch {
+			case expr == "document.readyState":
+				return map[string]any{"result": map[string]any{"type": "string", "value": "complete"}}, nil
+			case strings.Contains(expr, "location.href || ''"):
+				return map[string]any{"result": map[string]any{"type": "string", "value": "https://releases.example.com/list"}}, nil
+			case strings.Contains(expr, "aria_disabled"):
+				nextHits++
+				if curPage >= 3 {
+					return map[string]any{"result": map[string]any{"type": "object", "value": map[string]any{"clicked": false, "reason": "disabled"}}}, nil
+				}
+				curPage++
+				return map[string]any{"result": map[string]any{"type": "object", "value": map[string]any{"clicked": true}}}, nil
+			case strings.Contains(expr, "evalItemRule"):
+				var pageItems []map[string]any
+				switch curPage {
+				case 1:
+					pageItems = []map[string]any{{"tag": "v1.0.0"}, {"tag": "v1.0.1"}}
+				case 2:
+					pageItems = []map[string]any{{"tag": "v1.0.1"}, {"tag": "v1.0.2"}}
+				case 3:
+					pageItems = []map[string]any{{"tag": "v1.0.3"}}
+				}
+				return map[string]any{
+					"result": map[string]any{
+						"type": "object",
+						"value": map[string]any{
+							"title": "Releases",
+							"url":   "https://releases.example.com/list",
+							"items": pageItems,
+						},
+					},
+				}, nil
+			default:
+				return map[string]any{"result": map[string]any{"type": "boolean", "value": true}}, nil
+			}
+		default:
+			return map[string]any{}, nil
+		}
+	})
+	defer srv.Close()
+
+	wsURL := "ws://" + strings.TrimPrefix(srv.URL, "http://")
+	client, err := Connect(context.Background(), wsURL)
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close()
+
+	step := contract.Step{
+		ID:  "releases",
+		URL: "https://releases.example.com/list",
+		Items: &contract.ItemRule{
+			Container: "article.release",
+			DedupeBy:  "tag",
+			Limit:     10,
+			Fields:    map[string]contract.FieldRule{"tag": {Selector: "a.tag"}},
+		},
+		Pagination: &contract.PaginationRule{
+			NextSelector: "button.next",
+			MaxPages:     5,
+			WaitMs:       5,
+		},
+		Expect: contract.Expectation{
+			MinItems: 4,
+		},
+	}
+
+	res, err := client.ExecuteStep(context.Background(), step)
+	if err != nil {
+		t.Fatalf("ExecuteStep with pagination failed: %v", err)
+	}
+	if res.PagesVisited != 3 {
+		t.Fatalf("PagesVisited = %d, want 3 (stopped when page 3 Next disabled)", res.PagesVisited)
+	}
+	if len(res.Items) != 4 {
+		t.Fatalf("merged items = %d, want 4 deduplicated tags across 3 pages", len(res.Items))
+	}
+	mu.Lock()
+	gotAX := axCalls
+	gotNext := nextHits
+	mu.Unlock()
+	if gotAX != 0 {
+		t.Fatalf("happy-path extraction must call Accessibility.getFullAXTree 0 times, got %d", gotAX)
+	}
+	if gotNext != 3 {
+		t.Fatalf("expected 3 Next-control probes (click p1->p2, click p2->p3, disabled on p3), got %d", gotNext)
 	}
 }
 

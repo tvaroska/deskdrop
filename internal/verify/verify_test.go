@@ -163,3 +163,58 @@ func TestVerifyRecipeOnHTMLShadowDOMTableAndDriftFailure(t *testing.T) {
 		t.Fatal("expected drifted HTML to fail verification")
 	}
 }
+
+func TestVerifyRecipeOnHTMLPagesPaginationAndDisabledStop(t *testing.T) {
+	pages := []string{
+		`<!doctype html><html><body>
+			<article class="release"><a class="tag">v1.0.0</a></article>
+			<article class="release"><a class="tag">v1.0.1</a></article>
+			<button class="next">Next page</button>
+		</body></html>`,
+		`<!doctype html><html><body>
+			<article class="release"><a class="tag">v1.0.1</a></article>
+			<article class="release"><a class="tag">v1.0.2</a></article>
+			<button class="next" aria-disabled="true">Next page</button>
+		</body></html>`,
+		`<!doctype html><html><body>
+			<article class="release"><a class="tag">v1.0.3</a></article>
+		</body></html>`,
+	}
+
+	recipe := contract.Recipe{
+		Name:  "paged-releases",
+		Topic: "releases",
+		Steps: []contract.Step{
+			{
+				ID:  "list",
+				URL: "https://releases.example.com/list",
+				Items: &contract.ItemRule{
+					Container: "article.release",
+					DedupeBy:  "tag",
+					Limit:     10,
+					Fields: map[string]contract.FieldRule{
+						"tag": {Selector: "a.tag"},
+					},
+				},
+				Pagination: &contract.PaginationRule{
+					NextSelector: "button.next",
+					MaxPages:     4,
+				},
+				Expect: contract.Expectation{
+					MinItems: 3,
+				},
+			},
+		},
+	}
+
+	out, err := VerifyRecipeOnHTMLPages(recipe, nil, "list", pages, "https://releases.example.com/list")
+	if err != nil || !out.Passed {
+		t.Fatalf("VerifyRecipeOnHTMLPages failed: passed=%v err=%v outErr=%s", out.Passed, err, out.Error)
+	}
+	if out.StepResult.PagesVisited != 2 {
+		t.Fatalf("PagesVisited = %d, want 2 (page 2 has aria-disabled=true so page 3 is not visited)", out.StepResult.PagesVisited)
+	}
+	if out.ItemCount != 3 {
+		t.Fatalf("ItemCount = %d, want 3 deduplicated items", out.ItemCount)
+	}
+}

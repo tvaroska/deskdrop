@@ -34,6 +34,7 @@ const (
 	DefaultLocation      = "us-central1"
 	DefaultMaxIterations = 3
 	maxPromptHTMLRunes   = 40_000
+	maxPromptAXTreeRunes = 16_000
 )
 
 // Config configures the exception-only adk-go healer (Vertex AI or injected model.LLM for offline tests).
@@ -111,6 +112,13 @@ func (h *Healer) HealDrift(ctx context.Context, req server.HealRequest) (server.
 	if err := contract.EnforceAirGap(scrubbedHTML, h.forbiddenTerms); err != nil {
 		return server.HealResult{}, fmt.Errorf("air-gap blocked healer input: %w", err)
 	}
+	axTree := strings.TrimSpace(req.AXTreeText)
+	if axTree != "" {
+		if err := contract.EnforceAirGap(axTree, h.forbiddenTerms); err != nil {
+			return server.HealResult{}, fmt.Errorf("air-gap blocked healer axtree: %w", err)
+		}
+	}
+	canvasBlindSpot := hasUnlabelledCanvasBlindSpot(scrubbedHTML, axTree)
 
 	allowedDomains := contract.InferRecipeDomains(req.Recipe)
 
@@ -327,8 +335,9 @@ func (h *Healer) HealDrift(ctx context.Context, req server.HealRequest) (server.
 		Name:        "offline_snapshot_fallback",
 		Model:       h.llm,
 		Description: "Extracts structured output offline from screenshot + scrubbed dom.html or requests 1 bounded Tier-2 fallback.",
-		Instruction: "You are DeskDrop's Tier-1 exception fallback extractor. Inspect the provided screenshot and scrubbed dom.html. " +
-			"If the target metrics/items are visible in the snapshot, call submit_fallback_report with clean structured fields/items. " +
+		Instruction: "You are DeskDrop's Tier-1 exception fallback extractor. Inspect the provided screenshot, compact AXTree (when present), and scrubbed dom.html. " +
+			"Use compact AXTree for clean semantic labels and interactive states (modal/disabled/expanded); if Grounding Warning reports UNLABELLED_CANVAS_SURFACE, read metrics strictly from the attached screenshot image and never fabricate unseen values. " +
+			"If the target metrics/items are visible, call submit_fallback_report with clean structured fields/items. " +
 			"ONLY if the page is blocked by a modal, cookie banner, or collapsed section and data is missing, call request_tier2_fallback with 1..3 safe actions (scroll, wait, click — never type text or navigate cross-domain).",
 		Tools: fallbackTools,
 	})
@@ -340,8 +349,8 @@ func (h *Healer) HealDrift(ctx context.Context, req server.HealRequest) (server.
 		Name:        "recipe_patch_drafter",
 		Model:       h.llm,
 		Description: "Drafts and Go-verifies an updated declarative Recipe (zero arbitrary JS) against dom.html.",
-		Instruction: "You are DeskDrop's declarative recipe repair drafter. If a Tier-2 fallback was requested because the page is blocked, immediately call exit_loop. " +
-			"Otherwise inspect the failed recipe and scrubbed dom.html, update ONLY the broken CSS selectors / field rules / item rules (zero arbitrary JS, same approved URL/domain), " +
+		Instruction: "You are DeskDrop's declarative recipe repair drafter. If a Tier-2 fallback was requested because the page is blocked, or if Grounding Warning reports UNLABELLED_CANVAS_SURFACE where target data exists only as canvas/WebGL pixels and not in dom.html, immediately call exit_loop without guessing selectors. " +
+			"Otherwise use compact AXTree to locate semantic target roles/labels and use scrubbed dom.html for exact HTML tag names, CSS classes, and data-* attributes (AXTree omits CSS classes/attributes), update ONLY the broken CSS selectors / field rules / item rules (zero arbitrary JS, same approved URL/domain), " +
 			"call verify_recipe_on_snapshot to verify in pure Go, and once passed==true immediately call exit_loop.",
 		Tools: []tool.Tool{verifyTool, exitTool},
 	})
@@ -383,15 +392,23 @@ func (h *Healer) HealDrift(ctx context.Context, req server.HealRequest) (server.
 	}
 
 	recipeBytes, _ := json.MarshalIndent(req.Recipe, "", "  ")
-	prompt := fmt.Sprintf(
-		"SELECTOR_DRIFT Exception Context\nRecipe: %s\nStep ID: %s\nLanded URL: %s\nError: %s\n\nFailed Recipe JSON:\n%s\n\nScrubbed dom.html:\n%s",
+	var promptBuilder strings.Builder
+	fmt.Fprintf(&promptBuilder,
+		"SELECTOR_DRIFT Exception Context\nRecipe: %s\nStep ID: %s\nLanded URL: %s\nError: %s\n",
 		req.Recipe.Name,
 		req.StepID,
 		req.LandedURL,
 		req.ErrorMsg,
-		string(recipeBytes),
-		truncateRunes(scrubbedHTML, maxPromptHTMLRunes),
 	)
+	if canvasBlindSpot {
+		promptBuilder.WriteString("Grounding Warning: UNLABELLED_CANVAS_SURFACE — page contains an unlabelled <canvas>/WebGL surface with minimal DOM/AXTree text. Recover visible values from screenshot.png only; CSS selectors cannot read canvas pixels.\n")
+	}
+	fmt.Fprintf(&promptBuilder, "\nFailed Recipe JSON:\n%s\n", string(recipeBytes))
+	if axTree != "" {
+		fmt.Fprintf(&promptBuilder, "\nCompact AXTree (axtree.txt):\n%s\n", truncateRunes(axTree, maxPromptAXTreeRunes))
+	}
+	fmt.Fprintf(&promptBuilder, "\nScrubbed dom.html:\n%s", truncateRunes(scrubbedHTML, maxPromptHTMLRunes))
+	prompt := promptBuilder.String()
 	parts := []*genai.Part{genai.NewPartFromText(prompt)}
 	if len(req.ScreenshotPNG) > 0 {
 		parts = append(parts, genai.NewPartFromBytes(req.ScreenshotPNG, "image/png"))
@@ -431,4 +448,28 @@ func truncateRunes(s string, max int) string {
 		return s
 	}
 	return string(r[:max])
+}
+
+func hasUnlabelledCanvasBlindSpot(scrubbedHTML string, axTree string) bool {
+	if strings.Contains(axTree, "[UNGROUNDED_PIXEL_SURFACE]") {
+		nonCanvasLines := 0
+		for _, ln := range strings.Split(axTree, "\n") {
+			t := strings.TrimSpace(ln)
+			if t == "" || strings.HasPrefix(t, "[RootWebArea]") || strings.Contains(t, "[UNGROUNDED_PIXEL_SURFACE]") {
+				continue
+			}
+			nonCanvasLines++
+		}
+		if nonCanvasLines <= 3 {
+			return true
+		}
+	}
+	lower := strings.ToLower(scrubbedHTML)
+	if strings.Contains(lower, "<canvas") && axTree == "" {
+		out, err := verify.ExtractStepFromHTML(contract.Step{ID: "probe", MaxTextChars: 500}, scrubbedHTML, "")
+		if err == nil && len([]rune(strings.TrimSpace(out.TextExcerpt))) < 80 {
+			return true
+		}
+	}
+	return false
 }

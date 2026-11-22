@@ -15,12 +15,13 @@ There is no `TODO.md`.
 
 | # | Milestone | Done when | Target |
 | :--- | :--- | :--- | :--- |
-| **M2** | `v1.1.0` Release & Post-Soak Legacy Retirement | `v1.1.0` (`AXTree`, `pagination`, `schedule`) tagged and live on `/desktop`, Windows PC `deskdrop.exe` soak verified, and legacy `browser-drop` retired. | `v1.1.0` (`P0`, Small) |
+| **M2** | `v1.1.0` Release, Server Observability & Post-Soak Retirement | `v1.1.0` (`AXTree`, `pagination`, `schedule`, `5xx` stderr logging, release `404`) live on `/desktop`, Windows PC soak verified, and legacy `browser-drop` retired. | `v1.1.0` (`P0`, Small) |
 
-## Milestone M2 — `v1.1.0` Release & Post-Soak Legacy Retirement
+## Milestone M2 — `v1.1.0` Release, Server Observability & Post-Soak Retirement
 
 - [ ] **M2.1 (`v1.1.0` release):** Commit, tag, and roll out `deskdrop v1.1.0` (`AXTree` hybrid grounding + `<canvas>` blind-spot gate, declarative `pagination`, and `deskdrop schedule` Windows Task Scheduler helper) via Cloud Build (`cloudbuild.yaml`) and verify `/v1/release/SHA256SUMS.txt`.
-- [ ] **M2.2 (Windows PC soak & legacy cleanup):** Switch the Windows PC worker to `deskdrop.exe` (`--fallback-gate=tray` or `deskdrop schedule install`), verify one live extraction cycle end-to-end, and retire legacy `browser-drop` + its PostgreSQL database.
+- [ ] **M2.2 (`5xx` stderr logging & release-asset `404` cleanup):** Log `status >= 500` responses to stderr in `writeAPIError` ([`internal/server/http_helpers.go`](../internal/server/http_helpers.go)) so container error logs surface server faults, and return `404 NOT_FOUND` directly from `handleDownloadRelease` ([`internal/server/http.go`](../internal/server/http.go)) when `/release/{asset}` is absent on disk instead of probing `tools/deskdrop/latest/` in blob storage.
+- [ ] **M2.3 (Windows PC soak & legacy cleanup):** Switch the Windows PC worker to `deskdrop.exe` (`--fallback-gate=tray` or `deskdrop schedule install`), verify one live extraction cycle end-to-end, and retire legacy `browser-drop` + its PostgreSQL database.
 
 ## Unscheduled backlog
 

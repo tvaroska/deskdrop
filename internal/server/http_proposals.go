@@ -40,9 +40,9 @@ func (s *Service) handleSubmitError(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusUnprocessableEntity, "AIRGAP_VIOLATION", err.Error(), nil)
 		return
 	}
-	domHTML, screenshotPNG, zerr := inspectDiagnosticZip(zipBytes)
-	if zerr == nil && domHTML != "" {
-		if err := contract.EnforceAirGap(domHTML, s.cfg.ForbiddenTerms); err != nil {
+	domHTML, axTreeText, screenshotPNG, zerr := inspectDiagnosticZip(zipBytes)
+	if zerr == nil && (domHTML != "" || axTreeText != "") {
+		if err := contract.EnforceAirGap(domHTML+" "+axTreeText, s.cfg.ForbiddenTerms); err != nil {
 			writeAPIError(w, http.StatusUnprocessableEntity, "AIRGAP_VIOLATION", err.Error(), nil)
 			return
 		}
@@ -88,7 +88,7 @@ func (s *Service) handleSubmitError(w http.ResponseWriter, r *http.Request) {
 	var fallbackDropID string
 	if triage.Code == contract.ErrorCodeSelectorDrift && s.healer != nil && domHTML != "" && meta.Recipe != "" {
 		if rcp, ok, _ := s.catalog.Get(r.Context(), meta.Recipe); ok && rcp.AllowsComputerUseFallback() {
-			outcome := s.runDriftHealer(r.Context(), contract.Task{Recipe: rcp.Name, NotifyTo: to, Domain: triage.Domain}, rcp, meta.StepID, meta.LandedURL, meta.Error, diagID, domHTML, screenshotPNG, false)
+			outcome := s.runDriftHealer(r.Context(), contract.Task{Recipe: rcp.Name, NotifyTo: to, Domain: triage.Domain}, rcp, meta.StepID, meta.LandedURL, meta.Error, diagID, domHTML, axTreeText, screenshotPNG, false)
 			proposalID = outcome.ProposalID
 			fallbackDropID = outcome.DropID
 		}
@@ -129,9 +129,9 @@ func (s *Service) handleFailTask(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusUnprocessableEntity, "AIRGAP_VIOLATION", err.Error(), nil)
 		return
 	}
-	domHTML, screenshotPNG, _ := inspectDiagnosticZip(zipBytes)
-	if domHTML != "" {
-		if err := contract.EnforceAirGap(domHTML, s.cfg.ForbiddenTerms); err != nil {
+	domHTML, axTreeText, screenshotPNG, _ := inspectDiagnosticZip(zipBytes)
+	if domHTML != "" || axTreeText != "" {
+		if err := contract.EnforceAirGap(domHTML+" "+axTreeText, s.cfg.ForbiddenTerms); err != nil {
 			writeAPIError(w, http.StatusUnprocessableEntity, "AIRGAP_VIOLATION", err.Error(), nil)
 			return
 		}
@@ -186,7 +186,7 @@ func (s *Service) handleFailTask(w http.ResponseWriter, r *http.Request) {
 		rcp, rerr := s.catalog.ValidateAndResolveTask(r.Context(), task.Recipe, task.CustomRecipe, task.Vars)
 		if rerr == nil && rcp.AllowsComputerUseFallback() {
 			allowTier2 := task.Kind != contract.TaskKindFallback
-			healOut = s.runDriftHealer(r.Context(), updated, rcp, meta.StepID, meta.LandedURL, meta.Error, diagID, domHTML, screenshotPNG, allowTier2)
+			healOut = s.runDriftHealer(r.Context(), updated, rcp, meta.StepID, meta.LandedURL, meta.Error, diagID, domHTML, axTreeText, screenshotPNG, allowTier2)
 			if refreshed, gerr := s.store.GetTask(r.Context(), id); gerr == nil {
 				updated = refreshed
 			}
@@ -227,12 +227,12 @@ func (s *Service) handleFallbackResult(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
 		return
 	}
-	domHTML, screenshotPNG, err := inspectDiagnosticZip(zipBytes)
+	domHTML, axTreeText, screenshotPNG, err := inspectDiagnosticZip(zipBytes)
 	if err != nil || domHTML == "" {
 		writeAPIError(w, http.StatusUnprocessableEntity, string(contract.ErrorCodeContractInvalid), "fallback result bundle must include dom.html", nil)
 		return
 	}
-	if err := contract.EnforceAirGap(domHTML+" "+meta.LandedURL, s.cfg.ForbiddenTerms); err != nil {
+	if err := contract.EnforceAirGap(domHTML+" "+axTreeText+" "+meta.LandedURL, s.cfg.ForbiddenTerms); err != nil {
 		writeAPIError(w, http.StatusUnprocessableEntity, "AIRGAP_VIOLATION", err.Error(), nil)
 		return
 	}
@@ -252,7 +252,7 @@ func (s *Service) handleFallbackResult(w http.ResponseWriter, r *http.Request) {
 	if s.healer != nil {
 		rcp, rerr := s.catalog.ValidateAndResolveTask(r.Context(), task.Recipe, task.CustomRecipe, task.Vars)
 		if rerr == nil && rcp.AllowsComputerUseFallback() {
-			healOut = s.runDriftHealer(r.Context(), task, rcp, meta.StepID, meta.LandedURL, meta.Error, diagID, domHTML, screenshotPNG, false)
+			healOut = s.runDriftHealer(r.Context(), task, rcp, meta.StepID, meta.LandedURL, meta.Error, diagID, domHTML, axTreeText, screenshotPNG, false)
 		}
 	}
 
@@ -281,6 +281,7 @@ func (s *Service) runDriftHealer(
 	errMsg string,
 	diagID string,
 	domHTML string,
+	axTreeText string,
 	screenshotPNG []byte,
 	allowTier2 bool,
 ) driftHealSummary {
@@ -293,6 +294,7 @@ func (s *Service) runDriftHealer(
 		ErrorMsg:      errMsg,
 		DiagnosticID:  diagID,
 		DOMHTML:       domHTML,
+		AXTreeText:    axTreeText,
 		ScreenshotPNG: screenshotPNG,
 		AllowTier2:    allowTier2,
 	})

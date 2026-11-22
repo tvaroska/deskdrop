@@ -16,6 +16,8 @@ func defaultShowsTrayOnNoArgs() bool {
 	return false
 }
 
+func hideConsoleWindow() {}
+
 func runPlatformTray(cfgPath string, cdpURL string, interval time.Duration, fallbackGate string, _ bool) error {
 	if interval <= 0 {
 		interval = 20 * time.Second

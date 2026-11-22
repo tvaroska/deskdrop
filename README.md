@@ -6,10 +6,10 @@ Pull structured JSON from authenticated web pages using your running browser —
 
 ## Why DeskDrop
 
-- **Happy path costs `$0` in LLM tokens:** Attaches over Chrome DevTools Protocol (CDP) to your logged-in browser, runs declarative CSS / `>>>` Shadow-DOM `items` and `fields` rules (`0` `eval_js`), emits clean JSON, and captures zero screenshots or HTML dumps.
-- **Zero-dependency desktop binary:** `cmd/deskdrop` links strictly Go standard library packages (`CGO_ENABLED=0`, verified in [`hygiene_test.go`](hygiene_test.go)), with a native Windows System Tray and a single-attempt Chrome 144+ `DevToolsActivePort` approval latch.
+- **Happy path costs `$0` in LLM tokens:** Attaches over Chrome DevTools Protocol (CDP) to your logged-in browser, runs declarative CSS / `>>>` Shadow-DOM `items`, `fields`, and bounded `"Next page"` `pagination` rules (`0` `eval_js`), emits clean JSON, and captures zero screenshots, HTML dumps, or `AXTree` snapshots.
+- **Zero-dependency desktop binary:** `cmd/deskdrop` links strictly Go standard library packages (`CGO_ENABLED=0`, verified in [`hygiene_test.go`](hygiene_test.go)), with a native Windows System Tray, a `schtasks.exe` helper (`deskdrop schedule`), and a single-attempt Chrome 144+ `DevToolsActivePort` approval latch.
 - **Zero Postgres relay:** `cmd/server` persists state atomically to `/data/state.json` inside a `64Mi` distroless image and hot-reloads approved recipes from `RECIPES_URI` (local path or `gs://`), rejecting unapproved ad-hoc URLs with `HTTP 403`.
-- **Exception-only healing with human approval:** On `SELECTOR_DRIFT`, `deskdrop` scrubs `<script>`, `<style>`, `<svg>`, `<input value>`, and `<textarea>` from `dom.html`, closes the scratch tab immediately, runs `google.golang.org/adk/v2` (`SequentialAgent` + `LoopAgent` with pure-Go `verify_recipe_on_snapshot`), and writes patched recipes back to `RECIPES_URI` only after explicit `POST /v1/proposals/{id}/approve`.
+- **Exception-only healing with hybrid `AXTree` grounding & human approval:** On `SELECTOR_DRIFT`, `deskdrop` packages scrubbed `dom.html`, privacy-redacted compact `axtree.txt` (`Accessibility.getFullAXTree`), and `screenshot.png` (detecting unlabelled `<canvas>`/WebGL blind spots automatically), closes the scratch tab immediately, runs `google.golang.org/adk/v2` (`SequentialAgent` + `LoopAgent` with pure-Go `verify_recipe_on_snapshot`), and writes patched recipes back to `RECIPES_URI` only after explicit `POST /v1/proposals/{id}/approve`.
 
 ## Ports, Adapters, and Contracts
 
@@ -55,11 +55,14 @@ go run ./cmd/deskdrop run examples/recipes/status-dashboard.json --dry-run
 
 # Drain queued tasks continuously with Tier-2 fallback confirmation gated in tray
 go run ./cmd/deskdrop sync --interval 20s --fallback-gate=tray
+
+# Preview or install a quiet 15-minute Windows Scheduled Task (schtasks.exe)
+go run ./cmd/deskdrop schedule install --every 15m --fallback-gate tray --dry-run
 ```
 
 ## Declarative Recipe Format (Zero `eval_js`)
 
-See [`examples/recipes/status-dashboard.json`](examples/recipes/status-dashboard.json) and [`examples/recipes/release-feed.json`](examples/recipes/release-feed.json). Every rule supports CSS + `>>>` Shadow-DOM selectors, attribute fallbacks (`aria-label|text`), ancestor climbing (`closest` / `anchor_closest`), regex capture + fallback regex, compact numbers (`1.2K`, `3.5M`), and `click_if_present`.
+See [`examples/recipes/status-dashboard.json`](examples/recipes/status-dashboard.json) and [`examples/recipes/release-feed.json`](examples/recipes/release-feed.json). Every rule supports CSS + `>>>` Shadow-DOM selectors, attribute fallbacks (`aria-label|text`), ancestor climbing (`closest` / `anchor_closest`), regex capture + fallback regex, compact numbers (`1.2K`, `3.5M`), `click_if_present`, and bounded multi-page `pagination` (`next_selector`, `max_pages`, disabled/`aria-disabled` stop, cross-page deduplication).
 
 ## Regenerative Blueprint & Docs
 
