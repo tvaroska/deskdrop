@@ -16,7 +16,7 @@ import (
 	"github.com/tvaroska/deskdrop/internal/server"
 )
 
-var version = "v1.3.0"
+var version = "v1.3.1"
 
 func main() {
 	listenAddr := envOrDefault("LISTEN_ADDR", ":8080")
