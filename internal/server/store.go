@@ -42,7 +42,7 @@ type Store interface {
 
 	// Bidirectional extraction & fallback task queue
 	EnqueueTask(ctx context.Context, req contract.EnqueueTaskRequest) (contract.Task, bool, error)
-	ClaimNextTask(ctx context.Context, host string, lease time.Duration) (*contract.Task, error)
+	ClaimNextTask(ctx context.Context, host string, lease time.Duration, allow func(contract.Task) bool) (*contract.Task, error)
 	HeartbeatTask(ctx context.Context, taskID string, host string, lease time.Duration) (contract.Task, error)
 	CompleteTask(ctx context.Context, taskID string, dropID string) (contract.Task, error)
 	FailTask(ctx context.Context, taskID string, host string, triage contract.ErrorTriage, errMsg string, diagID string) (contract.Task, contract.DomainBreaker, bool, error)

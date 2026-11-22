@@ -201,8 +201,8 @@ func (f *FileStore) EnqueueTask(ctx context.Context, req contract.EnqueueTaskReq
 	return task, deduped, nil
 }
 
-func (f *FileStore) ClaimNextTask(ctx context.Context, host string, lease time.Duration) (*contract.Task, error) {
-	task, err := f.mem.ClaimNextTask(ctx, host, lease)
+func (f *FileStore) ClaimNextTask(ctx context.Context, host string, lease time.Duration, allow func(contract.Task) bool) (*contract.Task, error) {
+	task, err := f.mem.ClaimNextTask(ctx, host, lease, allow)
 	if err != nil || task == nil {
 		return task, err
 	}

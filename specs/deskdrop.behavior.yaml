@@ -22,6 +22,7 @@ state_machines:
         requires:
           - "next_run_at <= now"
           - "domain breaker state != paused_auth"
+          - "task target driver matches allowed_drivers when specified"
       - from: claimed
         to: succeeded
         action: complete_task

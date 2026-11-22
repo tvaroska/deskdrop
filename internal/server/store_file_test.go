@@ -35,7 +35,7 @@ func TestFileStoreAtomicPersistenceAcrossRestarts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnqueueTask failed: %v", err)
 	}
-	claimed, err := fs.ClaimNextTask(ctx, "worker-1", 60*time.Second)
+	claimed, err := fs.ClaimNextTask(ctx, "worker-1", 60*time.Second, nil)
 	if err != nil || claimed == nil || claimed.ID != task.ID {
 		t.Fatalf("ClaimNextTask mismatch: %+v err=%v", claimed, err)
 	}

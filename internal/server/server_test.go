@@ -274,3 +274,84 @@ func TestWriteAPIErrorLogs5xxToStderrAndReleaseAssetReturns404WithoutBlobFallbac
 		t.Fatalf("GCSBlobStore.objectName = %q, want desktop/diagnostics/diag_1.zip", got)
 	}
 }
+
+func TestClaimTaskAllowedDriversSkipsCDPWhenOnlyUIARunnable(t *testing.T) {
+	cat := recipes.NewStaticCatalog(
+		contract.Recipe{
+			Name:  "status-board",
+			Topic: "ops",
+			Steps: []contract.Step{{ID: "s1", URL: "https://status.example.com"}},
+		},
+		contract.Recipe{
+			Name:           "desktop-windows",
+			Topic:          "desktop-uia",
+			Driver:         "uia",
+			AllowedDomains: []string{"uia.local"},
+			Steps:          []contract.Step{{ID: "open_windows", URL: "uia://desktop", WindowTitle: "*"}},
+		},
+	)
+	store := NewMemoryStore()
+	svc := NewService(ServerConfig{
+		Version:            "v1.3.1",
+		DesktopClientToken: "desk-tok",
+		AgentBusToken:      "agent-tok",
+	}, store, NewMemoryBlobStore(), cat, nil)
+
+	// Enqueue high-priority CDP task + fallback task before UIA task.
+	for _, body := range []string{
+		`{"recipe":"status-board","priority":10,"requested_by":"agent-a"}`,
+		`{"kind":"fallback_task","recipe":"status-board","priority":20,"fallback_plan":{"allowed_domain":"status.example.com","target_url":"https://status.example.com","actions":[{"action":"wait","wait_ms":100}]}}`,
+		`{"recipe":"desktop-windows","priority":0,"requested_by":"agent-a"}`,
+	} {
+		rq := httptest.NewRequest(http.MethodPost, "/v1/tasks", strings.NewReader(body))
+		rq.Header.Set("Authorization", "Bearer agent-tok")
+		w := httptest.NewRecorder()
+		svc.ServeHTTP(w, rq)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("enqueue %s = %d (%s)", body, w.Code, w.Body.String())
+		}
+	}
+
+	// 1. Worker with allowed_drivers=["uia"] skips CDP tasks and claims desktop-windows.
+	claimUIA := httptest.NewRequest(http.MethodPost, "/v1/tasks/claim", strings.NewReader(`{"host":"win-pc","allowed_drivers":["uia"]}`))
+	claimUIA.Header.Set("Authorization", "Bearer desk-tok")
+	w1 := httptest.NewRecorder()
+	svc.ServeHTTP(w1, claimUIA)
+	var resp1 contract.ClaimTaskResponse
+	_ = json.Unmarshal(w1.Body.Bytes(), &resp1)
+	if resp1.Task == nil || resp1.Task.Recipe != "desktop-windows" {
+		t.Fatalf("expected desktop-windows claimed, got %+v", resp1.Task)
+	}
+
+	// 2. Second UIA-only claim returns empty while leaving CDP tasks untouched (attempt=0).
+	claimUIA2 := httptest.NewRequest(http.MethodPost, "/v1/tasks/claim", strings.NewReader(`{"host":"win-pc","allowed_drivers":["uia"]}`))
+	claimUIA2.Header.Set("Authorization", "Bearer desk-tok")
+	w2 := httptest.NewRecorder()
+	svc.ServeHTTP(w2, claimUIA2)
+	var resp2 contract.ClaimTaskResponse
+	_ = json.Unmarshal(w2.Body.Bytes(), &resp2)
+	if resp2.Task != nil {
+		t.Fatalf("expected nil task on second UIA-only claim, got %+v", resp2.Task)
+	}
+
+	tasks, _ := store.ListTasks(context.Background(), "pending", 10)
+	if len(tasks) != 2 {
+		t.Fatalf("expected 2 pending CDP tasks preserved, got %d", len(tasks))
+	}
+	for _, pt := range tasks {
+		if pt.Attempt != 0 {
+			t.Fatalf("pending CDP task %s had attempt=%d, want 0", pt.ID, pt.Attempt)
+		}
+	}
+
+	// 3. Once Chrome connects (allowed_drivers=["cdp","uia"]), highest-priority CDP task is claimed.
+	claimBoth := httptest.NewRequest(http.MethodPost, "/v1/tasks/claim", strings.NewReader(`{"host":"win-pc","allowed_drivers":["cdp","uia"]}`))
+	claimBoth.Header.Set("Authorization", "Bearer desk-tok")
+	w3 := httptest.NewRecorder()
+	svc.ServeHTTP(w3, claimBoth)
+	var resp3 contract.ClaimTaskResponse
+	_ = json.Unmarshal(w3.Body.Bytes(), &resp3)
+	if resp3.Task == nil || resp3.Task.Kind != contract.TaskKindFallback {
+		t.Fatalf("expected priority-20 fallback_task claimed once CDP allowed, got %+v", resp3.Task)
+	}
+}

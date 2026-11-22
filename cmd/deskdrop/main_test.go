@@ -12,15 +12,25 @@ import (
 	"github.com/tvaroska/deskdrop/internal/bus"
 	"github.com/tvaroska/deskdrop/internal/contract"
 	"github.com/tvaroska/deskdrop/internal/driver"
+	"github.com/tvaroska/deskdrop/internal/driver/cdp"
+	"github.com/tvaroska/deskdrop/internal/driver/uia"
 )
 
 type fakeDriver struct {
-	mu           sync.Mutex
-	fallbackRuns int
-	fbRes        driver.FallbackExecResult
+	mu            sync.Mutex
+	name          string
+	connected     *bool
+	browserStatus string
+	fallbackRuns  int
+	fbRes         driver.FallbackExecResult
 }
 
-func (f *fakeDriver) Name() string { return "fake" }
+func (f *fakeDriver) Name() string {
+	if f.name != "" {
+		return f.name
+	}
+	return "fake"
+}
 func (f *fakeDriver) ExecuteStep(_ context.Context, _ contract.Step) (contract.StepResult, error) {
 	return contract.StepResult{StepID: "s1", URL: "https://example.com"}, nil
 }
@@ -31,7 +41,15 @@ func (f *fakeDriver) ExecuteFallback(_ context.Context, _ contract.Step, _ contr
 	return f.fbRes, nil
 }
 func (f *fakeDriver) ProbeStatus(_ context.Context) driver.DriverStatus {
-	return driver.DriverStatus{Connected: true, Label: "Connected", BrowserStatus: "Ready"}
+	conn := true
+	if f.connected != nil {
+		conn = *f.connected
+	}
+	bs := f.browserStatus
+	if bs == "" {
+		bs = "Ready"
+	}
+	return driver.DriverStatus{Connected: conn, Label: bs, BrowserStatus: bs}
 }
 func (f *fakeDriver) Close() error { return nil }
 
@@ -159,5 +177,127 @@ func TestValidateDriverAndSelection(t *testing.T) {
 	defer cdpDrv.Close()
 	if cdpDrv.Name() != "cdp" {
 		t.Fatalf("cdpDrv.Name() = %q, want cdp", cdpDrv.Name())
+	}
+}
+
+func TestDrainQueueExecutesUIATasksWhileBrowserCDPDisconnected(t *testing.T) {
+	origMake := makeTargetDriver
+	defer func() { makeTargetDriver = origMake }()
+
+	staticUIA := &uia.StaticTreeProvider{
+		Windows: []uia.StaticWindowFixture{
+			{
+				Title: "Task Manager",
+				Nodes: []contract.AXNode{
+					{
+						NodeID: "1",
+						Role:   &contract.AXValue{Value: "window"},
+						Name:   &contract.AXValue{Value: "Task Manager"},
+					},
+				},
+			},
+		},
+	}
+	makeTargetDriver = func(driverName string, pool *cdp.SessionPool, cfg contract.Config) driver.TargetDriver {
+		if strings.EqualFold(driverName, "uia") {
+			return uia.NewDriverWithProvider(staticUIA)
+		}
+		return origMake(driverName, pool, cfg)
+	}
+
+	var (
+		mu             sync.Mutex
+		claimedUIA     bool
+		completedItems int
+		seenAllowed    []string
+	)
+
+	uiaRecipe := contract.Recipe{
+		Name:           "desktop-windows",
+		Topic:          "desktop-uia",
+		Driver:         "uia",
+		AllowedDomains: []string{"uia.local"},
+		Steps: []contract.Step{
+			{
+				ID:          "open_windows",
+				URL:         "uia://desktop",
+				WindowTitle: "*",
+				Items: &contract.ItemRule{
+					Container: "window",
+					Fields: map[string]contract.FieldRule{
+						"title": {Attr: "name"},
+					},
+				},
+				Expect: contract.Expectation{MinItems: 1},
+			},
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/tasks/claim"):
+			var req contract.ClaimTaskRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			seenAllowed = append([]string(nil), req.AllowedDrivers...)
+			if len(req.AllowedDrivers) == 1 && req.AllowedDrivers[0] == "uia" && !claimedUIA {
+				claimedUIA = true
+				_ = json.NewEncoder(w).Encode(contract.ClaimTaskResponse{
+					Task: &contract.Task{
+						ID:          "task_uia_1",
+						Kind:        contract.TaskKindExtract,
+						Recipe:      "desktop-windows",
+						Domain:      "uia.local",
+						Attempt:     1,
+						MaxAttempts: 2,
+					},
+					ResolvedRecipe: &uiaRecipe,
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(contract.ClaimTaskResponse{})
+		case strings.HasSuffix(r.URL.Path, "/complete"):
+			var sub contract.SubmitDropRequest
+			_ = json.NewDecoder(r.Body).Decode(&sub)
+			if len(sub.Report.Steps) > 0 {
+				completedItems = len(sub.Report.Steps[0].Items)
+			}
+			_, _ = w.Write([]byte(`{"ok":true,"drop_id":"drop_uia_1","short_id":"uia123","message_id":"msg_uia_1"}`))
+		default:
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}
+	}))
+	defer srv.Close()
+
+	disconn := false
+	cdpPrimary := &fakeDriver{
+		name:          "cdp",
+		connected:     &disconn,
+		browserStatus: "Disconnected (click Connect to retry)",
+	}
+	cfg := contract.Config{
+		From:         "win-pc",
+		ServiceURL:   srv.URL,
+		ServiceToken: "desk-tok",
+	}
+	client := bus.NewDesktopClient(cfg)
+
+	// 1. First pass: Chrome CDP is disconnected, but UIA is available -> claims & completes UIA task!
+	drained, err := drainQueue(context.Background(), cdpPrimary, cfg, client, "win-pc", 0, false, makeFallbackApprover("tray"))
+	if err != nil || drained != 1 {
+		t.Fatalf("drainQueue first pass: drained=%d err=%v, want drained=1 err=nil", drained, err)
+	}
+	if len(seenAllowed) != 1 || seenAllowed[0] != "uia" {
+		t.Fatalf("AllowedDrivers = %v, want [uia]", seenAllowed)
+	}
+	if completedItems != 1 {
+		t.Fatalf("completedItems = %d, want 1", completedItems)
+	}
+
+	// 2. Second pass: no more UIA tasks runnable while Chrome remains disconnected -> returns browser error.
+	drained2, err2 := drainQueue(context.Background(), cdpPrimary, cfg, client, "win-pc", 0, false, makeFallbackApprover("tray"))
+	if drained2 != 0 || err2 == nil || !strings.Contains(err2.Error(), "Disconnected") {
+		t.Fatalf("drainQueue second pass: drained=%d err=%v, want 0 + Disconnected error", drained2, err2)
 	}
 }

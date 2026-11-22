@@ -462,7 +462,7 @@ func (m *MemoryStore) sweepExpiredLeasesLocked(now time.Time) {
 	}
 }
 
-func (m *MemoryStore) ClaimNextTask(_ context.Context, host string, lease time.Duration) (*contract.Task, error) {
+func (m *MemoryStore) ClaimNextTask(_ context.Context, host string, lease time.Duration, allow func(contract.Task) bool) (*contract.Task, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -480,6 +480,9 @@ func (m *MemoryStore) ClaimNextTask(_ context.Context, host string, lease time.D
 			if b, paused := m.breakers[t.Domain]; paused && b.State == "paused_auth" {
 				continue
 			}
+		}
+		if allow != nil && !allow(*t) {
+			continue
 		}
 		if bestIdx == -1 || t.Priority > m.tasks[bestIdx].Priority {
 			bestIdx = i

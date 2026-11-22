@@ -14,7 +14,49 @@ import (
 	"github.com/tvaroska/deskdrop/internal/bus"
 	"github.com/tvaroska/deskdrop/internal/contract"
 	"github.com/tvaroska/deskdrop/internal/driver"
+	"github.com/tvaroska/deskdrop/internal/driver/uia"
 )
+
+var makeTargetDriver = newTargetDriver
+
+func uiaDriverAvailable(cfg contract.Config) bool {
+	alt := makeTargetDriver("uia", nil, cfg)
+	defer alt.Close()
+	if uiaDrv, ok := alt.(*uia.Driver); ok && uiaDrv.Provider != nil {
+		avail, _ := uiaDrv.Provider.Available()
+		return avail
+	}
+	return alt.ProbeStatus(context.Background()).Connected
+}
+
+func resolveRunnableDrivers(primaryDriverName string, primaryConnected bool, uiaAvailable bool) []string {
+	switch strings.ToLower(strings.TrimSpace(primaryDriverName)) {
+	case "uia":
+		if primaryConnected {
+			return []string{"uia"}
+		}
+		return nil
+	case "cdp":
+		if primaryConnected {
+			if uiaAvailable {
+				return []string{"cdp", "uia"}
+			}
+			return []string{"cdp"}
+		}
+		if uiaAvailable {
+			return []string{"uia"}
+		}
+		return nil
+	default:
+		if primaryConnected {
+			return nil
+		}
+		if uiaAvailable {
+			return []string{"uia"}
+		}
+		return nil
+	}
+}
 
 // FallbackApprover decides whether a bounded Tier-2 fallback_task is approved to run on the desktop.
 type FallbackApprover func(plan contract.FallbackPlan) (bool, error)
@@ -72,21 +114,27 @@ func drainQueue(
 ) (int, error) {
 	ws := collectWorkerStatus(ctx, drv, cfg, hostLabel, false, "sync", "")
 	_ = svcClient.ReportWorkerStatus(ctx, ws)
-	if !ws.BrowserConnected {
+
+	uiaAvail := strings.EqualFold(drv.Name(), "uia") && ws.BrowserConnected
+	if !strings.EqualFold(drv.Name(), "uia") {
+		uiaAvail = uiaDriverAvailable(cfg)
+	}
+	allowedDrivers := resolveRunnableDrivers(drv.Name(), ws.BrowserConnected, uiaAvail)
+	if !ws.BrowserConnected && len(allowedDrivers) == 0 {
 		return 0, errors.New(ws.BrowserStatus)
 	}
 
 	count := 0
 	for {
 		if hasCap && count >= remaining {
-			return count, nil
+			break
 		}
-		claimResp, err := svcClient.ClaimNextTask(ctx, hostLabel, 90, &ws)
+		claimResp, err := svcClient.ClaimNextTask(ctx, hostLabel, 90, &ws, allowedDrivers...)
 		if err != nil {
 			return count, err
 		}
 		if claimResp.Task == nil {
-			return count, nil
+			break
 		}
 		task := *claimResp.Task
 		count++
@@ -109,6 +157,10 @@ func drainQueue(
 		}
 		execExtractTask(ctx, drv, cfg, svcClient, hostLabel, task, *claimResp.ResolvedRecipe)
 	}
+	if count == 0 && !ws.BrowserConnected {
+		return 0, errors.New(ws.BrowserStatus)
+	}
+	return count, nil
 }
 
 func execExtractTask(
@@ -125,7 +177,7 @@ func execExtractTask(
 
 	execDrv := drv
 	if recipe.Driver != "" && !strings.EqualFold(recipe.NormalizedDriver(), drv.Name()) {
-		altDrv := newTargetDriver(recipe.NormalizedDriver(), nil, cfg)
+		altDrv := makeTargetDriver(recipe.NormalizedDriver(), nil, cfg)
 		defer altDrv.Close()
 		execDrv = altDrv
 	}

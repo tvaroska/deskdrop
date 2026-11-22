@@ -481,7 +481,25 @@ func (s *Service) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	task, err := s.store.ClaimNextTask(r.Context(), host, lease)
+	var allow func(contract.Task) bool
+	if len(req.AllowedDrivers) > 0 {
+		allowedSet := make(map[string]bool, len(req.AllowedDrivers))
+		for _, d := range req.AllowedDrivers {
+			if norm := strings.ToLower(strings.TrimSpace(d)); norm != "" {
+				allowedSet[norm] = true
+			}
+		}
+		if len(allowedSet) > 0 {
+			if s.catalog != nil {
+				_, _ = s.catalog.List(r.Context())
+			}
+			allow = func(t contract.Task) bool {
+				return allowedSet[s.taskDriver(r.Context(), t)]
+			}
+		}
+	}
+
+	task, err := s.store.ClaimNextTask(r.Context(), host, lease, allow)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "STORE_ERROR", err.Error(), nil)
 		return
@@ -500,6 +518,24 @@ func (s *Service) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 		Task:           task,
 		ResolvedRecipe: resolved,
 	})
+}
+
+func (s *Service) taskDriver(ctx context.Context, t contract.Task) string {
+	if t.Kind == contract.TaskKindFallback {
+		return "cdp"
+	}
+	if t.CustomRecipe != nil {
+		return t.CustomRecipe.NormalizedDriver()
+	}
+	if s.catalog != nil && t.Recipe != "" {
+		if rcp, ok, err := s.catalog.Get(ctx, t.Recipe); err == nil && ok {
+			return rcp.NormalizedDriver()
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(t.Domain), "uia.local") {
+		return "uia"
+	}
+	return "cdp"
 }
 
 func (s *Service) handleHeartbeatTask(w http.ResponseWriter, r *http.Request) {

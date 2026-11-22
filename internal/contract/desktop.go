@@ -399,9 +399,10 @@ type WorkerStatus struct {
 
 // ClaimTaskRequest is sent by deskdrop sync to lease the next runnable job.
 type ClaimTaskRequest struct {
-	Host         string        `json:"host"`
-	LeaseSeconds int           `json:"lease_seconds,omitempty"`
-	Worker       *WorkerStatus `json:"worker,omitempty"`
+	Host           string        `json:"host"`
+	LeaseSeconds   int           `json:"lease_seconds,omitempty"`
+	AllowedDrivers []string      `json:"allowed_drivers,omitempty"`
+	Worker         *WorkerStatus `json:"worker,omitempty"`
 }
 
 // ClaimTaskResponse returns the leased Task (or Task == nil when queue is idle).

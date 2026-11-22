@@ -7,6 +7,7 @@
 ## 2. Declarative Extraction Only & Approved Use-Cases (`RECIPES_URI`)
 - `eval_js` is retired completely (`contract.ParseJSONStrict` hard-rejects unknown fields). All extraction uses declarative `selectors`, `fields` (`FieldRule`), `items` (`ItemRule`), and bounded `pagination` (`PaginationRule`, `1..20` pages on the same allowlisted domain) evaluated identically across browser JS (`internal/driver/cdp`), pure Go HTML (`internal/verify`), and serialized `AXNode`/`UIA` semantic trees (`internal/contract/semantic_eval.go` + `internal/verify`).
 - Unapproved recipes or ad-hoc URLs outside `RECIPES_URI` are rejected with `HTTP 403`.
+- Rollout order: because `ReloadableCatalog` decodes `RECIPES_URI` with `contract.ParseJSONStrict` (`DisallowUnknownFields`), always deploy the updated `deskdrop-server` image (`ship deskdrop <tag>`) *before* uploading any `RECIPES_URI` bundle that introduces new `Recipe`, `Step`, or `FieldRule` JSON keys.
 
 ## 3. Privacy-Scrubbed Exception Diagnostics & Stateless Tabs
 - Happy-path runs capture `0` screenshots, `0` HTML dumps, `0` `AXTree` dumps, and consume `$0` LLM tokens.

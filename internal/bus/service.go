@@ -157,12 +157,13 @@ func (c *DesktopClient) SendErrorWithContext(ctx context.Context, to string, met
 	}, nil
 }
 
-func (c *DesktopClient) ClaimNextTask(ctx context.Context, host string, leaseSeconds int, worker *contract.WorkerStatus) (contract.ClaimTaskResponse, error) {
+func (c *DesktopClient) ClaimNextTask(ctx context.Context, host string, leaseSeconds int, worker *contract.WorkerStatus, allowedDrivers ...string) (contract.ClaimTaskResponse, error) {
 	var resp contract.ClaimTaskResponse
 	err := c.postJSONWithRetry(ctx, "/v1/tasks/claim", "", contract.ClaimTaskRequest{
-		Host:         host,
-		LeaseSeconds: leaseSeconds,
-		Worker:       worker,
+		Host:           host,
+		LeaseSeconds:   leaseSeconds,
+		AllowedDrivers: allowedDrivers,
+		Worker:         worker,
 	}, &resp)
 	return resp, err
 }
