@@ -2,26 +2,31 @@
 
 ## Where we are
 
-`deskdrop` `v1.0.0` is implemented locally with zero-dependency desktop CLI (`cmd/deskdrop`), atomic JSON `FileStore` relay (`cmd/server`), hot-reloadable `RECIPES_URI` catalog, pure-Go HTML verifier (`internal/verify`), and exception-only `adk-go` (`google.golang.org/adk/v2`) drift healer with `testdata/drift/` benchmark. Pending final public repository publish and production `/desktop` cutover. There is no `TODO.md`.
+`deskdrop` `v1.0.0` is live in production behind `/desktop` with a zero-dependency desktop CLI (`cmd/deskdrop`), atomic JSON `FileStore` relay (`cmd/server`), hot-reloadable `RECIPES_URI` catalog, and exception-only `adk-go` (`google.golang.org/adk/v2`) drift healer.
+
+**Implemented locally (pending `v1.1.0` release):**
+- Compact, privacy-redacted CDP `Accessibility.getFullAXTree` (`axtree.txt`) exception grounding paired with `dom.html`, deterministic `<canvas>`/WebGL blind-spot detection (`UNLABELLED_CANVAS_SURFACE`), and offline compression/selector/canvas benchmarks (`internal/healer/axtree_bench_test.go`).
+- Bounded declarative `"Next page"` `pagination` (`1..20` pages, disabled/`aria-disabled` stop, same-domain lock, cross-page item & table-row deduplication) with pure-Go multi-page verifier parity (`internal/verify/paginate.go`).
+- Direct `schtasks.exe` Windows Task Scheduler helper (`deskdrop schedule install|uninstall|status`) and quiet scheduled `sync` (`--quiet-cdp`, `--hide-console`).
+
+There is no `TODO.md`.
 
 ## Milestones at a glance
 
 | # | Milestone | Done when | Target |
 | :--- | :--- | :--- | :--- |
-| **M1** | Public Release & Live `/desktop` Cutover | `github.com/tvaroska/deskdrop` published as `v1.0.0`, live `/desktop` traffic cut over onto `1Gi` PVC `FileStore` + `RECIPES_URI`, smoke checks green. | `v1.0.0` (`P0`, Small) |
+| **M2** | `v1.1.0` Release & Post-Soak Legacy Retirement | `v1.1.0` (`AXTree`, `pagination`, `schedule`) tagged and live on `/desktop`, Windows PC `deskdrop.exe` soak verified, and legacy `browser-drop` retired. | `v1.1.0` (`P0`, Small) |
 
-## Milestone M1 — Public Release & Live `/desktop` Cutover
+## Milestone M2 — `v1.1.0` Release & Post-Soak Legacy Retirement
 
-- [ ] **M1.1:** Publish clean `main` and `v1.0.0` tag to public `github.com/tvaroska/deskdrop` and verify Cloud Build CI (`cloudbuild.yaml`).
-- [ ] **M1.2:** Stage externalized declarative `recipes.json` in Cloud Storage (`RECIPES_URI`), deploy `deskdrop` with `1Gi` PVC + Vertex AI Workload Identity behind `/desktop`, pass live smoke checks, and retire legacy `browser-drop`.
+- [ ] **M2.1 (`v1.1.0` release):** Commit, tag, and roll out `deskdrop v1.1.0` (`AXTree` hybrid grounding + `<canvas>` blind-spot gate, declarative `pagination`, and `deskdrop schedule` Windows Task Scheduler helper) via Cloud Build (`cloudbuild.yaml`) and verify `/v1/release/SHA256SUMS.txt`.
+- [ ] **M2.2 (Windows PC soak & legacy cleanup):** Switch the Windows PC worker to `deskdrop.exe` (`--fallback-gate=tray` or `deskdrop schedule install`), verify one live extraction cycle end-to-end, and retire legacy `browser-drop` + its PostgreSQL database.
 
 ## Unscheduled backlog
 
 - **Google Scholar Profile & Recommended Papers Recipe (`google-scholar-profile`):** External declarative CDP recipe for citation metrics, per-paper stats, and recommended articles, backed by scrubbed HTML snapshot tests and `AUTH_EXPIRED` detection.
-- **Accessibility Tree (`AXTree`) Grounding Evaluation:** Benchmark CDP `Accessibility.getFullAXTree` compact snapshots against scrubbed `dom.html` + screenshots for exception-route self-healing, including `<canvas>`/WebGL failure modes.
-- **Interactive Pagination & Windows Scheduler Helper:** Optional multi-page `"Next page"` loop step and `schtasks.exe` helper for background `sync`.
 - **Native Windows UI Automation (`UIA`) Adapter:** Second `TargetDriver` Adapter inspecting Windows semantic accessibility trees behind the same declarative `Recipe` and `Expect` Contracts.
 
 ## Shipped
 
-*(First release `v1.0.0` pending M1 tag & live verification.)*
+- **`v1.0.0` (`M1`, `2026-11-22`)** — Zero-dependency Go CDP CLI, `TargetDriver` Port, pure-Go HTML verifier (`0` `eval_js`), atomic JSON `FileStore`, hot-reloadable `RECIPES_URI`, `adk-go` exception healer, and live `/desktop` cutover — [archive](archive/roadmap-history.md#milestone-m1-public-v100-release-live-desktop-cutover)
