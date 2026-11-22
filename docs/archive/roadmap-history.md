@@ -4,6 +4,10 @@ Archived shipped milestones moved out of [`../roadmap.md`](../roadmap.md).
 
 ---
 
+## Milestone M4 & Release v1.3.1 — Windows UIA Adapter & CDP-Independent Queue Claiming
+
+- **M4.2 (`2026-11-22`, `268ea91`):** Shipped [`internal/driver/uia/`](../../internal/driver/uia) (`ADR-008`, pure-stdlib `CGO_ENABLED=0` `IUIAutomation` x64 COM vtable reader with BFS level-order walk and `SysFreeString` cleanup), `--driver cdp|uia` + `Recipe.Driver`, [`examples/recipes/desktop-task-manager.json`](../../examples/recipes/desktop-task-manager.json), `RECIPES_URI` rollout-order rule in [`CRITICAL.md`](../../CRITICAL.md), and `ClaimTaskRequest.AllowedDrivers` across [`cmd/deskdrop/sync.go`](../../cmd/deskdrop/sync.go), [`internal/bus/service.go`](../../internal/bus/service.go), and [`internal/server/http.go`](../../internal/server/http.go). Verified live on the Windows PC worker (`v1.3.1` automatic tray self-update -> live `desktop-windows` `UIAutomationCore.dll` COM drop completed while keeping pending `CDP` tasks untouched).
+
 ## Release v1.3.0 — Rollout Resilience, Scholar Contract & Windows UIA Adapter
 
 - **M2.1 (`2026-11-22`, `49c05d7`):** Shipped bounded `502`/`503`/`504`/`429` exponential backoff across `GET` (`GetDesktopStatus`, `ListApprovedRecipes`, `DownloadReleaseBinary`), JSON `POST`, and rewound multipart uploads in [`internal/bus/service.go`](../../internal/bus/service.go) + [`internal/bus/service_test.go`](../../internal/bus/service_test.go) and companion message-board CLI `_http_req` retry; verified live across the `v1.3.0` `Recreate` rollout and automatic Windows tray self-update.
