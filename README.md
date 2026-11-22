@@ -67,6 +67,6 @@ See [`examples/recipes/status-dashboard.json`](examples/recipes/status-dashboard
 ## Regenerative Blueprint & Docs
 
 - [`prompts/REGENERATE.md`](prompts/REGENERATE.md) — Delete-and-regenerate workflow for bounded adapters
-- [`DECISIONS.md`](DECISIONS.md) — Architectural decision records (`ADR-001`–`ADR-005`)
+- [`DECISIONS.md`](DECISIONS.md) — Architectural decision records (`ADR-001`–`ADR-006`)
 - [`CRITICAL.md`](CRITICAL.md) — Hard security, privacy, and compile-boundary invariants
 - [`docs/roadmap.md`](docs/roadmap.md) — Release plan and post-v1.0 backlog
