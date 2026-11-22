@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -354,6 +355,60 @@ func TestHappyPathSkipsAXTreeAndPaginationLoopsUntilDisabled(t *testing.T) {
 	}
 	if gotNext != 3 {
 		t.Fatalf("expected 3 Next-control probes (click p1->p2, click p2->p3, disabled on p3), got %d", gotNext)
+	}
+}
+
+func TestJSEvalFieldRuleNumericFallbackParity(t *testing.T) {
+	if !strings.Contains(shadowDOMHelperJS, `!parseCompactFloat(raw).ok`) {
+		t.Fatal("shadowDOMHelperJS missing numeric parseCompactFloat fallback_regex check")
+	}
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		return
+	}
+
+	script := shadowDOMHelperJS + `
+const card = {
+	nodeType: 1,
+	innerText: "Shipping clean declarative selectors. Like View analytics 64 11 2,450 impressions",
+	children: [],
+	querySelectorAll(sel) {
+		if (sel.includes("post-summary")) {
+			return [{ nodeType: 1, innerText: "View analytics", getAttribute: () => null, children: [] }];
+		}
+		if (sel.includes("reaction")) {
+			return [{ nodeType: 1, innerText: "Like", getAttribute: (k) => k === "aria-label" ? "Open reactions menu" : null, children: [] }];
+		}
+		return [];
+	}
+};
+const imp = evalFieldRule(card, {
+	selector: "a[href*='/analytics/post-summary/']",
+	attr: "text",
+	fallback_regex: "(?i)([\\d,.]+\\s*[KkMm]?)\\s+impressions\\b",
+	parse: "number"
+});
+const react = evalFieldRule(card, {
+	selector: "button[aria-label*='reaction']",
+	attr: "aria-label|text",
+	fallback_regex: "(?i)\\b(\\d+)(?:\\s+\\d+)?\\s+[\\d,]+\\s+impressions",
+	parse: "number"
+});
+console.log(JSON.stringify({ imp, react }));
+`
+	out, runErr := exec.Command(nodeBin, "-e", script).CombinedOutput()
+	if runErr != nil {
+		t.Fatalf("node JS runtime test failed: %v\n%s", runErr, string(out))
+	}
+	var got struct {
+		Imp   int64 `json:"imp"`
+		React int64 `json:"react"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &got); err != nil {
+		t.Fatalf("unmarshal node output %q: %v", string(out), err)
+	}
+	if got.Imp != 2450 || got.React != 64 {
+		t.Fatalf("JS evalFieldRule parity = %+v, want {Imp:2450 React:64}", got)
 	}
 }
 

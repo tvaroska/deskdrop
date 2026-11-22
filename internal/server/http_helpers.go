@@ -8,9 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tvaroska/deskdrop/internal/contract"
@@ -278,7 +281,38 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	_ = enc.Encode(payload)
 }
 
+var (
+	errLogMu  sync.Mutex
+	errLogger = log.New(os.Stderr, "", log.LstdFlags)
+)
+
+func setErrorLogOutputForTest(w io.Writer) func() {
+	errLogMu.Lock()
+	prev := errLogger.Writer()
+	errLogger.SetOutput(w)
+	errLogMu.Unlock()
+	return func() {
+		errLogMu.Lock()
+		errLogger.SetOutput(prev)
+		errLogMu.Unlock()
+	}
+}
+
 func writeAPIError(w http.ResponseWriter, status int, code string, message string, details any) {
+	if status >= http.StatusInternalServerError {
+		method, path := "-", "-"
+		if rw, ok := w.(*requestMetaWriter); ok {
+			if rw.method != "" {
+				method = rw.method
+			}
+			if rw.path != "" {
+				path = rw.path
+			}
+		}
+		errLogMu.Lock()
+		errLogger.Printf("ERROR %s %s status=%d code=%s message=%q", method, path, status, code, message)
+		errLogMu.Unlock()
+	}
 	errObj := map[string]any{
 		"code":    code,
 		"message": message,

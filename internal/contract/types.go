@@ -25,6 +25,7 @@ type Config struct {
 	ChromeProfile       string   `json:"chrome_profile,omitempty"`
 	ChromeProfileHyphen string   `json:"chrome-profile,omitempty"`
 	UserDataDir         string   `json:"user_data_dir,omitempty"`
+	Driver              string   `json:"driver,omitempty"` // "" | "cdp" | "uia"
 	DebugDir            string   `json:"debug_dir,omitempty"`
 	RecipesURI          string   `json:"recipes_uri,omitempty"`
 	FallbackGate        string   `json:"fallback_gate,omitempty"` // "auto" | "tray"
@@ -48,6 +49,14 @@ func (c Config) NormalizedFallbackGate() string {
 		return "tray"
 	}
 	return "auto"
+}
+
+// NormalizedDriver returns "uia" when explicitly configured, defaulting to "cdp".
+func (c Config) NormalizedDriver() string {
+	if strings.EqualFold(strings.TrimSpace(c.Driver), "uia") {
+		return "uia"
+	}
+	return "cdp"
 }
 
 // ParseConfigJSON decodes a deskdrop.json configuration file permissively (allowing // comments
@@ -91,10 +100,19 @@ type Recipe struct {
 	Name                     string            `json:"name"`
 	Topic                    string            `json:"topic"`
 	Description              string            `json:"description,omitempty"`
+	Driver                   string            `json:"driver,omitempty"` // "" / "cdp" | "uia"
 	AllowComputerUseFallback *bool             `json:"allow_computer_use_fallback,omitempty"`
 	AllowedDomains           []string          `json:"allowed_domains,omitempty"`
 	Defaults                 map[string]string `json:"defaults,omitempty"`
 	Steps                    []Step            `json:"steps"`
+}
+
+// NormalizedDriver returns "uia" when explicitly set on the recipe, defaulting to "cdp".
+func (r Recipe) NormalizedDriver() string {
+	if strings.EqualFold(strings.TrimSpace(r.Driver), "uia") {
+		return "uia"
+	}
+	return "cdp"
 }
 
 // AllowsComputerUseFallback defaults to true unless explicitly disabled by the recipe.
@@ -135,6 +153,7 @@ type Step struct {
 	ID             string               `json:"id"`
 	URL            string               `json:"url,omitempty"`
 	MatchTabURL    string               `json:"match_tab_url,omitempty"`
+	WindowTitle    string               `json:"window_title,omitempty"`
 	ReuseOpenTab   bool                 `json:"reuse_open_tab,omitempty"`
 	WaitSelector   string               `json:"wait_selector,omitempty"`
 	WaitText       string               `json:"wait_text,omitempty"`
@@ -241,6 +260,13 @@ func ResolveRecipe(r Recipe, cliVars map[string]string) (Recipe, error) {
 	if len(r.Steps) == 0 {
 		return Recipe{}, fmt.Errorf("recipe %q must define at least 1 step", r.Name)
 	}
+	drv := strings.ToLower(strings.TrimSpace(r.Driver))
+	switch drv {
+	case "", "cdp", "uia":
+		r.Driver = drv
+	default:
+		return Recipe{}, fmt.Errorf("recipe %q has invalid driver %q (expected cdp or uia)", r.Name, r.Driver)
+	}
 
 	merged := make(map[string]string, len(r.Defaults)+len(cliVars))
 	for k, v := range r.Defaults {
@@ -272,11 +298,12 @@ func ResolveRecipe(r Recipe, cliVars map[string]string) (Recipe, error) {
 		}
 		s.URL = sub(s.URL)
 		s.MatchTabURL = sub(s.MatchTabURL)
+		s.WindowTitle = strings.TrimSpace(sub(s.WindowTitle))
 		s.WaitSelector = sub(s.WaitSelector)
 		s.WaitText = sub(s.WaitText)
 		s.ClickSelector = sub(s.ClickSelector)
 		s.ClickIfPresent = sub(s.ClickIfPresent)
-		if s.URL == "" && s.MatchTabURL == "" {
+		if s.URL == "" && s.MatchTabURL == "" && (r.NormalizedDriver() != "uia" || s.WindowTitle == "") {
 			return Recipe{}, fmt.Errorf("step %q requires url or match_tab_url", s.ID)
 		}
 		if len(s.Selectors) > 0 {

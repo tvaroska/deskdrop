@@ -2,156 +2,109 @@ package main
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
-	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
-	"time"
 )
 
-func TestBuildSchtasksArgsSyncLogonAndSafetyChecks(t *testing.T) {
-	syncArgs, err := BuildSchtasksCreateArgs(ScheduleSpec{
-		TaskName:     "DeskDropSync",
-		Mode:         "sync",
-		Every:        15 * time.Minute,
+func TestBuildRegRunArgsAndSafetyChecks(t *testing.T) {
+	addArgs, err := BuildRegAddRunArgs(LogonSpec{
+		Name:         "DeskDrop",
 		ExePath:      `C:\Program Files\DeskDrop\deskdrop.exe`,
 		ConfigPath:   `C:\Users\Alice Smith\AppData\Roaming\deskdrop\config.json`,
 		CDPURL:       "http://127.0.0.1:9222",
 		FallbackGate: "tray",
 	})
 	if err != nil {
-		t.Fatalf("BuildSchtasksCreateArgs sync failed: %v", err)
+		t.Fatalf("BuildRegAddRunArgs failed: %v", err)
 	}
-	preview := FormatSchtasksCommand(syncArgs)
+	if addArgs[0] != "add" || addArgs[1] != RunRegistryKey || addArgs[2] != "/v" || addArgs[3] != "DeskDrop" || addArgs[5] != "REG_SZ" {
+		t.Fatalf("unexpected reg add args: %v", addArgs)
+	}
+	cmdData := addArgs[7]
 	for _, want := range []string{
-		"/Create",
-		"/TN DeskDropSync",
-		"--hide-console --quiet-cdp --fallback-gate tray",
-		"/SC MINUTE /MO 15",
-		"/F",
+		`"C:\Program Files\DeskDrop\deskdrop.exe" tray --fallback-gate tray`,
+		`--config "C:\Users\Alice Smith\AppData\Roaming\deskdrop\config.json"`,
+		`--cdp http://127.0.0.1:9222`,
 	} {
-		if !strings.Contains(preview, want) {
-			t.Fatalf("expected %q in preview:\n%s", want, preview)
+		if !strings.Contains(cmdData, want) {
+			t.Fatalf("expected %q in REG_SZ data:\n%s", want, cmdData)
 		}
 	}
 
-	// 2h interval maps cleanly to /SC HOURLY /MO 2.
-	hourlyArgs, err := BuildSchtasksCreateArgs(ScheduleSpec{
-		TaskName: "DeskDropHourly",
-		Mode:     "sync",
-		Every:    2 * time.Hour,
-		ExePath:  `C:\Tools\deskdrop.exe`,
-	})
-	if err != nil {
-		t.Fatalf("hourly BuildSchtasksCreateArgs failed: %v", err)
-	}
-	if !strings.Contains(FormatSchtasksCommand(hourlyArgs), "/SC HOURLY /MO 2") {
-		t.Fatalf("expected /SC HOURLY /MO 2, got %s", FormatSchtasksCommand(hourlyArgs))
+	preview := FormatRegCommand(addArgs)
+	if !strings.HasPrefix(preview, `reg.exe add HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v DeskDrop /t REG_SZ /d `) {
+		t.Fatalf("unexpected preview command:\n%s", preview)
 	}
 
-	// Logon mode launches persistent tray worker at ONLOGON.
-	logonArgs, err := BuildSchtasksCreateArgs(ScheduleSpec{
-		TaskName:     "DeskDropTray",
-		Mode:         "logon",
+	// Reject invalid registry value names and quote/control-char injection.
+	if _, err := BuildRegAddRunArgs(LogonSpec{
+		Name:    `Bad\Name`,
+		ExePath: `C:\Tools\deskdrop.exe`,
+	}); err == nil {
+		t.Fatal("expected backslash in --name to fail")
+	}
+	if _, err := BuildRegAddRunArgs(LogonSpec{
+		Name:    "DeskDrop",
+		ExePath: `C:\Tools\deskdrop.exe" & calc.exe`,
+	}); err == nil {
+		t.Fatal("expected embedded quote in --exe to fail")
+	}
+	if _, err := BuildRegAddRunArgs(LogonSpec{
+		Name:         "DeskDrop",
 		ExePath:      `C:\Tools\deskdrop.exe`,
-		FallbackGate: "tray",
-	})
-	if err != nil {
-		t.Fatalf("logon BuildSchtasksCreateArgs failed: %v", err)
-	}
-	if !strings.Contains(FormatSchtasksCommand(logonArgs), "/SC ONLOGON") || !strings.Contains(FormatSchtasksCommand(logonArgs), "tray --fallback-gate tray") {
-		t.Fatalf("unexpected logon preview: %s", FormatSchtasksCommand(logonArgs))
-	}
-
-	// Reject shell/quote injection or invalid intervals.
-	if _, err := BuildSchtasksCreateArgs(ScheduleSpec{
-		TaskName: "Bad;Name",
-		ExePath:  `C:\Tools\deskdrop.exe`,
-		Every:    15 * time.Minute,
+		FallbackGate: "invalid",
 	}); err == nil {
-		t.Fatal("expected invalid task name to fail")
-	}
-	if _, err := BuildSchtasksCreateArgs(ScheduleSpec{
-		TaskName: "DeskDropSync",
-		ExePath:  `C:\Tools\deskdrop.exe" & calc.exe`,
-		Every:    15 * time.Minute,
-	}); err == nil {
-		t.Fatal("expected embedded quote in exe path to fail")
-	}
-	if _, err := BuildSchtasksCreateArgs(ScheduleSpec{
-		TaskName: "DeskDropSync",
-		Mode:     "sync",
-		ExePath:  `C:\Tools\deskdrop.exe`,
-		Every:    25 * time.Hour,
-	}); err == nil {
-		t.Fatal("expected >23h59m interval to fail")
+		t.Fatal("expected invalid --fallback-gate to fail")
 	}
 }
 
-func TestScheduleCLIInstallStatusUninstallWithInjectedRunner(t *testing.T) {
+func TestScheduleCLIRegInstallStatusUninstallAndRejectsRetiredFlags(t *testing.T) {
 	var calls [][]string
 	mockExec := func(_ context.Context, binary string, args []string) (string, error) {
 		row := append([]string{binary}, args...)
 		calls = append(calls, row)
-		return "SUCCESS", nil
+		return "The operation completed successfully.", nil
 	}
 
 	if err := runScheduleWithExec([]string{
 		"install",
-		"--task-name", "DeskDropTest",
-		"--every", "10m",
-		"--exe", `C:\Tools\deskdrop.exe`,
+		"--name", "DeskDropWorker",
+		"--exe", `C:\Users\Tester\deskdrop\deskdrop.exe`,
 		"--fallback-gate", "tray",
 	}, mockExec); err != nil {
 		t.Fatalf("schedule install failed: %v", err)
 	}
-	if err := runScheduleWithExec([]string{"status", "--task-name", "DeskDropTest"}, mockExec); err != nil {
+	if err := runScheduleWithExec([]string{"status", "--name", "DeskDropWorker"}, mockExec); err != nil {
 		t.Fatalf("schedule status failed: %v", err)
 	}
-	if err := runScheduleWithExec([]string{"uninstall", "--task-name", "DeskDropTest"}, mockExec); err != nil {
+	if err := runScheduleWithExec([]string{"uninstall", "--name", "DeskDropWorker"}, mockExec); err != nil {
 		t.Fatalf("schedule uninstall failed: %v", err)
 	}
 
 	if len(calls) != 3 {
-		t.Fatalf("expected 3 schtasks.exe invocations, got %d", len(calls))
+		t.Fatalf("expected 3 reg.exe invocations, got %d", len(calls))
 	}
-	if calls[0][0] != "schtasks.exe" || calls[0][1] != "/Create" {
+	if calls[0][0] != "reg.exe" || calls[0][1] != "add" || calls[0][2] != RunRegistryKey {
 		t.Fatalf("unexpected install call: %v", calls[0])
 	}
-	if calls[1][1] != "/Query" {
+	if calls[1][0] != "reg.exe" || calls[1][1] != "query" {
 		t.Fatalf("unexpected status call: %v", calls[1])
 	}
-	if calls[2][1] != "/Delete" {
+	if calls[2][0] != "reg.exe" || calls[2][1] != "delete" {
 		t.Fatalf("unexpected uninstall call: %v", calls[2])
 	}
-}
 
-func TestQuietCDPSyncExitsZeroAndReportsHeartbeatWhenBrowserOffline(t *testing.T) {
-	var heartbeats atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/workers/heartbeat") {
-			heartbeats.Add(1)
-		}
-		_, _ = w.Write([]byte(`{"ok":true}`))
-	}))
-	defer srv.Close()
-
-	cfgFile := filepath.Join(t.TempDir(), "deskdrop.json")
-	t.Setenv("DESKDROP_SERVICE_URL", srv.URL)
-	t.Setenv("DESKDROP_TOKEN", "desk-tok")
-
-	// Point --cdp to a closed local HTTP port so ProbeQuiet returns connected=false without touching DevToolsActivePort.
-	err := cmdSync([]string{"--config", cfgFile, "--cdp", "http://127.0.0.1:1", "--quiet-cdp"})
-	if err != nil && !strings.Contains(err.Error(), "no such file") {
-		t.Fatalf("unexpected error: %v", err)
+	// Retired schtasks flags (--every, --mode) and sync scheduled flags (--quiet-cdp, --hide-console) must be rejected.
+	if err := runScheduleWithExec([]string{"install", "--every", "15m"}, mockExec); err == nil {
+		t.Fatal("expected retired --every flag on schedule install to fail")
 	}
-	// Run without explicit missing --config so loadConfig uses env vars cleanly.
-	if err := cmdSync([]string{"--cdp", "http://127.0.0.1:1", "--quiet-cdp"}); err != nil {
-		t.Fatalf("expected --quiet-cdp drain to exit 0 cleanly when browser offline, got %v", err)
+	if err := runScheduleWithExec([]string{"install", "--mode", "sync"}, mockExec); err == nil {
+		t.Fatal("expected retired --mode flag on schedule install to fail")
 	}
-	if heartbeats.Load() < 1 {
-		t.Fatalf("expected worker heartbeat report when browser offline, got %d", heartbeats.Load())
+	if err := cmdSync([]string{"--quiet-cdp"}); err == nil {
+		t.Fatal("expected retired --quiet-cdp flag on sync to fail")
+	}
+	if err := cmdSync([]string{"--hide-console"}); err == nil {
+		t.Fatal("expected retired --hide-console flag on sync to fail")
 	}
 }

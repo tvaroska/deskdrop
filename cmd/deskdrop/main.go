@@ -18,6 +18,7 @@ import (
 	"github.com/tvaroska/deskdrop/internal/contract"
 	"github.com/tvaroska/deskdrop/internal/driver"
 	"github.com/tvaroska/deskdrop/internal/driver/cdp"
+	"github.com/tvaroska/deskdrop/internal/driver/uia"
 )
 
 var version = "v1.1.0"
@@ -88,15 +89,33 @@ func printUsage() {
 
 Usage:
   deskdrop tray         [--interval 20s] [--fallback-gate auto|tray] [--cdp <url>] [--config <path>] [--console]
-  deskdrop sync         [--interval 0s] [--max-tasks 0] [--fallback-gate auto|tray] [--quiet-cdp] [--hide-console] [--cdp <url>] [--config <path>]
-  deskdrop schedule     <install|uninstall|status> [--every 15m] [--mode sync|logon] [--task-name DeskDropSync] [--dry-run]
-  deskdrop run          <recipe-file.json|approved-name> [--var key=val ...] [--to <agents>] [--dry-run]
+  deskdrop sync         [--interval 0s] [--max-tasks 0] [--fallback-gate auto|tray] [--driver cdp|uia] [--cdp <url>] [--config <path>]
+  deskdrop schedule     <install|uninstall|status> [--name DeskDrop] [--fallback-gate tray|auto] [--dry-run]
+  deskdrop run          <recipe-file.json|approved-name> [--driver cdp|uia] [--var key=val ...] [--to <agents>] [--dry-run]
   deskdrop recipes      [--config <path>]
-  deskdrop status       [--cdp <url>] [--config <path>]
+  deskdrop status       [--driver cdp|uia] [--cdp <url>] [--config <path>]
   deskdrop tabs         [--cdp <url>] [--config <path>]
   deskdrop open-browser [--browser chrome|edge] [--port 9222] [--profile <dir>]
   deskdrop update       [--config <path>]
   deskdrop version`)
+}
+
+func validateDriverName(raw string) (string, error) {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	if v == "" {
+		return "", nil
+	}
+	if v != "cdp" && v != "uia" {
+		return "", fmt.Errorf("invalid --driver %q (expected 'cdp' or 'uia')", raw)
+	}
+	return v, nil
+}
+
+func newTargetDriver(driverName string, pool *cdp.SessionPool, cfg contract.Config) driver.TargetDriver {
+	if strings.EqualFold(strings.TrimSpace(driverName), "uia") {
+		return uia.NewDriver(cfg)
+	}
+	return cdp.NewDriver(pool, cfg)
 }
 
 func validateFallbackGate(raw string) (string, error) {
@@ -254,6 +273,7 @@ func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "Optional config file path")
 	cdpURL := fs.String("cdp", "", "Explicit CDP ws:// or http:// URL")
+	driverFlag := fs.String("driver", "", "Target driver override (cdp|uia)")
 	to := fs.String("to", "", "Target agent(s) on relay message board")
 	dryRun := fs.Bool("dry-run", false, "Print extracted JSON to stdout without uploading")
 	vars := make(kvSlice)
@@ -261,9 +281,13 @@ func cmdRun(args []string) error {
 
 	recipeArg, flagArgs, err := splitPositionalFirst(args)
 	if err != nil {
-		return errors.New("usage: deskdrop run <recipe-file.json|approved-name> [--var key=val] [--dry-run]")
+		return errors.New("usage: deskdrop run <recipe-file.json|approved-name> [--driver cdp|uia] [--var key=val] [--dry-run]")
 	}
 	if err := fs.Parse(flagArgs); err != nil {
+		return err
+	}
+	drvOverride, err := validateDriverName(*driverFlag)
+	if err != nil {
 		return err
 	}
 
@@ -273,6 +297,9 @@ func cmdRun(args []string) error {
 	}
 	if *cdpURL != "" {
 		cfg.CDPURL = *cdpURL
+	}
+	if drvOverride != "" {
+		cfg.Driver = drvOverride
 	}
 
 	rawRecipe, err := loadRecipeFromArgOrRelay(recipeArg, cfg)
@@ -283,23 +310,29 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	return executeRecipeAndDeliver(resolved, cfg, *to, *dryRun)
+	effectiveDriver := resolved.NormalizedDriver()
+	if drvOverride != "" {
+		effectiveDriver = drvOverride
+	} else if resolved.Driver == "" {
+		effectiveDriver = cfg.NormalizedDriver()
+	}
+	return executeRecipeAndDeliver(resolved, effectiveDriver, cfg, *to, *dryRun)
 }
 
 func cmdSync(args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "Optional config file path")
 	cdpURL := fs.String("cdp", "", "Explicit CDP ws:// or http:// URL")
+	driverFlag := fs.String("driver", "", "Primary target driver (cdp|uia)")
 	interval := fs.Duration("interval", 0, "Poll interval for continuous worker mode (0 = drain once)")
 	maxTasks := fs.Int("max-tasks", 0, "Maximum tasks to execute before exiting (0 = unlimited)")
 	fallbackGate := fs.String("fallback-gate", "", "Tier-2 fallback gate (auto|tray)")
-	quietCDP := fs.Bool("quiet-cdp", false, "Never prompt Chrome 144+ DevToolsActivePort; exit 0 cleanly if browser is closed")
-	hideConsole := fs.Bool("hide-console", false, "Hide console window on Windows (for Task Scheduler runs)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *hideConsole {
-		hideConsoleWindow()
+	drvOverride, err := validateDriverName(*driverFlag)
+	if err != nil {
+		return err
 	}
 
 	cfg, err := loadConfig(*cfgPath)
@@ -308,6 +341,9 @@ func cmdSync(args []string) error {
 	}
 	if *cdpURL != "" {
 		cfg.CDPURL = *cdpURL
+	}
+	if drvOverride != "" {
+		cfg.Driver = drvOverride
 	}
 	if *fallbackGate != "" {
 		g, gerr := validateFallbackGate(*fallbackGate)
@@ -332,18 +368,12 @@ func cmdSync(args []string) error {
 
 	pool := cdp.NewSessionPool()
 	defer pool.Close()
-	drv := cdp.NewDriver(pool, cfg)
+	activeDriver := cfg.NormalizedDriver()
+	drv := newTargetDriver(activeDriver, pool, cfg)
+	defer drv.Close()
 	approver := makeFallbackApprover(cfg.NormalizedFallbackGate())
 
-	if *quietCDP {
-		conn, _ := pool.ProbeQuiet(ctx, cfg.CDPURL)
-		if !conn && *interval <= 0 {
-			ws := collectWorkerStatus(ctx, drv, cfg, hostLabel, false, "scheduled-sync", "")
-			_ = svcClient.ReportWorkerStatus(ctx, ws)
-			fmt.Println("Browser not connected on quiet CDP endpoint; reported idle heartbeat.")
-			return nil
-		}
-	} else {
+	if activeDriver == "cdp" {
 		// Single startup attempt for explicit interactive CLI sync.
 		_, _ = pool.Acquire(ctx, cfg.CDPURL, cfg.UserDataDir)
 	}
@@ -382,12 +412,20 @@ func cmdStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "Optional config file path")
 	cdpURL := fs.String("cdp", "", "Explicit CDP ws:// or http:// URL")
+	driverFlag := fs.String("driver", "", "Target driver (cdp|uia)")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	drvOverride, err := validateDriverName(*driverFlag)
+	if err != nil {
 		return err
 	}
 	cfg, cfgErr := loadConfig(*cfgPath)
 	if *cdpURL != "" {
 		cfg.CDPURL = *cdpURL
+	}
+	if drvOverride != "" {
+		cfg.Driver = drvOverride
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -395,8 +433,12 @@ func cmdStatus(args []string) error {
 
 	pool := cdp.NewSessionPool()
 	defer pool.Close()
-	_, _ = pool.Acquire(ctx, cfg.CDPURL, cfg.UserDataDir)
-	drv := cdp.NewDriver(pool, cfg)
+	activeDriver := cfg.NormalizedDriver()
+	if activeDriver == "cdp" {
+		_, _ = pool.Acquire(ctx, cfg.CDPURL, cfg.UserDataDir)
+	}
+	drv := newTargetDriver(activeDriver, pool, cfg)
+	defer drv.Close()
 
 	lastErr := ""
 	if cfgErr != nil {
@@ -405,6 +447,7 @@ func cmdStatus(args []string) error {
 	ws := collectWorkerStatus(ctx, drv, cfg, resolveHostLabel(cfg), false, "status", lastErr)
 	fmt.Printf("Local Client:      deskdrop %s (%s/%s)\n", ws.Version, ws.OS, ws.Arch)
 	fmt.Printf("Host Label:        %s (hostname=%s)\n", ws.Host, ws.Hostname)
+	fmt.Printf("Target Driver:     %s\n", drv.Name())
 	fmt.Printf("Fallback Gate:     %s\n", ws.FallbackGate)
 	if cfgErr != nil {
 		fmt.Printf("Config Status:     ERROR: %v\n", cfgErr)
@@ -456,11 +499,11 @@ func cmdUpdate(args []string) error {
 	return nil
 }
 
-func executeRecipeAndDeliver(recipe contract.Recipe, cfg contract.Config, to string, dryRun bool) error {
+func executeRecipeAndDeliver(recipe contract.Recipe, driverName string, cfg contract.Config, to string, dryRun bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	drv := cdp.NewDriver(nil, cfg)
+	drv := newTargetDriver(driverName, nil, cfg)
 	defer drv.Close()
 
 	hostname, _ := os.Hostname()
@@ -620,6 +663,7 @@ func loadConfig(explicitPath string) (contract.Config, error) {
 	applyEnv(&cfg.ChromeSession, "DESKDROP_CHROME_SESSION", "BROWSER_DROP_CHROME_SESSION")
 	applyEnv(&cfg.RecipesURI, "DESKDROP_RECIPES_URI", "RECIPES_URI")
 	applyEnv(&cfg.FallbackGate, "DESKDROP_FALLBACK_GATE", "")
+	applyEnv(&cfg.Driver, "DESKDROP_DRIVER", "")
 	return cfg, nil
 }
 

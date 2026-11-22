@@ -18,6 +18,11 @@ import (
 	"github.com/tvaroska/deskdrop/internal/contract"
 )
 
+const (
+	defaultRetryBaseDelay   = 400 * time.Millisecond
+	defaultMaxRetryAttempts = 4
+)
+
 // SendResult describes a delivered drop or diagnostic escalation.
 type SendResult struct {
 	ShortID    string `json:"short_id"`
@@ -40,13 +45,15 @@ func NewTransport(cfg contract.Config) Transport {
 
 // DesktopClient communicates with the deskdrop relay (/v1/* or /desktop/v1/*).
 type DesktopClient struct {
-	From           string
-	DefaultTo      string
-	BaseURL        string
-	Token          string
-	ClientVersion  string
-	ForbiddenTerms []string
-	HTTPClient     *http.Client
+	From             string
+	DefaultTo        string
+	BaseURL          string
+	Token            string
+	ClientVersion    string
+	ForbiddenTerms   []string
+	HTTPClient       *http.Client
+	RetryBaseDelay   time.Duration
+	MaxRetryAttempts int
 }
 
 // NewDesktopClient builds a relay client from Config.
@@ -61,12 +68,14 @@ func NewDesktopClient(cfg contract.Config) *DesktopClient {
 		to = "all"
 	}
 	return &DesktopClient{
-		From:           from,
-		DefaultTo:      to,
-		BaseURL:        strings.TrimRight(strings.TrimSpace(cfg.ServiceURL), "/"),
-		Token:          strings.TrimSpace(cfg.ServiceToken),
-		ForbiddenTerms: cfg.ForbiddenTerms,
-		HTTPClient:     &http.Client{Timeout: 30 * time.Second},
+		From:             from,
+		DefaultTo:        to,
+		BaseURL:          strings.TrimRight(strings.TrimSpace(cfg.ServiceURL), "/"),
+		Token:            strings.TrimSpace(cfg.ServiceToken),
+		ForbiddenTerms:   cfg.ForbiddenTerms,
+		HTTPClient:       &http.Client{Timeout: 30 * time.Second},
+		RetryBaseDelay:   defaultRetryBaseDelay,
+		MaxRetryAttempts: defaultMaxRetryAttempts,
 	}
 }
 
@@ -138,7 +147,7 @@ func (c *DesktopClient) SendErrorWithContext(ctx context.Context, to string, met
 		DiagnosticID string               `json:"diagnostic_id"`
 		Triage       contract.ErrorTriage `json:"triage"`
 	}
-	if err := c.postErrorMultipart(ctx, "/v1/errors", meta, zipBytes, &resp); err != nil {
+	if err := c.postErrorMultipart(ctx, "/v1/errors", "err-"+randomHex(8), meta, zipBytes, &resp); err != nil {
 		return SendResult{}, err
 	}
 	return SendResult{
@@ -175,17 +184,9 @@ func (c *DesktopClient) GetDesktopStatus(ctx context.Context) (map[string]any, e
 	if err := c.ValidateAuth(); err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/v1/status", nil)
+	raw, _, err := c.getWithRetry(ctx, "/v1/status", 256*1024, "relay")
 	if err != nil {
 		return nil, err
-	}
-	c.setCommonHeaders(req)
-	status, raw, doErr := c.doReq(req)
-	if doErr != nil {
-		return nil, doErr
-	}
-	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("relay HTTP %d: %s", status, strings.TrimSpace(string(raw)))
 	}
 	var out map[string]any
 	if err := json.Unmarshal(raw, &out); err != nil {
@@ -198,17 +199,9 @@ func (c *DesktopClient) ListApprovedRecipes(ctx context.Context) ([]contract.Rec
 	if err := c.ValidateAuth(); err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/v1/recipes", nil)
+	raw, _, err := c.getWithRetry(ctx, "/v1/recipes", 2*1024*1024, "relay recipes")
 	if err != nil {
 		return nil, err
-	}
-	c.setCommonHeaders(req)
-	status, raw, doErr := c.doReq(req)
-	if doErr != nil {
-		return nil, doErr
-	}
-	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("relay recipes HTTP %d: %s", status, strings.TrimSpace(string(raw)))
 	}
 	var parsed struct {
 		Recipes []contract.Recipe `json:"recipes"`
@@ -228,29 +221,11 @@ func (c *DesktopClient) DownloadReleaseBinary(ctx context.Context, goos string) 
 	if goos == "windows" {
 		asset = "deskdrop.exe"
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/v1/release/"+asset, nil)
+	data, hdr, err := c.getWithRetry(ctx, "/v1/release/"+asset, 25*1024*1024, "download release")
 	if err != nil {
 		return nil, "", err
 	}
-	c.setCommonHeaders(req)
-	hc := c.HTTPClient
-	if hc == nil {
-		hc = http.DefaultClient
-	}
-	resp, err := hc.Do(req)
-	if err != nil {
-		return nil, "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, "", fmt.Errorf("download release HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 25*1024*1024))
-	if err != nil {
-		return nil, "", err
-	}
-	return data, strings.TrimSpace(resp.Header.Get("X-DeskDrop-Version")), nil
+	return data, strings.TrimSpace(hdr.Get("X-DeskDrop-Version")), nil
 }
 
 func (c *DesktopClient) HeartbeatTask(ctx context.Context, taskID string, host string, leaseSeconds int) error {
@@ -301,7 +276,7 @@ func (c *DesktopClient) FailTask(ctx context.Context, taskID string, meta contra
 		Triage       contract.ErrorTriage `json:"triage"`
 		DiagnosticID string               `json:"diagnostic_id"`
 	}
-	if err := c.postErrorMultipart(ctx, "/v1/tasks/"+taskID+"/fail", meta, zipBytes, &resp); err != nil {
+	if err := c.postErrorMultipart(ctx, "/v1/tasks/"+taskID+"/fail", "fail-"+taskID, meta, zipBytes, &resp); err != nil {
 		return contract.ErrorTriage{}, "", err
 	}
 	return resp.Triage, resp.DiagnosticID, nil
@@ -319,7 +294,7 @@ func (c *DesktopClient) SubmitFallbackResult(ctx context.Context, taskID string,
 		FallbackDropID string `json:"fallback_drop_id"`
 		ProposalID     string `json:"proposal_id"`
 	}
-	if err := c.postErrorMultipart(ctx, "/v1/tasks/"+taskID+"/fallback-result", meta, zipBytes, &resp); err != nil {
+	if err := c.postErrorMultipart(ctx, "/v1/tasks/"+taskID+"/fallback-result", "fbres-"+taskID, meta, zipBytes, &resp); err != nil {
 		return "", "", err
 	}
 	return resp.FallbackDropID, resp.ProposalID, nil
@@ -333,14 +308,89 @@ func (c *DesktopClient) setCommonHeaders(req *http.Request) {
 	}
 }
 
+func (c *DesktopClient) maxAttempts() int {
+	if c.MaxRetryAttempts > 0 {
+		return c.MaxRetryAttempts
+	}
+	return defaultMaxRetryAttempts
+}
+
+func (c *DesktopClient) backoffDelay(attempt int) time.Duration {
+	base := c.RetryBaseDelay
+	if base <= 0 {
+		base = defaultRetryBaseDelay
+	}
+	if attempt <= 1 {
+		return base
+	}
+	shift := attempt - 1
+	if shift > 4 {
+		shift = 4
+	}
+	return base * time.Duration(1<<shift)
+}
+
+func isRolloutRetryStatus(status int, retryAll5xx bool) bool {
+	if status == http.StatusTooManyRequests ||
+		status == http.StatusBadGateway ||
+		status == http.StatusServiceUnavailable ||
+		status == http.StatusGatewayTimeout {
+		return true
+	}
+	return retryAll5xx && status >= 500
+}
+
+func (c *DesktopClient) getWithRetry(ctx context.Context, subPath string, maxBytes int64, errPrefix string) ([]byte, http.Header, error) {
+	urlStr := c.BaseURL + subPath
+	attempts := c.maxAttempts()
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+		if rerr != nil {
+			return nil, nil, rerr
+		}
+		c.setCommonHeaders(req)
+
+		status, raw, hdr, doErr := c.doReqWithLimit(req, maxBytes)
+		if doErr == nil && status >= 200 && status < 300 {
+			return raw, hdr, nil
+		}
+		if doErr != nil {
+			if ctx.Err() != nil {
+				return nil, nil, ctx.Err()
+			}
+			lastErr = doErr
+		} else {
+			errPreview := raw
+			if len(errPreview) > 4096 {
+				errPreview = errPreview[:4096]
+			}
+			lastErr = fmt.Errorf("%s HTTP %d: %s", errPrefix, status, strings.TrimSpace(string(errPreview)))
+			if !isRolloutRetryStatus(status, false) {
+				return nil, nil, lastErr
+			}
+		}
+		if attempt == attempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-time.After(c.backoffDelay(attempt)):
+		}
+	}
+	return nil, nil, lastErr
+}
+
 func (c *DesktopClient) postJSONWithRetry(ctx context.Context, subPath string, idempKey string, payload any, dst any) error {
 	bodyBytes, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 	urlStr := c.BaseURL + subPath
+	attempts := c.maxAttempts()
 	var lastErr error
-	for attempt := 1; attempt <= 3; attempt++ {
+	for attempt := 1; attempt <= attempts; attempt++ {
 		req, rerr := http.NewRequestWithContext(ctx, http.MethodPost, urlStr, bytes.NewReader(bodyBytes))
 		if rerr != nil {
 			return rerr
@@ -351,7 +401,7 @@ func (c *DesktopClient) postJSONWithRetry(ctx context.Context, subPath string, i
 			req.Header.Set("Idempotency-Key", idempKey)
 		}
 
-		status, raw, doErr := c.doReq(req)
+		status, raw, _, doErr := c.doReqWithLimit(req, 256*1024)
 		if doErr == nil && status >= 200 && status < 300 {
 			if dst != nil && len(raw) > 0 {
 				_ = json.Unmarshal(raw, dst)
@@ -359,25 +409,31 @@ func (c *DesktopClient) postJSONWithRetry(ctx context.Context, subPath string, i
 			return nil
 		}
 		if doErr != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			lastErr = doErr
 		} else {
 			lastErr = fmt.Errorf("relay HTTP %d: %s", status, strings.TrimSpace(string(raw)))
-			if status < 500 && status != http.StatusTooManyRequests {
+			if !isRolloutRetryStatus(status, true) {
 				return lastErr
 			}
+		}
+		if attempt == attempts {
+			break
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(time.Duration(attempt*400) * time.Millisecond):
+		case <-time.After(c.backoffDelay(attempt)):
 		}
 	}
 	return lastErr
 }
 
-func (c *DesktopClient) postErrorMultipart(ctx context.Context, subPath string, meta contract.FailReportMetadata, zipBytes []byte, dst any) error {
+func (c *DesktopClient) postErrorMultipart(ctx context.Context, subPath string, idempKey string, meta contract.FailReportMetadata, zipBytes []byte, dst any) error {
 	if len(zipBytes) == 0 {
-		return c.postJSONWithRetry(ctx, subPath, "", meta, dst)
+		return c.postJSONWithRetry(ctx, subPath, idempKey, meta, dst)
 	}
 
 	var buf bytes.Buffer
@@ -412,38 +468,64 @@ func (c *DesktopClient) postErrorMultipart(ctx context.Context, subPath string, 
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+subPath, &buf)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	c.setCommonHeaders(req)
+	mpBytes := buf.Bytes()
+	contentType := mw.FormDataContentType()
+	urlStr := c.BaseURL + subPath
+	attempts := c.maxAttempts()
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodPost, urlStr, bytes.NewReader(mpBytes))
+		if rerr != nil {
+			return rerr
+		}
+		req.Header.Set("Content-Type", contentType)
+		c.setCommonHeaders(req)
+		if idempKey != "" {
+			req.Header.Set("Idempotency-Key", idempKey)
+		}
 
-	status, raw, doErr := c.doReq(req)
-	if doErr != nil {
-		return doErr
+		status, raw, _, doErr := c.doReqWithLimit(req, 256*1024)
+		if doErr == nil && status >= 200 && status < 300 {
+			if dst != nil && len(raw) > 0 {
+				_ = json.Unmarshal(raw, dst)
+			}
+			return nil
+		}
+		if doErr != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			lastErr = doErr
+		} else {
+			lastErr = fmt.Errorf("relay HTTP %d: %s", status, strings.TrimSpace(string(raw)))
+			if !isRolloutRetryStatus(status, false) {
+				return lastErr
+			}
+		}
+		if attempt == attempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(c.backoffDelay(attempt)):
+		}
 	}
-	if status < 200 || status >= 300 {
-		return fmt.Errorf("relay HTTP %d: %s", status, strings.TrimSpace(string(raw)))
-	}
-	if dst != nil && len(raw) > 0 {
-		_ = json.Unmarshal(raw, dst)
-	}
-	return nil
+	return lastErr
 }
 
-func (c *DesktopClient) doReq(req *http.Request) (int, []byte, error) {
+func (c *DesktopClient) doReqWithLimit(req *http.Request, maxBytes int64) (int, []byte, http.Header, error) {
 	hc := c.HTTPClient
 	if hc == nil {
 		hc = http.DefaultClient
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
-	return resp.StatusCode, raw, nil
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
+	return resp.StatusCode, raw, resp.Header, nil
 }
 
 func randomHex(nBytes int) string {

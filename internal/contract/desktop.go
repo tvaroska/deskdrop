@@ -78,10 +78,18 @@ func ClassifyExtractionError(errMsg string, landedURL string, fallbackDomain str
 	if strings.Contains(lowerErr, "blocked/login url") ||
 		strings.Contains(lowerErr, "session expired") ||
 		strings.Contains(lowerErr, "sign in") ||
+		strings.Contains(lowerErr, "unusual traffic") ||
+		strings.Contains(lowerErr, "captcha") ||
 		strings.Contains(lowerURL, "accounts.google.com") ||
 		strings.Contains(lowerURL, "/servicelogin") ||
 		strings.Contains(lowerURL, "/signin") ||
-		strings.Contains(lowerURL, "/login") {
+		strings.Contains(lowerURL, "/login") ||
+		strings.Contains(lowerURL, "/sorry/") ||
+		strings.Contains(lowerURL, "captcha") ||
+		strings.Contains(lowerURL, "/challenge") {
+		if fallbackDomain != "" && !DomainsMatch(domain, fallbackDomain) {
+			domain = fallbackDomain
+		}
 		return ErrorTriage{
 			Code:   ErrorCodeAuthExpired,
 			Action: TriageHoldDomainAuth,
@@ -189,6 +197,9 @@ func InferRecipeDomain(r Recipe) string {
 			return d
 		}
 	}
+	if r.NormalizedDriver() == "uia" {
+		return "uia.local"
+	}
 	return ""
 }
 
@@ -212,6 +223,9 @@ func InferRecipeDomains(r Recipe) []string {
 	for _, s := range r.Steps {
 		add(s.URL)
 		add(s.MatchTabURL)
+	}
+	if len(out) == 0 && r.NormalizedDriver() == "uia" {
+		out = append(out, "uia.local")
 	}
 	return out
 }

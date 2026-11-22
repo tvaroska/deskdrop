@@ -123,6 +123,13 @@ func execExtractTask(
 	stepCtx, cancel := context.WithTimeout(parentCtx, 120*time.Second)
 	defer cancel()
 
+	execDrv := drv
+	if recipe.Driver != "" && !strings.EqualFold(recipe.NormalizedDriver(), drv.Name()) {
+		altDrv := newTargetDriver(recipe.NormalizedDriver(), nil, cfg)
+		defer altDrv.Close()
+		execDrv = altDrv
+	}
+
 	hbDone := startTaskHeartbeat(stepCtx, svcClient, task.ID, hostLabel)
 
 	hostname, _ := os.Hostname()
@@ -136,7 +143,7 @@ func execExtractTask(
 	}
 
 	for _, step := range recipe.Steps {
-		res, stepErr := drv.ExecuteStep(stepCtx, step)
+		res, stepErr := execDrv.ExecuteStep(stepCtx, step)
 		if stepErr != nil {
 			cancel()
 			<-hbDone

@@ -41,7 +41,7 @@ func (c *Client) ExecuteStep(ctx context.Context, step contract.Step) (contract.
 				if bestCtx != "" && p.BrowserContextID != "" && p.BrowserContextID != bestCtx {
 					continue
 				}
-				if strings.Contains(strings.ToLower(p.URL), strings.ToLower(matchPattern)) {
+				if matchesTabPattern(p.URL, matchPattern) {
 					sessionID, err := c.AttachPage(sctx, p.TargetID)
 					if err == nil {
 						_ = c.Call(sctx, sessionID, "Runtime.enable", nil, nil)
@@ -297,6 +297,27 @@ func (c *Client) waitDocumentReady(ctx context.Context, sessionID string) error 
 		}
 	}
 	return nil
+}
+
+func matchesTabPattern(pageURL string, pattern string) bool {
+	uLower := strings.ToLower(strings.TrimSpace(pageURL))
+	pLower := strings.ToLower(strings.TrimSpace(pattern))
+	if uLower == "" || pLower == "" {
+		return false
+	}
+	if strings.HasSuffix(pLower, "$") {
+		base := strings.TrimSuffix(pLower, "$")
+		noFrag := strings.SplitN(uLower, "#", 2)[0]
+		noQuery := strings.SplitN(noFrag, "?", 2)[0]
+		if strings.HasSuffix(noQuery, base) {
+			return true
+		}
+		if strings.HasSuffix(base, "/") && strings.HasSuffix(noQuery+"/", base) {
+			return true
+		}
+		return false
+	}
+	return strings.Contains(uLower, pLower)
 }
 
 func (c *Client) waitForCondition(ctx context.Context, sessionID string, selector string, text string, forbiddenURLSubstrings []string) error {

@@ -72,6 +72,7 @@ components:
         name: { type: string }
         topic: { type: string }
         description: { type: string }
+        driver: { type: string, enum: ["", cdp, uia], default: cdp }
         allow_computer_use_fallback: { type: boolean, default: true }
         allowed_domains:
           type: array
@@ -85,6 +86,7 @@ components:
               id: { type: string }
               url: { type: string }
               match_tab_url: { type: string }
+              window_title: { type: string }
               click_if_present: { type: string }
               fields:
                 type: object

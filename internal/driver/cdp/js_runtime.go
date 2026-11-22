@@ -227,10 +227,16 @@ function evalFieldRule(scopeEl, rule) {
 	if (raw && rule.regex) {
 		raw = applyRegexCapture(raw, rule.regex, rule.group || 0);
 	}
-	if (!raw && rule.fallback_regex) {
-		raw = applyRegexCapture(cleanText(scopeEl), rule.fallback_regex, rule.fallback_group || 0);
-	}
 	raw = normalizeWS(raw);
+	if (rule.fallback_regex) {
+		let needFallback = !raw;
+		if (!needFallback && (rule.parse === "number" || rule.parse === "float")) {
+			needFallback = !parseCompactFloat(raw).ok;
+		}
+		if (needFallback) {
+			raw = normalizeWS(applyRegexCapture(cleanText(scopeEl), rule.fallback_regex, rule.fallback_group || 0));
+		}
+	}
 	if (!raw) {
 		if (rule.optional) return undefined;
 		if (rule.parse === "number" || rule.parse === "float") return 0;

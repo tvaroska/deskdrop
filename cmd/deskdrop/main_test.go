@@ -140,3 +140,24 @@ func TestIsNewerVersion(t *testing.T) {
 		t.Fatal("expected v1.0.0 not newer than v1.0.0")
 	}
 }
+
+func TestValidateDriverAndSelection(t *testing.T) {
+	for _, okName := range []string{"", "cdp", "uia", "UIA"} {
+		if _, err := validateDriverName(okName); err != nil {
+			t.Fatalf("validateDriverName(%q) failed: %v", okName, err)
+		}
+	}
+	if _, err := validateDriverName("playwright"); err == nil {
+		t.Fatal("expected unsupported driver name to fail")
+	}
+	uiaDrv := newTargetDriver("uia", nil, contract.Config{})
+	defer uiaDrv.Close()
+	if uiaDrv.Name() != "uia" {
+		t.Fatalf("uiaDrv.Name() = %q, want uia", uiaDrv.Name())
+	}
+	cdpDrv := newTargetDriver("cdp", nil, contract.Config{})
+	defer cdpDrv.Close()
+	if cdpDrv.Name() != "cdp" {
+		t.Fatalf("cdpDrv.Name() = %q, want cdp", cdpDrv.Name())
+	}
+}

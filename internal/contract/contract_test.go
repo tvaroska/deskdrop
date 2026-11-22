@@ -100,6 +100,31 @@ func TestClassifyExtractionError(t *testing.T) {
 	if got := ClassifyExtractionError("fallback declined by user in tray", "https://example.com", "example.com", false); got.Code != ErrorCodeFallbackDeclined {
 		t.Fatalf("expected FALLBACK_DECLINED, got %+v", got)
 	}
+	// Google Scholar /sorry/ rate-limit and login redirects must fail closed into AUTH_EXPIRED on scholar.google.com.
+	if got := ClassifyExtractionError(
+		`step "profile_citations" landed on blocked/login URL "https://www.google.com/sorry/index?continue=https://scholar.google.com/citations" (matched "/sorry/")`,
+		"https://www.google.com/sorry/index?continue=https://scholar.google.com/citations",
+		"scholar.google.com",
+		false,
+	); got.Code != ErrorCodeAuthExpired || got.Action != TriageHoldDomainAuth || got.Domain != "scholar.google.com" {
+		t.Fatalf("expected /sorry/ redirect to trip AUTH_EXPIRED on scholar.google.com, got %+v", got)
+	}
+	if got := ClassifyExtractionError(
+		"unusual traffic detected",
+		"https://ipv4.google.com/sorry/index",
+		"scholar.google.com",
+		true,
+	); got.Code != ErrorCodeAuthExpired || got.Domain != "scholar.google.com" {
+		t.Fatalf("expected ipv4 /sorry/ challenge to trip AUTH_EXPIRED on scholar.google.com, got %+v", got)
+	}
+	if got := ClassifyExtractionError(
+		"please sign in to continue",
+		"https://accounts.google.com/v3/signin/identifier?continue=https://scholar.google.com/",
+		"scholar.google.com",
+		false,
+	); got.Code != ErrorCodeAuthExpired || got.Domain != "scholar.google.com" {
+		t.Fatalf("expected accounts.google.com login redirect to trip AUTH_EXPIRED on scholar.google.com, got %+v", got)
+	}
 }
 
 func TestFormatCompactAXTreeRedactsInputsAndDetectsCanvasBlindSpot(t *testing.T) {

@@ -42,18 +42,75 @@ type AXProperty struct {
 	Value AXValue `json:"value"`
 }
 
-// AXNode mirrors a node from Chrome DevTools Protocol Accessibility.getFullAXTree.
+// AXNode mirrors a node from Chrome DevTools Protocol Accessibility.getFullAXTree
+// or a native desktop accessibility tree such as Windows UI Automation (UIA).
 type AXNode struct {
 	NodeID           string       `json:"nodeId"`
 	Ignored          bool         `json:"ignored,omitempty"`
 	ParentID         string       `json:"parentId,omitempty"`
 	ChildIDs         []string     `json:"childIds,omitempty"`
 	BackendDOMNodeID int64        `json:"backendDOMNodeId,omitempty"`
+	AutomationID     string       `json:"automationId,omitempty"`
+	ClassName        string       `json:"className,omitempty"`
+	IsPassword       bool         `json:"isPassword,omitempty"`
 	Role             *AXValue     `json:"role,omitempty"`
 	Name             *AXValue     `json:"name,omitempty"`
 	Description      *AXValue     `json:"description,omitempty"`
 	Value            *AXValue     `json:"value,omitempty"`
 	Properties       []AXProperty `json:"properties,omitempty"`
+}
+
+// ScrubAXNodes returns a copy of nodes with password and editable control values redacted to "[REDACTED]".
+func ScrubAXNodes(nodes []AXNode) []AXNode {
+	if len(nodes) == 0 {
+		return nil
+	}
+	out := make([]AXNode, len(nodes))
+	for i, n := range nodes {
+		cp := n
+		if len(n.ChildIDs) > 0 {
+			cp.ChildIDs = append([]string(nil), n.ChildIDs...)
+		}
+		if len(n.Properties) > 0 {
+			cp.Properties = make([]AXProperty, len(n.Properties))
+			copy(cp.Properties, n.Properties)
+		}
+		roleLower := NormalizeAXRole(n.Role.StringValue())
+		isPwd := n.IsPassword || roleLower == "password" || hasTruthyAXProp(n.Properties, "ispassword") || hasTruthyAXProp(n.Properties, "password")
+		if isPwd {
+			cp.IsPassword = true
+		}
+		if cp.Value != nil && cp.Value.StringValue() != "" && (isPwd || isSensitiveInputRole(roleLower)) {
+			cp.Value = &AXValue{Type: "string", Value: "[REDACTED]"}
+		}
+		for pi := range cp.Properties {
+			pk := strings.ToLower(strings.TrimSpace(cp.Properties[pi].Name))
+			if pk == "value" && cp.Properties[pi].Value.StringValue() != "" && (isPwd || isSensitiveInputRole(roleLower)) {
+				cp.Properties[pi].Value = AXValue{Type: "string", Value: "[REDACTED]"}
+			}
+		}
+		out[i] = cp
+	}
+	return out
+}
+
+// NormalizeAXRole maps CDP and Windows UIA ControlType names to lowercase canonical role tokens.
+func NormalizeAXRole(raw string) string {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	s = strings.TrimPrefix(s, "controltype.")
+	s = strings.TrimPrefix(s, "uia_")
+	s = strings.TrimSuffix(s, "controltypeid")
+	return s
+}
+
+func hasTruthyAXProp(props []AXProperty, keyLower string) bool {
+	for _, p := range props {
+		if strings.ToLower(strings.TrimSpace(p.Name)) == keyLower {
+			v := strings.ToLower(p.Value.StringValue())
+			return v == "true" || v == "1"
+		}
+	}
+	return false
 }
 
 // AXGroundingStats summarizes semantic density and canvas/WebGL blind spots in an AXTree snapshot.
@@ -154,7 +211,7 @@ func FormatCompactAXTree(nodes []AXNode, rawByteLen int) (string, AXGroundingSta
 		}
 
 		role := strings.TrimSpace(n.Role.StringValue())
-		roleLower := strings.ToLower(role)
+		roleLower := NormalizeAXRole(role)
 
 		// InlineTextBox duplicates glyph runs already present in parent StaticText.
 		if roleLower == "inlinetextbox" {
@@ -171,7 +228,8 @@ func FormatCompactAXTree(nodes []AXNode, rawByteLen int) (string, AXGroundingSta
 
 		name := n.Name.StringValue()
 		val := n.Value.StringValue()
-		if isSensitiveInputRole(roleLower) && val != "" {
+		isPwd := n.IsPassword || roleLower == "password" || hasTruthyAXProp(n.Properties, "ispassword") || hasTruthyAXProp(n.Properties, "password")
+		if (isPwd || isSensitiveInputRole(roleLower)) && val != "" {
 			val = "[REDACTED]"
 		}
 
@@ -216,6 +274,9 @@ func FormatCompactAXTree(nodes []AXNode, rawByteLen int) (string, AXGroundingSta
 		b.WriteString("]")
 		if name != "" {
 			fmt.Fprintf(&b, " %q", truncateAXStr(name, 180))
+		}
+		if autoID := strings.TrimSpace(n.AutomationID); autoID != "" {
+			fmt.Fprintf(&b, " id=%q", truncateAXStr(autoID, 80))
 		}
 		if val != "" && val != name {
 			fmt.Fprintf(&b, " value=%q", truncateAXStr(val, 120))
@@ -268,7 +329,7 @@ func InspectHTMLCanvasBlindSpot(scrubbedHTML string, axStats AXGroundingStats) b
 
 func isSensitiveInputRole(roleLower string) bool {
 	switch roleLower {
-	case "textbox", "searchbox", "combobox", "spinbutton", "password":
+	case "textbox", "edit", "searchbox", "combobox", "spinbutton", "password":
 		return true
 	default:
 		return false

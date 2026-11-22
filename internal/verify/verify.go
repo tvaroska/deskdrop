@@ -68,6 +68,69 @@ func VerifyRecipeOnHTML(recipe contract.Recipe, vars map[string]string, stepID s
 	return out, nil
 }
 
+// VerifyRecipeOnAXTree resolves recipe variables, evaluates declarative FieldRule / ItemRule
+// contracts over a serialized AXNode / Windows UIA semantic tree, and enforces Expectations.
+func VerifyRecipeOnAXTree(recipe contract.Recipe, vars map[string]string, stepID string, nodes []contract.AXNode, landedURI string) (VerifyOutcome, error) {
+	resolved, err := contract.ResolveRecipe(recipe, vars)
+	if err != nil {
+		return VerifyOutcome{Passed: false, Error: err.Error()}, err
+	}
+	var target *contract.Step
+	if strings.TrimSpace(stepID) == "" {
+		target = &resolved.Steps[0]
+	} else {
+		for i := range resolved.Steps {
+			if resolved.Steps[i].ID == stepID {
+				target = &resolved.Steps[i]
+				break
+			}
+		}
+	}
+	if target == nil {
+		return VerifyOutcome{Passed: false, Error: fmt.Sprintf("step %q not found in recipe %q", stepID, resolved.Name)}, fmt.Errorf("step %q not found", stepID)
+	}
+	if landedURI == "" {
+		if target.URL != "" {
+			landedURI = target.URL
+		} else if target.WindowTitle != "" {
+			landedURI = "uia://window/" + target.WindowTitle
+		}
+	}
+
+	res, err := ExtractStepFromAXTree(*target, nodes, landedURI)
+	if err != nil {
+		return VerifyOutcome{Passed: false, StepID: target.ID, Error: err.Error()}, err
+	}
+	valErr := contract.ValidateStepResult(*target, res)
+	out := VerifyOutcome{
+		Passed:      valErr == nil,
+		StepID:      target.ID,
+		StepResult:  res,
+		ItemCount:   len(res.Items),
+		FieldCount:  len(res.Fields),
+		TableCount:  len(res.Tables),
+		MetricCount: len(res.Metrics),
+	}
+	if valErr != nil {
+		out.Error = valErr.Error()
+	}
+	return out, nil
+}
+
+// VerifyRecipeOnAXTreeJSON decodes a serialized AXNode JSON snapshot and runs VerifyRecipeOnAXTree.
+func VerifyRecipeOnAXTreeJSON(recipe contract.Recipe, vars map[string]string, stepID string, rawAXJSON []byte, landedURI string) (VerifyOutcome, error) {
+	nodes, err := contract.ParseAXTreeJSON(rawAXJSON)
+	if err != nil {
+		return VerifyOutcome{Passed: false, Error: err.Error()}, err
+	}
+	return VerifyRecipeOnAXTree(recipe, vars, stepID, nodes, landedURI)
+}
+
+// ExtractStepFromAXTree evaluates a declarative Step over an AXNode / UIA semantic tree.
+func ExtractStepFromAXTree(step contract.Step, nodes []contract.AXNode, landedURI string) (contract.StepResult, error) {
+	return contract.ExtractStepFromAXNodes(step, nodes, landedURI)
+}
+
 // ExtractStepFromHTML evaluates a declarative contract.Step against a scrubbed HTML document in pure Go,
 // mirroring internal/driver/cdp's in-browser declarative extractor.
 func ExtractStepFromHTML(step contract.Step, htmlDoc string, landedURL string) (contract.StepResult, error) {
@@ -174,10 +237,17 @@ func evalFieldRule(scope *html.Node, rule contract.FieldRule) (any, bool) {
 	if raw != "" && rule.Regex != "" {
 		raw = applyRegex(raw, rule.Regex, rule.Group)
 	}
-	if raw == "" && rule.FallbackRegex != "" {
-		raw = applyRegex(nodeText(scope), rule.FallbackRegex, rule.FallbackGroup)
-	}
 	raw = contract.NormalizeWhitespace(raw)
+	if rule.FallbackRegex != "" {
+		needFallback := raw == ""
+		if !needFallback && (rule.Parse == "number" || rule.Parse == "float") {
+			_, ok := contract.ParseCompactFloat(raw)
+			needFallback = !ok
+		}
+		if needFallback {
+			raw = contract.NormalizeWhitespace(applyRegex(nodeText(scope), rule.FallbackRegex, rule.FallbackGroup))
+		}
+	}
 	if raw == "" {
 		if rule.Optional {
 			return nil, false

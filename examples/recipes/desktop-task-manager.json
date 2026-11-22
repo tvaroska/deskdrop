@@ -1,0 +1,53 @@
+{
+  "name": "desktop-task-manager",
+  "topic": "desktop-telemetry",
+  "description": "Inspects an open Windows Task Manager window via read-only UI Automation (UIA) to extract CPU/Memory utilization and active process rows.",
+  "driver": "uia",
+  "allow_computer_use_fallback": false,
+  "allowed_domains": ["uia.local"],
+  "defaults": {
+    "window_title": "Task Manager"
+  },
+  "steps": [
+    {
+      "id": "processes",
+      "url": "uia://window/{{window_title}}",
+      "window_title": "{{window_title}}",
+      "reuse_open_tab": true,
+      "fields": {
+        "cpu_pct": {
+          "selector": "[automation_id='CpuUtilizationText'], [name*='CPU']",
+          "regex": "(\\d+)\\s*%",
+          "parse": "number"
+        },
+        "memory_gb": {
+          "selector": "[automation_id='MemoryUsageText'], [name*='Memory']",
+          "regex": "([\\d.]+)\\s*GB",
+          "parse": "float",
+          "optional": true
+        }
+      },
+      "items": {
+        "container": "datagrid > dataitem, table > row, list > listitem",
+        "dedupe_by": "process",
+        "limit": 25,
+        "fields": {
+          "process": {
+            "selector": "[automation_id='ColProcessName'], text:first-child",
+            "attr": "name|text"
+          },
+          "memory_mb": {
+            "selector": "[automation_id='ColMemoryMB'], text:nth-child(2)",
+            "regex": "([\\d,.]+)\\s*MB",
+            "parse": "float",
+            "optional": true
+          }
+        }
+      },
+      "expect": {
+        "min_items": 1,
+        "required_fields": ["cpu_pct"]
+      }
+    }
+  ]
+}

@@ -129,7 +129,7 @@ func (g *GCSBlobStore) httpClient() *http.Client {
 
 func (g *GCSBlobStore) objectName(key string) string {
 	k := strings.TrimLeft(key, "/")
-	if g.Prefix == "" || strings.HasPrefix(k, "tools/") {
+	if g.Prefix == "" {
 		return k
 	}
 	return g.Prefix + "/" + k

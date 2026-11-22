@@ -75,14 +75,29 @@ func NewService(cfg ServerConfig, store Store, blobs BlobStore, catalog recipes.
 	return s
 }
 
+type requestMetaWriter struct {
+	http.ResponseWriter
+	method string
+	path   string
+}
+
+func (rw *requestMetaWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
 func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	rw := &requestMetaWriter{
+		ResponseWriter: w,
+		method:         r.Method,
+		path:           r.URL.Path,
+	}
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Printf("PANIC %s %s: %v", r.Method, r.URL.Path, rec)
-			writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "internal server error", nil)
+			writeAPIError(rw, http.StatusInternalServerError, "INTERNAL_ERROR", "internal server error", nil)
 		}
 	}()
-	s.mux.ServeHTTP(w, r)
+	s.mux.ServeHTTP(rw, r)
 }
 
 func (s *Service) handleDual(method string, suffix string, h http.HandlerFunc) {
@@ -756,15 +771,12 @@ func (s *Service) handleDownloadRelease(w http.ResponseWriter, r *http.Request) 
 		relDir = "/release"
 	}
 	data, err := os.ReadFile(filepath.Join(relDir, asset))
-	if err != nil {
-		data, err = s.blobs.Get(r.Context(), "tools/deskdrop/latest/"+asset)
-	}
-	if errors.Is(err, ErrNotFound) || errors.Is(err, os.ErrNotExist) {
+	if errors.Is(err, os.ErrNotExist) {
 		writeAPIError(w, http.StatusNotFound, "NOT_FOUND", "release asset not found", nil)
 		return
 	}
 	if err != nil {
-		writeAPIError(w, http.StatusInternalServerError, "BLOB_ERROR", err.Error(), nil)
+		writeAPIError(w, http.StatusInternalServerError, "RELEASE_READ_ERROR", err.Error(), nil)
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")

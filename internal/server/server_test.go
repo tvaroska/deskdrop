@@ -213,3 +213,64 @@ func TestDriftHealerProposalRequiresHumanApprovalBeforeWriteBack(t *testing.T) {
 		t.Fatalf("expected RECIPES_URI to update to .v2-status after approval, got %+v", after.Steps[0].Fields)
 	}
 }
+
+type failStore struct {
+	*MemoryStore
+}
+
+func (f *failStore) ListDrops(_ context.Context, _, _ string, _ int) ([]contract.DropRecord, error) {
+	return nil, context.DeadlineExceeded
+}
+
+func TestWriteAPIErrorLogs5xxToStderrAndReleaseAssetReturns404WithoutBlobFallback(t *testing.T) {
+	var errBuf bytes.Buffer
+	restore := setErrorLogOutputForTest(&errBuf)
+	defer restore()
+
+	blobs := NewMemoryBlobStore()
+	// Seed legacy blob path to prove handleDownloadRelease never falls back to blob storage.
+	_ = blobs.Put(context.Background(), "tools/deskdrop/latest/deskdrop.exe", "application/octet-stream", []byte("legacy-blob"))
+
+	svc := NewService(ServerConfig{
+		Version:            "v1.1.1",
+		DesktopClientToken: "desk-tok",
+		AgentBusToken:      "agent-tok",
+		ReleaseDir:         t.TempDir(), // empty release dir -> must return 404 directly
+	}, &failStore{MemoryStore: NewMemoryStore()}, blobs, recipes.NewStaticCatalog(), nil)
+
+	// 1. Missing release asset on disk returns 404 NOT_FOUND without touching blob storage or logging 5xx.
+	relReq := httptest.NewRequest(http.MethodGet, "/v1/release/deskdrop.exe", nil)
+	relReq.Header.Set("Authorization", "Bearer desk-tok")
+	relW := httptest.NewRecorder()
+	svc.ServeHTTP(relW, relReq)
+	if relW.Code != http.StatusNotFound {
+		t.Fatalf("GET /v1/release/deskdrop.exe = %d, want 404 (%s)", relW.Code, relW.Body.String())
+	}
+	if errBuf.Len() != 0 {
+		t.Fatalf("expected 0 stderr error logs for 404 response, got %q", errBuf.String())
+	}
+
+	// 2. 500 response logs method, path, status, code, and message to stderr.
+	dropReq := httptest.NewRequest(http.MethodGet, "/v1/drops", nil)
+	dropReq.Header.Set("Authorization", "Bearer agent-tok")
+	dropW := httptest.NewRecorder()
+	svc.ServeHTTP(dropW, dropReq)
+	if dropW.Code != http.StatusInternalServerError {
+		t.Fatalf("GET /v1/drops = %d, want 500", dropW.Code)
+	}
+	logged := errBuf.String()
+	for _, want := range []string{"GET", "/v1/drops", "status=500", "code=STORE_ERROR", "context deadline exceeded"} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("expected %q in 5xx stderr log, got %q", want, logged)
+		}
+	}
+
+	// 3. GCSBlobStore.objectName strictly applies Prefix without legacy tools/ bypass.
+	gcs := NewGCSBlobStore("my-bucket", "desktop")
+	if got := gcs.objectName("tools/deskdrop/latest/deskdrop.exe"); got != "desktop/tools/deskdrop/latest/deskdrop.exe" {
+		t.Fatalf("GCSBlobStore.objectName = %q, want desktop/tools/deskdrop/latest/deskdrop.exe", got)
+	}
+	if got := gcs.objectName("/diagnostics/diag_1.zip"); got != "desktop/diagnostics/diag_1.zip" {
+		t.Fatalf("GCSBlobStore.objectName = %q, want desktop/diagnostics/diag_1.zip", got)
+	}
+}

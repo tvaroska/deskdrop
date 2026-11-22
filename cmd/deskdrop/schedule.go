@@ -10,20 +10,21 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 )
 
-const DefaultScheduledTaskName = "DeskDropSync"
+const (
+	RunRegistryKey      = `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+	DefaultRunValueName = "DeskDrop"
+)
 
-var validTaskNameRe = regexp.MustCompile(`^[A-Za-z0-9_.\-\\]{1,120}$`)
+var validRunValueNameRe = regexp.MustCompile(`^[A-Za-z0-9_.\-]{1,64}$`)
 
-// ScheduleSpec defines a Windows Task Scheduler (schtasks.exe) job for background DeskDrop execution.
-type ScheduleSpec struct {
-	TaskName     string
-	Mode         string        // "sync" (periodic drain) | "logon" (persistent tray worker)
-	Every        time.Duration // used when Mode == "sync" (1m..1439m)
+// LogonSpec defines a non-Admin Windows HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+// logon registration that launches the persistent DeskDrop system tray worker at user sign-in.
+type LogonSpec struct {
+	Name         string
 	ExePath      string
 	ConfigPath   string
 	CDPURL       string
@@ -32,9 +33,9 @@ type ScheduleSpec struct {
 
 type commandExecFn func(ctx context.Context, binary string, args []string) (string, error)
 
-var defaultSchtasksExec commandExecFn = func(ctx context.Context, binary string, args []string) (string, error) {
+var defaultRegExec commandExecFn = func(ctx context.Context, binary string, args []string) (string, error) {
 	if runtime.GOOS != "windows" {
-		return "", errors.New("schtasks.exe requires Windows (pass --dry-run to preview the scheduled command)")
+		return "", errors.New("reg.exe requires Windows (pass --dry-run to preview the HKCU Run command)")
 	}
 	cmd := exec.CommandContext(ctx, binary, args...)
 	out, err := cmd.CombinedOutput()
@@ -42,7 +43,7 @@ var defaultSchtasksExec commandExecFn = func(ctx context.Context, binary string,
 }
 
 func cmdSchedule(args []string) error {
-	return runScheduleWithExec(args, defaultSchtasksExec)
+	return runScheduleWithExec(args, defaultRegExec)
 }
 
 func runScheduleWithExec(args []string, execFn commandExecFn) error {
@@ -68,21 +69,19 @@ func runScheduleWithExec(args []string, execFn commandExecFn) error {
 
 func printScheduleUsage() {
 	fmt.Println(`Usage:
-  deskdrop schedule install   [--every 15m] [--mode sync|logon] [--task-name DeskDropSync] [--fallback-gate tray|auto] [--config <path>] [--cdp <url>] [--exe <path>] [--dry-run]
-  deskdrop schedule uninstall [--task-name DeskDropSync] [--dry-run]
-  deskdrop schedule status    [--task-name DeskDropSync] [--dry-run]`)
+  deskdrop schedule install   [--name DeskDrop] [--fallback-gate tray|auto] [--config <path>] [--cdp <url>] [--exe <path>] [--dry-run]
+  deskdrop schedule uninstall [--name DeskDrop] [--dry-run]
+  deskdrop schedule status    [--name DeskDrop] [--dry-run]`)
 }
 
 func cmdScheduleInstall(args []string, execFn commandExecFn) error {
 	fs := flag.NewFlagSet("schedule install", flag.ContinueOnError)
-	taskName := fs.String("task-name", DefaultScheduledTaskName, "Windows Scheduled Task name")
-	mode := fs.String("mode", "sync", "Schedule mode: 'sync' (periodic quiet drain) or 'logon' (persistent tray)")
-	every := fs.Duration("every", 15*time.Minute, "Poll interval for --mode=sync (1m..23h59m)")
+	name := fs.String("name", DefaultRunValueName, "HKCU Run value name")
 	fallbackGate := fs.String("fallback-gate", "tray", "Tier-2 fallback gate (tray|auto)")
 	cfgPath := fs.String("config", "", "Optional deskdrop.json config path")
 	cdpURL := fs.String("cdp", "", "Optional explicit CDP endpoint (e.g. http://127.0.0.1:9222)")
 	exePath := fs.String("exe", "", "Explicit path to deskdrop.exe (defaults to current binary)")
-	dryRun := fs.Bool("dry-run", false, "Print schtasks.exe command without executing")
+	dryRun := fs.Bool("dry-run", false, "Print reg.exe command without executing")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -106,34 +105,36 @@ func cmdScheduleInstall(args []string, execFn commandExecFn) error {
 		}
 	}
 
-	spec := ScheduleSpec{
-		TaskName:     *taskName,
-		Mode:         *mode,
-		Every:        *every,
+	spec := LogonSpec{
+		Name:         *name,
 		ExePath:      resolvedExe,
 		ConfigPath:   resolvedCfg,
 		CDPURL:       strings.TrimSpace(*cdpURL),
 		FallbackGate: gate,
 	}
-	schtasksArgs, err := BuildSchtasksCreateArgs(spec)
+	regArgs, err := BuildRegAddRunArgs(spec)
 	if err != nil {
 		return err
 	}
 	if *dryRun {
-		fmt.Println(FormatSchtasksCommand(schtasksArgs))
+		fmt.Println(FormatRegCommand(regArgs))
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	out, err := execFn(ctx, "schtasks.exe", schtasksArgs)
+	out, err := execFn(ctx, "reg.exe", regArgs)
 	if err != nil {
 		if out != "" {
-			return fmt.Errorf("schtasks.exe /Create failed: %w (%s)", err, out)
+			return fmt.Errorf("reg.exe add failed: %w (%s)", err, out)
 		}
-		return fmt.Errorf("schtasks.exe /Create failed: %w", err)
+		return fmt.Errorf("reg.exe add failed: %w", err)
 	}
-	fmt.Printf("Installed scheduled task %q (%s).\n", spec.TaskName, spec.Mode)
+	valName := strings.TrimSpace(spec.Name)
+	if valName == "" {
+		valName = DefaultRunValueName
+	}
+	fmt.Printf("Registered HKCU Run tray logon %q (%s).\n", valName, RunRegistryKey)
 	if out != "" {
 		fmt.Println(out)
 	}
@@ -142,29 +143,33 @@ func cmdScheduleInstall(args []string, execFn commandExecFn) error {
 
 func cmdScheduleUninstall(args []string, execFn commandExecFn) error {
 	fs := flag.NewFlagSet("schedule uninstall", flag.ContinueOnError)
-	taskName := fs.String("task-name", DefaultScheduledTaskName, "Windows Scheduled Task name")
-	dryRun := fs.Bool("dry-run", false, "Print schtasks.exe command without executing")
+	name := fs.String("name", DefaultRunValueName, "HKCU Run value name")
+	dryRun := fs.Bool("dry-run", false, "Print reg.exe command without executing")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	schtasksArgs, err := BuildSchtasksDeleteArgs(*taskName)
+	regArgs, err := BuildRegDeleteRunArgs(*name)
 	if err != nil {
 		return err
 	}
 	if *dryRun {
-		fmt.Println(FormatSchtasksCommand(schtasksArgs))
+		fmt.Println(FormatRegCommand(regArgs))
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	out, err := execFn(ctx, "schtasks.exe", schtasksArgs)
+	out, err := execFn(ctx, "reg.exe", regArgs)
 	if err != nil {
 		if out != "" {
-			return fmt.Errorf("schtasks.exe /Delete failed: %w (%s)", err, out)
+			return fmt.Errorf("reg.exe delete failed: %w (%s)", err, out)
 		}
-		return fmt.Errorf("schtasks.exe /Delete failed: %w", err)
+		return fmt.Errorf("reg.exe delete failed: %w", err)
 	}
-	fmt.Printf("Removed scheduled task %q.\n", strings.TrimSpace(*taskName))
+	valName := strings.TrimSpace(*name)
+	if valName == "" {
+		valName = DefaultRunValueName
+	}
+	fmt.Printf("Removed HKCU Run tray logon %q.\n", valName)
 	if out != "" {
 		fmt.Println(out)
 	}
@@ -173,53 +178,50 @@ func cmdScheduleUninstall(args []string, execFn commandExecFn) error {
 
 func cmdScheduleStatus(args []string, execFn commandExecFn) error {
 	fs := flag.NewFlagSet("schedule status", flag.ContinueOnError)
-	taskName := fs.String("task-name", DefaultScheduledTaskName, "Windows Scheduled Task name")
-	dryRun := fs.Bool("dry-run", false, "Print schtasks.exe command without executing")
+	name := fs.String("name", DefaultRunValueName, "HKCU Run value name")
+	dryRun := fs.Bool("dry-run", false, "Print reg.exe command without executing")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	schtasksArgs, err := BuildSchtasksQueryArgs(*taskName)
+	regArgs, err := BuildRegQueryRunArgs(*name)
 	if err != nil {
 		return err
 	}
 	if *dryRun {
-		fmt.Println(FormatSchtasksCommand(schtasksArgs))
+		fmt.Println(FormatRegCommand(regArgs))
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	out, err := execFn(ctx, "schtasks.exe", schtasksArgs)
+	out, err := execFn(ctx, "reg.exe", regArgs)
 	if err != nil {
 		if out != "" {
-			return fmt.Errorf("schtasks.exe /Query failed: %w (%s)", err, out)
+			return fmt.Errorf("reg.exe query failed: %w (%s)", err, out)
 		}
-		return fmt.Errorf("schtasks.exe /Query failed: %w", err)
+		return fmt.Errorf("reg.exe query failed: %w", err)
 	}
 	fmt.Println(out)
 	return nil
 }
 
-// BuildSchtasksCreateArgs validates spec and constructs direct schtasks.exe /Create arguments
-// (zero cmd.exe shell interpolation).
-func BuildSchtasksCreateArgs(spec ScheduleSpec) ([]string, error) {
-	name := strings.TrimSpace(spec.TaskName)
-	if name == "" {
-		name = DefaultScheduledTaskName
-	}
-	if !validTaskNameRe.MatchString(name) {
-		return nil, fmt.Errorf("invalid --task-name %q (allowed: letters, digits, '.', '_', '-', '\\')", spec.TaskName)
+// BuildRegAddRunArgs validates spec and constructs direct reg.exe add arguments
+// for HKCU\Software\Microsoft\Windows\CurrentVersion\Run (zero shell interpolation, no Admin elevation).
+func BuildRegAddRunArgs(spec LogonSpec) ([]string, error) {
+	name, err := normalizeRunValueName(spec.Name)
+	if err != nil {
+		return nil, err
 	}
 	exe := strings.TrimSpace(spec.ExePath)
 	if exe == "" {
 		return nil, errors.New("executable path is required")
 	}
-	if err := rejectUnsafeTaskArg("--exe", exe); err != nil {
+	if err := rejectUnsafeRunArg("--exe", exe); err != nil {
 		return nil, err
 	}
-	if err := rejectUnsafeTaskArg("--config", spec.ConfigPath); err != nil {
+	if err := rejectUnsafeRunArg("--config", spec.ConfigPath); err != nil {
 		return nil, err
 	}
-	if err := rejectUnsafeTaskArg("--cdp", spec.CDPURL); err != nil {
+	if err := rejectUnsafeRunArg("--cdp", spec.CDPURL); err != nil {
 		return nil, err
 	}
 
@@ -228,79 +230,42 @@ func BuildSchtasksCreateArgs(spec ScheduleSpec) ([]string, error) {
 		return nil, err
 	}
 
-	mode := strings.ToLower(strings.TrimSpace(spec.Mode))
-	if mode == "" {
-		mode = "sync"
+	// Always quote executable path in the HKCU Run REG_SZ command line so paths with spaces
+	// cannot trigger Windows CreateProcessW unquoted-path ambiguity at user logon.
+	runTokens := []string{`"` + exe + `"`, "tray", "--fallback-gate", gate}
+	if cfg := strings.TrimSpace(spec.ConfigPath); cfg != "" {
+		runTokens = append(runTokens, "--config", quoteIfSpaces(cfg))
+	}
+	if cdp := strings.TrimSpace(spec.CDPURL); cdp != "" {
+		runTokens = append(runTokens, "--cdp", quoteIfSpaces(cdp))
 	}
 
-	var runTokens []string
-	var scheduleFlags []string
-
-	switch mode {
-	case "sync":
-		mins := int(spec.Every / time.Minute)
-		if spec.Every <= 0 || spec.Every%time.Minute != 0 || mins < 1 || mins > 1439 {
-			return nil, fmt.Errorf("--every must be whole minutes between 1m and 23h59m, got %s", spec.Every)
-		}
-		if mins >= 60 && mins%60 == 0 {
-			scheduleFlags = []string{"/SC", "HOURLY", "/MO", strconv.Itoa(mins / 60)}
-		} else {
-			scheduleFlags = []string{"/SC", "MINUTE", "/MO", strconv.Itoa(mins)}
-		}
-		runTokens = []string{quoteTaskToken(exe), "sync", "--hide-console", "--quiet-cdp", "--fallback-gate", gate}
-	case "logon":
-		scheduleFlags = []string{"/SC", "ONLOGON"}
-		runTokens = []string{quoteTaskToken(exe), "tray", "--fallback-gate", gate}
-	default:
-		return nil, fmt.Errorf("invalid --mode %q (expected 'sync' or 'logon')", spec.Mode)
-	}
-
-	if strings.TrimSpace(spec.ConfigPath) != "" {
-		runTokens = append(runTokens, "--config", quoteTaskToken(strings.TrimSpace(spec.ConfigPath)))
-	}
-	if strings.TrimSpace(spec.CDPURL) != "" {
-		runTokens = append(runTokens, "--cdp", quoteTaskToken(strings.TrimSpace(spec.CDPURL)))
-	}
-
-	taskRun := strings.Join(runTokens, " ")
-	if len(taskRun) > 260 {
-		return nil, fmt.Errorf("scheduled task command length (%d) exceeds schtasks.exe 261-char /TR limit; shorten paths", len(taskRun))
-	}
-
-	out := []string{"/Create", "/TN", name, "/TR", taskRun}
-	out = append(out, scheduleFlags...)
-	out = append(out, "/F")
-	return out, nil
+	cmdValue := strings.Join(runTokens, " ")
+	return []string{"add", RunRegistryKey, "/v", name, "/t", "REG_SZ", "/d", cmdValue, "/f"}, nil
 }
 
-// BuildSchtasksDeleteArgs constructs direct schtasks.exe /Delete arguments.
-func BuildSchtasksDeleteArgs(taskName string) ([]string, error) {
-	name := strings.TrimSpace(taskName)
-	if name == "" {
-		name = DefaultScheduledTaskName
+// BuildRegDeleteRunArgs constructs direct reg.exe delete arguments for HKCU\...\Run.
+func BuildRegDeleteRunArgs(rawName string) ([]string, error) {
+	name, err := normalizeRunValueName(rawName)
+	if err != nil {
+		return nil, err
 	}
-	if !validTaskNameRe.MatchString(name) {
-		return nil, fmt.Errorf("invalid --task-name %q", taskName)
-	}
-	return []string{"/Delete", "/TN", name, "/F"}, nil
+	return []string{"delete", RunRegistryKey, "/v", name, "/f"}, nil
 }
 
-// BuildSchtasksQueryArgs constructs direct schtasks.exe /Query arguments.
-func BuildSchtasksQueryArgs(taskName string) ([]string, error) {
-	name := strings.TrimSpace(taskName)
-	if name == "" {
-		name = DefaultScheduledTaskName
+// BuildRegQueryRunArgs constructs direct reg.exe query arguments for HKCU\...\Run.
+func BuildRegQueryRunArgs(rawName string) ([]string, error) {
+	name, err := normalizeRunValueName(rawName)
+	if err != nil {
+		return nil, err
 	}
-	if !validTaskNameRe.MatchString(name) {
-		return nil, fmt.Errorf("invalid --task-name %q", taskName)
-	}
-	return []string{"/Query", "/TN", name, "/FO", "LIST", "/V"}, nil
+	return []string{"query", RunRegistryKey, "/v", name}, nil
 }
 
-// FormatSchtasksCommand formats a preview command line for --dry-run output.
-func FormatSchtasksCommand(args []string) string {
+// FormatRegCommand formats a preview reg.exe command line for --dry-run output.
+func FormatRegCommand(args []string) string {
 	parts := make([]string, 0, len(args)+1)
-	parts = append(parts, "schtasks.exe")
+	parts = append(parts, "reg.exe")
 	for _, a := range args {
 		if strings.ContainsAny(a, " \t\"") {
 			escaped := strings.ReplaceAll(a, `"`, `\"`)
@@ -312,14 +277,25 @@ func FormatSchtasksCommand(args []string) string {
 	return strings.Join(parts, " ")
 }
 
-func rejectUnsafeTaskArg(flagName string, val string) error {
+func normalizeRunValueName(raw string) (string, error) {
+	name := strings.TrimSpace(raw)
+	if name == "" {
+		name = DefaultRunValueName
+	}
+	if !validRunValueNameRe.MatchString(name) {
+		return "", fmt.Errorf("invalid --name %q (allowed: letters, digits, '.', '_', '-')", raw)
+	}
+	return name, nil
+}
+
+func rejectUnsafeRunArg(flagName string, val string) error {
 	if strings.ContainsAny(val, "\"\r\n\x00") {
 		return fmt.Errorf("%s must not contain quotes or control characters", flagName)
 	}
 	return nil
 }
 
-func quoteTaskToken(val string) string {
+func quoteIfSpaces(val string) string {
 	if strings.ContainsAny(val, " \t") {
 		return `"` + val + `"`
 	}

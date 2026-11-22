@@ -1,0 +1,162 @@
+{
+  "name": "google-scholar-profile",
+  "topic": "scholar-profile",
+  "description": "Extracts citation metrics (total and 5-year citations, h-index, i10-index), per-paper citation counts, and homepage recommended articles from open Google Scholar tabs.",
+  "allow_computer_use_fallback": false,
+  "allowed_domains": ["scholar.google.com"],
+  "defaults": {
+    "user_id": "example_scholar_id"
+  },
+  "steps": [
+    {
+      "id": "profile_citations",
+      "url": "https://scholar.google.com/citations?user={{user_id}}&hl=en",
+      "match_tab_url": "scholar.google.com/citations",
+      "reuse_open_tab": true,
+      "wait_selector": "#gsc_rsb_st, #gsc_a_b",
+      "wait_ms": 800,
+      "fields": {
+        "author": {
+          "selector": "#gsc_prf_in",
+          "optional": true
+        },
+        "affiliation": {
+          "selector": ".gsc_prf_il",
+          "optional": true
+        },
+        "citations_total": {
+          "selector": "#gsc_rsb_st tbody tr:nth-child(1) td.gsc_rsb_std:nth-child(2)",
+          "fallback_regex": "(?i)Citations\\s+([\\d,]+)",
+          "parse": "number"
+        },
+        "citations_5y": {
+          "selector": "#gsc_rsb_st tbody tr:nth-child(1) td.gsc_rsb_std:nth-child(3)",
+          "fallback_regex": "(?i)Citations\\s+[\\d,]+\\s+([\\d,]+)",
+          "parse": "number"
+        },
+        "h_index": {
+          "selector": "#gsc_rsb_st tbody tr:nth-child(2) td.gsc_rsb_std:nth-child(2)",
+          "fallback_regex": "(?i)h-index\\s+([\\d,]+)",
+          "parse": "number"
+        },
+        "h_index_5y": {
+          "selector": "#gsc_rsb_st tbody tr:nth-child(2) td.gsc_rsb_std:nth-child(3)",
+          "fallback_regex": "(?i)h-index\\s+[\\d,]+\\s+([\\d,]+)",
+          "parse": "number",
+          "optional": true
+        },
+        "i10_index": {
+          "selector": "#gsc_rsb_st tbody tr:nth-child(3) td.gsc_rsb_std:nth-child(2)",
+          "fallback_regex": "(?i)i10-index\\s+([\\d,]+)",
+          "parse": "number"
+        },
+        "i10_index_5y": {
+          "selector": "#gsc_rsb_st tbody tr:nth-child(3) td.gsc_rsb_std:nth-child(3)",
+          "fallback_regex": "(?i)i10-index\\s+[\\d,]+\\s+([\\d,]+)",
+          "parse": "number",
+          "optional": true
+        }
+      },
+      "items": {
+        "container": "tr.gsc_a_tr",
+        "dedupe_by": "title",
+        "limit": 25,
+        "fields": {
+          "title": {
+            "selector": "a.gsc_a_at"
+          },
+          "url": {
+            "selector": "a.gsc_a_at",
+            "attr": "href",
+            "prefix": "https://scholar.google.com",
+            "optional": true
+          },
+          "authors_venue": {
+            "selector": "div.gs_gray",
+            "optional": true
+          },
+          "citations": {
+            "selector": "a.gsc_a_ac, span.gsc_a_ac",
+            "parse": "number"
+          },
+          "year": {
+            "selector": "span.gsc_a_h, td.gsc_a_y",
+            "regex": "(\\d{4})",
+            "parse": "number",
+            "optional": true
+          }
+        }
+      },
+      "expect": {
+        "not_url_contains": [
+          "/sorry/",
+          "accounts.google.com",
+          "/signin",
+          "/login",
+          "captcha"
+        ],
+        "min_items": 1,
+        "required_fields": [
+          "citations_total",
+          "citations_5y",
+          "h_index",
+          "i10_index"
+        ]
+      }
+    },
+    {
+      "id": "recommended_articles",
+      "url": "https://scholar.google.com/",
+      "match_tab_url": "scholar.google.com/$",
+      "reuse_open_tab": true,
+      "wait_selector": "div.gs_or, div.gs_r.gs_scl, #gs_res_ccl_mid",
+      "wait_ms": 800,
+      "items": {
+        "container": "div.gs_or, div.gs_r.gs_scl",
+        "dedupe_by": "title",
+        "limit": 15,
+        "fields": {
+          "title": {
+            "selector": "h3.gs_rt a, h3.gs_rt"
+          },
+          "url": {
+            "selector": "h3.gs_rt a",
+            "attr": "href",
+            "optional": true
+          },
+          "authors_venue": {
+            "selector": "div.gs_a",
+            "optional": true
+          },
+          "year": {
+            "selector": "div.gs_a",
+            "regex": "\\b(19\\d{2}|20\\d{2})\\b",
+            "parse": "number",
+            "optional": true
+          },
+          "snippet": {
+            "selector": "div.gs_rs",
+            "max_chars": 280,
+            "optional": true
+          },
+          "citations": {
+            "selector": "a[href*='cites=']",
+            "regex": "(?i)Cited by\\s+([\\d,]+)",
+            "parse": "number",
+            "optional": true
+          }
+        }
+      },
+      "expect": {
+        "not_url_contains": [
+          "/sorry/",
+          "accounts.google.com",
+          "/signin",
+          "/login",
+          "captcha"
+        ],
+        "min_items": 1
+      }
+    }
+  ]
+}
