@@ -20,7 +20,7 @@ import (
 	"github.com/tvaroska/deskdrop/internal/driver/cdp"
 )
 
-var version = "v1.0.0"
+var version = "v1.1.0"
 
 func main() {
 	unblockExecutableOnWindows()
