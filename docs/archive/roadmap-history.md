@@ -4,6 +4,10 @@ Archived shipped milestones moved out of [`../roadmap.md`](../roadmap.md).
 
 ---
 
+## Release v1.1.0 — AXTree Grounding, Declarative Pagination & Windows Scheduler
+
+- **v1.1.0 (`2026-11-22`, `b582837`):** Shipped exception-only CDP `Accessibility.getFullAXTree` (`axtree.txt`) hybrid grounding with input redaction and `<canvas>`/WebGL blind-spot detection (`UNLABELLED_CANVAS_SURFACE` + `testdata/drift/` compression/selector/canvas benchmarks), bounded declarative `"Next page"` `pagination` (`1..20` pages, disabled/`aria-disabled` stop, cross-page deduplication, pure-Go `VerifyRecipeOnHTMLPages`), and direct `schtasks.exe` Windows Task Scheduler helper (`deskdrop schedule install|uninstall|status` + `sync --quiet-cdp --hide-console`). Rolled out live behind `/desktop` and verified `/desktop/healthz`.
+
 ## Milestone M1 — Public v1.0.0 Release & Live /desktop Cutover
 
 - **M1.1 (`2026-11-22`):** Published public `github.com/tvaroska/deskdrop` (`140a6ff`, tag `v1.0.0`) with zero-dependency desktop CLI (`cmd/deskdrop`), `TargetDriver` Port + CDP Adapter, pure-Go HTML verifier (`internal/verify`, zero `eval_js`), atomic JSON `FileStore` relay, hot-reloadable `RECIPES_URI` catalog, exception-only `adk-go` drift healer, and Cloud Build 2nd-gen triggers (`deskdrop-main`, `deskdrop-tag`).
