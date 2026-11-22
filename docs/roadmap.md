@@ -8,12 +8,14 @@
 
 | # | Milestone | Done when | Target |
 | :--- | :--- | :--- | :--- |
-| **M2** | Server Observability & Post-Soak Legacy Retirement | `5xx` stderr logging + release `404` cleanup shipped, Windows PC `deskdrop.exe` soak verified, and legacy `browser-drop` retired. | `v1.1.1` (`P0`, Small) |
+| **M2** | Server Observability, FieldRule Fallback & Post-Soak Retirement | `5xx` stderr logging, numeric `fallback_regex` + `RECIPES_URI` sync, non-Admin Windows `HKCU\...\Run` logon install, and legacy `browser-drop` retirement shipped. | `v1.1.1` (`P0`, Small) |
 
-## Milestone M2 — Server Observability & Post-Soak Legacy Retirement
+## Milestone M2 — Server Observability, FieldRule Fallback & Post-Soak Retirement
 
 - [ ] **M2.1 (`5xx` stderr logging & release-asset `404` cleanup):** Log `status >= 500` responses to stderr in `writeAPIError` ([`internal/server/http_helpers.go`](../internal/server/http_helpers.go)) so container error logs surface server faults, and return `404 NOT_FOUND` directly from `handleDownloadRelease` ([`internal/server/http.go`](../internal/server/http.go)) when `/release/{asset}` is absent on disk instead of probing `tools/deskdrop/latest/` in blob storage.
-- [ ] **M2.2 (Windows PC soak & legacy cleanup):** Switch the Windows PC worker to `deskdrop.exe` (`--fallback-gate=tray` or `deskdrop schedule install`), verify one live extraction cycle end-to-end, and retire legacy `browser-drop` + its PostgreSQL database.
+- [ ] **M2.2 (Numeric `FieldRule.fallback_regex` fallback & `RECIPES_URI` recipe sync):** When `FieldRule.Parse` is `"number"` or `"float"` and `raw` contains no parseable number (e.g. `"View analytics"` or `aria-label="Open reactions menu"`), fall back to `fallback_regex` in `evalFieldRule` ([`internal/driver/cdp/js_runtime.go`](../internal/driver/cdp/js_runtime.go) and [`internal/verify/verify.go`](../internal/verify/verify.go)) with parity unit tests, update `impressions`/`reactions` rules in `RECIPES_URI`, and verify non-zero per-item counts live.
+- [ ] **M2.3 (Non-Admin Windows logon startup in `deskdrop schedule`):** Register `--mode logon` in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` ([`cmd/deskdrop/schedule.go`](../cmd/deskdrop/schedule.go)) via `reg.exe` instead of `schtasks.exe /Create /SC ONLOGON` so standard non-elevated PowerShell installs persistent tray auto-start without UAC `Access is denied` errors, with matching `uninstall` and `status` support (keeping `schtasks.exe` for headless `--mode sync`).
+- [ ] **M2.4 (Post-soak legacy `browser-drop` retirement):** After verifying the patched extraction cycle on the Windows PC tray worker (`win-pc` already connected on `v1.1.0`), retire legacy `browser-drop` and its PostgreSQL database.
 
 ## Unscheduled backlog
 
