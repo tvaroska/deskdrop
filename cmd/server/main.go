@@ -19,7 +19,7 @@ import (
 	"github.com/tvaroska/deskdrop/internal/server"
 )
 
-var version = "v1.4.1"
+var version = "v1.4.2"
 
 const defaultWriteTimeout = 180 * time.Second
 
