@@ -79,3 +79,12 @@ Close the CI production-mode parity and state-evolution gaps identified in the 2
 
 - **M1.1 (`2026-11-22`):** Published public `github.com/tvaroska/deskdrop` (`140a6ff`, tag `v1.0.0`) with zero-dependency desktop CLI (`cmd/deskdrop`), `TargetDriver` Port + CDP Adapter, pure-Go HTML verifier (`internal/verify`, zero `eval_js`), atomic JSON `FileStore` relay, hot-reloadable `RECIPES_URI` catalog, exception-only `adk-go` drift healer, and Cloud Build 2nd-gen triggers (`deskdrop-main`, `deskdrop-tag`).
 - **M1.2 (`2026-11-22`):** Staged 6 declarative recipes in Cloud Storage (`RECIPES_URI`), deployed `deskdrop:v1.0.0` behind `/desktop` with a `1Gi` PVC `FileStore` and Vertex AI Workload Identity, and passed live smoke checks (keeping legacy `browser-drop` on standby pending Windows PC soak in `M2.2`).
+
+## Milestone M2 - Rollout Resilience, FieldRule Verification & HKCU Logon (`v1.4.3+`)
+
+*Archived from [`../roadmap.md`](../roadmap.md) on 2026-11-26.*
+
+*Bottleneck / rollout order:* Single-replica `Recreate` RWO-PVC rollouts produce a `15–60s` `HTTP 503` window while re-attaching `/data`; `M2.1`–`M2.3`, `M2.5` Step 2, and `A-1`–`A-7`/`S-1`–`S-8` are shipped in `v1.3.0`–`v1.4.3`, and Chrome 144+ `DevToolsActivePort` requires a one-time interactive `"Allow"` click after a tray binary restart.
+
+- [x] **M2.4 (Run `deskdrop.exe schedule install` `HKCU\...\Run` logon registration on Windows PC — live since `v1.3.1`):** `reg.exe` `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` tray logon implementation (`ADR-007`, [`cmd/deskdrop/schedule.go`](../../cmd/deskdrop/schedule.go)) is live on the `v1.4.3` Windows worker; confirmed installed and verified on the Windows PC (`2026-11-26`).
+- [x] **M2.5 (P3, 0.25d) — Stop tray sync retry bursts during relay `Recreate` rollouts (`F-2026-11-23-002`):** Step 2 (`4fbf6a5`, `v1.4.0`–`v1.4.3`) and Step 1 verified via Cloud Logging (`2026-11-26`): confirmed all `15` `2026-11-22` `DeskDrop/1.0` `503 UH` rows (`20:02:52–20:02:56Z` `7x`, `20:46:29–20:46:34Z` `8x`, `0` `AgentBus/2.0`) and confirmed the post-`v1.4.3` `2026-11-26T16:06:40–16:06:43Z` rollout produced `4x` `GET /desktop/v1/status` (`<= 4` `503 UH` rows/tick) with `0` `heartbeat` or `claim` fan-out.
