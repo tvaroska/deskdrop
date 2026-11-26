@@ -19,13 +19,19 @@ import (
 	"time"
 )
 
-const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+const (
+	wsGUID              = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	maxWSMessageBytes   = 128 * 1024 * 1024
+	defaultWriteTimeout = 15 * time.Second
+)
 
 // WSConn is a minimal pure-stdlib RFC 6455 WebSocket client for local Chrome DevTools Protocol.
 type WSConn struct {
-	conn net.Conn
-	br   *bufio.Reader
-	wmu  sync.Mutex
+	conn            net.Conn
+	br              *bufio.Reader
+	wmu             sync.Mutex
+	maxMessageBytes uint64
+	writeTimeout    time.Duration
 }
 
 // DialWS opens a client WebSocket connection to ws://host:port/path.
@@ -135,6 +141,13 @@ func (w *WSConn) writeFrame(opcode byte, payload []byte) error {
 		masked[i] = payload[i] ^ mask[i%4]
 	}
 
+	timeout := w.writeTimeout
+	if timeout <= 0 {
+		timeout = defaultWriteTimeout
+	}
+	_ = w.conn.SetWriteDeadline(time.Now().Add(timeout))
+	defer func() { _ = w.conn.SetWriteDeadline(time.Time{}) }()
+
 	if _, err := w.conn.Write(hdr[:offset]); err != nil {
 		return err
 	}
@@ -148,6 +161,10 @@ func (w *WSConn) writeFrame(opcode byte, payload []byte) error {
 
 // ReadText reads the next complete text message, automatically replying to Ping frames and reassembling fragments.
 func (w *WSConn) ReadText() ([]byte, error) {
+	maxBytes := w.maxMessageBytes
+	if maxBytes == 0 {
+		maxBytes = maxWSMessageBytes
+	}
 	var msgBuf bytes.Buffer
 	inMessage := false
 
@@ -176,7 +193,7 @@ func (w *WSConn) ReadText() ([]byte, error) {
 			length = binary.BigEndian.Uint64(ext[:])
 		}
 
-		if length > 128*1024*1024 {
+		if length > maxBytes {
 			return nil, fmt.Errorf("websocket frame too large (%d bytes)", length)
 		}
 
@@ -208,15 +225,22 @@ func (w *WSConn) ReadText() ([]byte, error) {
 		case 0xA:
 			continue
 		case 0x1, 0x2:
+			if inMessage {
+				return nil, errors.New("unexpected websocket data frame during fragmented message")
+			}
 			msgBuf.Reset()
 			msgBuf.Write(data)
 			if fin {
+				inMessage = false
 				return append([]byte(nil), msgBuf.Bytes()...), nil
 			}
 			inMessage = true
 		case 0x0:
 			if !inMessage {
 				return nil, errors.New("unexpected websocket continuation frame")
+			}
+			if uint64(msgBuf.Len())+uint64(len(data)) > maxBytes {
+				return nil, fmt.Errorf("fragmented websocket message exceeds %d bytes", maxBytes)
 			}
 			msgBuf.Write(data)
 			if fin {

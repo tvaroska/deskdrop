@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
 )
@@ -237,14 +238,21 @@ const (
 
 var varPlaceholderRe = regexp.MustCompile(`\{\{\s*([a-zA-Z0-9_]+)\s*\}\}`)
 
-// ParseJSONStrict decodes JSON (allowing // line comments outside strings) with DisallowUnknownFields.
-// Any unknown legacy script-execution field is rejected at decode time.
+// ParseJSONStrict decodes a single JSON value (allowing // line comments outside strings) with
+// DisallowUnknownFields and rejects any trailing tokens after the root value.
 func ParseJSONStrict(raw []byte, dst any) error {
 	cleaned := stripJSONComments(raw)
 	dec := json.NewDecoder(bytes.NewReader(cleaned))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
 		return err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("unexpected trailing JSON token")
+		}
+		return fmt.Errorf("unexpected trailing JSON content: %w", err)
 	}
 	return nil
 }
@@ -486,12 +494,6 @@ func isEmptyFieldValue(v any) bool {
 	switch t := v.(type) {
 	case string:
 		return strings.TrimSpace(t) == ""
-	case int:
-		return t == 0
-	case int64:
-		return t == 0
-	case float64:
-		return t == 0
 	default:
 		return false
 	}
@@ -507,6 +509,11 @@ func uniqueStrings(in []string) []string {
 		}
 	}
 	return out
+}
+
+// StripJSONComments removes // line comments outside JSON string literals.
+func StripJSONComments(src []byte) []byte {
+	return stripJSONComments(src)
 }
 
 func stripJSONComments(src []byte) []byte {

@@ -247,6 +247,7 @@ func LaunchBrowserProfile(browser string, prof BrowserProfile, targetURL string)
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("failed to start %s (%s): %w", bin, prof.DirName, err)
 	}
+	go func() { _ = cmd.Wait() }()
 	return bin, nil
 }
 
@@ -285,6 +286,7 @@ func LaunchDedicatedBrowserWithURL(browser string, port int, userDataDir string,
 	if err := cmd.Start(); err != nil {
 		return "", "", fmt.Errorf("failed to start %s: %w", bin, err)
 	}
+	go func() { _ = cmd.Wait() }()
 	return bin, userDataDir, nil
 }
 

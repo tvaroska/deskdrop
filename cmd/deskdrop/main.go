@@ -21,7 +21,7 @@ import (
 	"github.com/tvaroska/deskdrop/internal/driver/uia"
 )
 
-var version = "v1.3.1"
+var version = "v1.4.0"
 
 func main() {
 	unblockExecutableOnWindows()
@@ -211,7 +211,10 @@ func cmdOpenBrowser(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, _ := loadConfig(*cfgPath)
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		return err
+	}
 	b := *browser
 	if b == "" {
 		b = cfg.Browser
@@ -503,7 +506,7 @@ func executeRecipeAndDeliver(recipe contract.Recipe, driverName string, cfg cont
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	drv := newTargetDriver(driverName, nil, cfg)
+	drv := makeTargetDriver(driverName, nil, cfg)
 	defer drv.Close()
 
 	hostname, _ := os.Hostname()
@@ -516,7 +519,9 @@ func executeRecipeAndDeliver(recipe contract.Recipe, driverName string, cfg cont
 		CapturedAtUTC: time.Now().UTC().Format(time.RFC3339),
 	}
 
-	transport := bus.NewTransport(cfg)
+	busClient := bus.NewDesktopClient(cfg)
+	busClient.ClientVersion = version
+	var transport bus.Transport = busClient
 	for _, step := range recipe.Steps {
 		res, stepErr := drv.ExecuteStep(ctx, step)
 		if stepErr != nil {
@@ -692,17 +697,31 @@ func saveConfigChromeSession(explicitPath string, sessionName string) error {
 		}
 		raw, err := os.ReadFile(p)
 		if err != nil {
-			continue
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("read config %s: %w", p, err)
 		}
+		cleaned := contract.StripJSONComments(raw)
 		var m map[string]any
-		if json.Unmarshal(raw, &m) == nil && m != nil {
-			targetPath = p
-			rawMap = m
-			break
+		if len(strings.TrimSpace(string(cleaned))) == 0 {
+			m = make(map[string]any)
+		} else if err := json.Unmarshal(cleaned, &m); err != nil {
+			return fmt.Errorf("parse config %s: %w", p, err)
 		}
+		if m == nil {
+			m = make(map[string]any)
+		}
+		targetPath = p
+		rawMap = m
+		break
 	}
 	if targetPath == "" {
-		targetPath = "deskdrop.json"
+		if strings.TrimSpace(explicitPath) != "" {
+			targetPath = explicitPath
+		} else {
+			targetPath = "deskdrop.json"
+		}
 		rawMap = make(map[string]any)
 	}
 	delete(rawMap, "chrome-session")
@@ -714,7 +733,41 @@ func saveConfigChromeSession(explicitPath string, sessionName string) error {
 		return err
 	}
 	encoded = append(encoded, '\n')
-	return os.WriteFile(targetPath, encoded, 0o600)
+
+	dir := filepath.Dir(targetPath)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	tmp, err := os.CreateTemp(dir, ".deskdrop-cfg-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(encoded); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Chmod(tmpPath, 0o600); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, targetPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 func candidateConfigPaths(explicit string) []string {

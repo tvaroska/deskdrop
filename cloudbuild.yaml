@@ -12,13 +12,28 @@ steps:
         VERSION_STR="$${CB_TAG:-$${CB_MANUAL_TAG:-${_VERSION}}}"
         test -z "$$(gofmt -s -l .)"
         go vet ./...
-        go test -race ./...
+        GOOS=windows GOARCH=amd64 go vet ./cmd/deskdrop ./internal/driver/...
+        go test -race -count=1 ./...
         mkdir -p dist/latest
+        go test -c -o dist/cdp.test ./internal/driver/cdp
         CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=$${VERSION_STR}" -o dist/latest/deskdrop ./cmd/deskdrop
         CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=$${VERSION_STR}" -o dist/latest/deskdrop.exe ./cmd/deskdrop
         cp deskdrop.example.json dist/latest/deskdrop.example.json
-        (cd dist/latest && sha256sum deskdrop deskdrop.exe deskdrop.example.json > SHA256SUMS.txt)
+        (cd dist/latest && sha256sum deskdrop deskdrop.exe > SHA256SUMS.txt)
         cp -r dist/latest "dist/$${VERSION_STR}"
+
+  - name: "node:22-bookworm"
+    id: "node-js-parity-and-ast"
+    waitFor:
+      - "test-and-cross-build"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+        trap 'rm -f dist/cdp.test' EXIT
+        DESKDROP_REQUIRE_NODE=1 ./dist/cdp.test -test.v -test.run 'TestJSEval|TestT2JSRuntime'
+        npx --yes @ast-grep/cli@0.51.1 scan --rule specs/ast.rules.yaml
 
   - name: "gcr.io/cloud-builders/docker"
     id: "pull-cache"
@@ -68,23 +83,94 @@ steps:
         set -euo pipefail
         USER_CFG="$$(docker image inspect --format '{{.Config.User}}' deskdrop:ci)"
         test "$${USER_CFG}" = "65532:65532"
-        docker run -d --name deskdrop-smoke \
-          -e STORE_BACKEND=memory \
-          -e STORAGE_BACKEND=memory \
-          -e HEALER_ENABLED=false \
-          -e ADMIN_TOKEN=ci-smoke-token \
-          deskdrop:ci
-        trap "docker rm -f deskdrop-smoke >/dev/null 2>&1 || true" EXIT
-        for i in $$(seq 1 20); do
-          if docker run --rm --network="container:deskdrop-smoke" --entrypoint curl gcr.io/cloud-builders/docker -fsS http://127.0.0.1:8080/healthz >/dev/null \
-            && docker run --rm --network="container:deskdrop-smoke" --entrypoint curl gcr.io/cloud-builders/docker -fsS http://127.0.0.1:8080/desktop/healthz >/dev/null; then
-            echo "Health probes passed on attempt $$i"
-            exit 0
-          fi
-          sleep 1
-        done
-        docker logs deskdrop-smoke || true
-        exit 1
+
+        DATA_VOL="deskdrop-smoke-data-$${BUILD_ID:-ci}"
+        RECIPES_VOL="deskdrop-smoke-recipes-$${BUILD_ID:-ci}"
+        CLI_VOL="deskdrop-smoke-cli-$${BUILD_ID:-ci}"
+        cleanup() {
+          docker rm -f deskdrop-smoke >/dev/null 2>&1 || true
+          docker volume rm -f "$${DATA_VOL}" "$${RECIPES_VOL}" "$${CLI_VOL}" >/dev/null 2>&1 || true
+        }
+        trap cleanup EXIT
+
+        docker volume create "$${DATA_VOL}" >/dev/null
+        docker volume create "$${RECIPES_VOL}" >/dev/null
+        docker volume create "$${CLI_VOL}" >/dev/null
+
+        docker run --rm -v "$${DATA_VOL}:/data" --entrypoint sh gcr.io/cloud-builders/docker \
+          -c 'mkdir -p /data/blobs && chmod -R 777 /data'
+        docker run --rm -i -v "$${RECIPES_VOL}:/recipes" --entrypoint sh gcr.io/cloud-builders/docker \
+          -c 'cat > /recipes/status-dashboard.json && chmod 644 /recipes/status-dashboard.json' \
+          < examples/recipes/status-dashboard.json
+        docker run --rm -i -v "$${CLI_VOL}:/cli" --entrypoint sh gcr.io/cloud-builders/docker \
+          -c 'cat > /cli/deskdrop && chmod 755 /cli/deskdrop' \
+          < dist/latest/deskdrop
+
+        start_relay() {
+          docker rm -f deskdrop-smoke >/dev/null 2>&1 || true
+          docker run -d --name deskdrop-smoke \
+            -v "$${DATA_VOL}:/data" \
+            -v "$${RECIPES_VOL}:/recipes:ro" \
+            -e STORE_BACKEND=file \
+            -e STATE_FILE=/data/state.json \
+            -e STORAGE_BACKEND=local \
+            -e LOCAL_BLOB_DIR=/data/blobs \
+            -e RECIPES_URI=/recipes/status-dashboard.json \
+            -e HEALER_ENABLED=false \
+            -e DESKTOP_CLIENT_TOKEN=ci-desk-token \
+            -e AGENT_BUS_TOKEN=ci-agent-token \
+            -e ADMIN_TOKEN=ci-admin-token \
+            deskdrop:ci >/dev/null
+          for i in $$(seq 1 20); do
+            if docker run --rm --network="container:deskdrop-smoke" --entrypoint curl gcr.io/cloud-builders/docker -fsS http://127.0.0.1:8080/healthz >/dev/null \
+              && docker run --rm --network="container:deskdrop-smoke" --entrypoint curl gcr.io/cloud-builders/docker -fsS http://127.0.0.1:8080/desktop/healthz >/dev/null; then
+              echo "Health probes passed on attempt $$i"
+              return 0
+            fi
+            sleep 1
+          done
+          docker logs deskdrop-smoke || true
+          return 1
+        }
+
+        # M5.1: Production-mode FileStore + RECIPES_URI smoke and restart persistence.
+        start_relay
+        ENQ_JSON="$$(docker run --rm --network="container:deskdrop-smoke" --entrypoint curl gcr.io/cloud-builders/docker -fsS \
+          -X POST http://127.0.0.1:8080/desktop/v1/tasks \
+          -H 'Authorization: Bearer ci-agent-token' \
+          -H 'Content-Type: application/json' \
+          -d '{"recipe":"status-dashboard","requested_by":"ci-smoke"}')"
+        echo "$${ENQ_JSON}" | grep -q '"status-dashboard"'
+
+        # Restart container against the same /data volume and verify state.json persisted the task.
+        start_relay
+        TASKS_JSON="$$(docker run --rm --network="container:deskdrop-smoke" --entrypoint curl gcr.io/cloud-builders/docker -fsS \
+          -H 'Authorization: Bearer ci-agent-token' \
+          http://127.0.0.1:8080/desktop/v1/tasks)"
+        echo "$${TASKS_JSON}" | grep -q '"status-dashboard"'
+
+        # M5.3: Compiled CLI + relay E2E flow (recipes -> claim -> complete -> bus message).
+        docker run --rm --network="container:deskdrop-smoke" -v "$${CLI_VOL}:/cli:ro" \
+          --entrypoint bash gcr.io/cloud-builders/docker -c '
+            set -euo pipefail
+            printf "{\"from\":\"ci-worker\",\"service_url\":\"http://127.0.0.1:8080/desktop\",\"service_token\":\"ci-desk-token\"}\n" > /tmp/deskdrop.json
+            /cli/deskdrop recipes --config /tmp/deskdrop.json | grep -q "status-dashboard"
+            CLAIM_JSON="$$(curl -fsS -X POST http://127.0.0.1:8080/desktop/v1/tasks/claim \
+              -H "Authorization: Bearer ci-desk-token" \
+              -H "Content-Type: application/json" \
+              -d "{\"host\":\"ci-worker\"}")"
+            TASK_ID="$$(printf "%s" "$$CLAIM_JSON" | grep -o "\"id\":\"task_[^\"]*\"" | head -n 1 | cut -d"\"" -f4)"
+            test -n "$$TASK_ID"
+            curl -fsS -X POST "http://127.0.0.1:8080/desktop/v1/tasks/$${TASK_ID}/complete" \
+              -H "Authorization: Bearer ci-desk-token" \
+              -H "Content-Type: application/json" \
+              -d "{\"from\":\"ci-worker\",\"to\":\"ci-smoke\",\"report\":{\"schema_version\":\"2.0\",\"mode\":\"deterministic\",\"recipe\":\"status-dashboard\",\"topic\":\"ops-status\",\"host\":\"ci-worker\",\"captured_at_utc\":\"2026-11-26T00:00:00Z\",\"steps\":[{\"step_id\":\"overview\",\"url\":\"https://status.example.com/overview\",\"fields\":{\"overall_status\":\"Operational\"},\"items\":[{\"service\":\"API\",\"state\":\"Up\"}]}]}}" \
+              | grep -q "\"drop_id\""
+            curl -fsS -H "Authorization: Bearer ci-agent-token" \
+              "http://127.0.0.1:8080/desktop/v1/messages?for=ci-smoke" \
+              | grep -q "status-dashboard"
+          '
+        echo "M5.1 FileStore persistence and M5.3 CLI->relay E2E passed"
 
   - name: "gcr.io/cloud-builders/docker"
     id: "trivy-vulnerability-scan"
@@ -97,7 +183,7 @@ steps:
         set -euo pipefail
         docker run --rm \
           -v /var/run/docker.sock:/var/run/docker.sock \
-          aquasec/trivy:0.58.1 image \
+          ghcr.io/aquasecurity/trivy:0.70.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e image \
           --scanners vuln \
           --severity HIGH,CRITICAL \
           --ignore-unfixed \
@@ -107,6 +193,7 @@ steps:
   - name: "gcr.io/cloud-builders/docker"
     id: "push-release-image"
     waitFor:
+      - "node-js-parity-and-ast"
       - "verify-nonroot-and-healthcheck"
       - "trivy-vulnerability-scan"
     entrypoint: "bash"
@@ -156,6 +243,7 @@ steps:
         if [[ ! "$${RESOLVED_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
           exit 0
         fi
+        umask 077
         if ! gcloud secrets versions access latest --secret=ghcr-push-token --project=${PROJECT_ID} > /workspace/.ghcr-token; then
           rm -f /workspace/.ghcr-token
           exit 0
@@ -171,8 +259,8 @@ steps:
       - "-c"
       - |
         set -euo pipefail
+        trap 'rm -f /workspace/.ghcr-token' EXIT
         if [[ ! -s /workspace/.ghcr-token ]]; then
-          rm -f /workspace/.ghcr-token
           exit 0
         fi
         CB_TAG="${TAG_NAME}"
@@ -187,7 +275,7 @@ steps:
 
 substitutions:
   _REGION: "us-central1"
-  _VERSION: "v1.3.1"
+  _VERSION: "v1.4.0"
   _TAG: ""
   _PUSH: "auto"
 

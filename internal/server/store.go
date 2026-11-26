@@ -16,10 +16,19 @@ var (
 	ErrConflict = errors.New("state conflict")
 )
 
+// StatusCounts holds exact aggregate queue and proposal counts across all retained store records.
+type StatusCounts struct {
+	PendingTasks          int
+	ClaimedTasks          int
+	FailedDiagnosticTasks int
+	PendingProposals      int
+}
+
 // Store is the Driven Port for control-plane persistence (MemoryStore or atomic JSON FileStore).
 type Store interface {
 	Ping(ctx context.Context) error
 	Close() error
+	CountStatus(ctx context.Context) (StatusCounts, error)
 
 	// Message board (/v1/messages)
 	PostMessage(ctx context.Context, req contract.PostMessageRequest, idempotencyKey string) (contract.BusMessage, bool, error)

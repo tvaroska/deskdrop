@@ -1,0 +1,16 @@
+.git
+.gitignore
+.DS_Store
+.env
+.env.*
+dist/
+bin/
+*.exe
+*.zip
+deskdrop.json
+deskdrop.local.json
+browser-drop.json
+browser-drop.local.json
+docs/
+ci/
+prompts/

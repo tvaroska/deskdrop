@@ -1,7 +1,7 @@
 id: no-postgres-driver-import
 language: go
 severity: error
-message: "DeskDrop retired PostgreSQL in favor of atomic JSON FileStore (ADR-003); do not import lib/pq or database/sql."
+message: "DeskDrop retired PostgreSQL in favor of atomic JSON FileStore (ADR-003); do not import lib/pq, jackc/pgx, or database/sql."
 rule:
   kind: import_spec
   any:
@@ -9,12 +9,18 @@ rule:
         pattern: '"github.com/lib/pq"'
     - has:
         pattern: '"database/sql"'
+    - has:
+        kind: interpreted_string_literal
+        regex: '^"github\.com/jackc/pgx(/.*)?"$'
 metadata:
   test_path: hygiene_test.go
   invalid_examples:
     - |
       package p
       import _ "github.com/lib/pq"
+    - |
+      package p
+      import _ "github.com/jackc/pgx/v5"
   valid_examples:
     - |
       package p
@@ -23,12 +29,14 @@ metadata:
 id: no-shell-command-injection
 language: go
 severity: error
-message: "Do not execute shell interpreters via exec.Command; invoke target binaries directly."
+message: "Do not execute shell interpreters via exec.Command or exec.CommandContext; invoke target binaries directly."
 rule:
   any:
-    - pattern: exec.Command("sh", "-c", $$$)
-    - pattern: exec.Command("bash", "-c", $$$)
-    - pattern: exec.Command("cmd", "/C", $$$)
+    - pattern: exec.Command($SHELL, $$$)
+    - pattern: exec.CommandContext($CTX, $SHELL, $$$)
+constraints:
+  SHELL:
+    regex: '^"((/usr)?/bin/(ba|z|da|a)?sh|(ba|z|da|a)?sh|[Cc][Mm][Dd](\.[Ee][Xx][Ee])?|[Pp]ower[Ss]hell(\.[Ee][Xx][Ee])?|[Pp]wsh(\.[Ee][Xx][Ee])?)"$'
 metadata:
   test_path: hygiene_test.go
   invalid_examples:
@@ -36,8 +44,48 @@ metadata:
       package p
       import "os/exec"
       func f() { _ = exec.Command("sh", "-c", "ls") }
+    - |
+      package p
+      import (
+        "context"
+        "os/exec"
+      )
+      func f(ctx context.Context) { _ = exec.CommandContext(ctx, "/bin/bash", "-c", "ls") }
+    - |
+      package p
+      import "os/exec"
+      func f() { _ = exec.Command("cmd.exe", "/c", "dir") }
+    - |
+      package p
+      import "os/exec"
+      func f() { _ = exec.Command("powershell.exe", "-Command", "Get-Date") }
   valid_examples:
     - |
       package p
       import "os/exec"
       func f() { _ = exec.Command("google-chrome", "--no-first-run") }
+---
+id: no-adk-genai-outside-healer
+language: go
+severity: error
+message: "ADK and GenAI SDK imports must stay isolated inside internal/healer/ to preserve the zero-dependency desktop CLI boundary (ADR-001)."
+ignores:
+  - "internal/healer/**"
+rule:
+  kind: import_spec
+  has:
+    kind: interpreted_string_literal
+    regex: '^"google\.golang\.org/(adk|genai)(/.*)?"$'
+metadata:
+  test_path: hygiene_test.go
+  invalid_examples:
+    - |
+      package p
+      import "google.golang.org/genai"
+    - |
+      package p
+      import "google.golang.org/adk/v2/model"
+  valid_examples:
+    - |
+      package p
+      import "github.com/tvaroska/deskdrop/internal/contract"

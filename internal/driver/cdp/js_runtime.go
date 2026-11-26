@@ -38,7 +38,7 @@ func buildDeclarativeExtractJS(step contract.Step, maxText int) string {
 
 		const fieldsOut = {};
 		for (const [key, rule] of Object.entries(fieldRules)) {
-			const val = evalFieldRule(document.body || document.documentElement, rule);
+			const val = evalFieldRule(document.body || document.documentElement, rule, true);
 			if (val !== undefined) fieldsOut[key] = val;
 		}
 
@@ -317,14 +317,23 @@ function readAttrOrText(el, attrSpec) {
 	return "";
 }
 
-function evalFieldRule(scopeEl, rule) {
+function safeClosest(el, selector) {
+	if (!el || !selector || !el.closest) return null;
+	try {
+		return el.closest(selector);
+	} catch (_) {
+		return null;
+	}
+}
+
+function evalFieldRule(scopeEl, rule, omitUnmatchedNumeric) {
 	if (!scopeEl || !rule) return undefined;
 	let el = scopeEl;
 	if (rule.selector) {
 		el = deepQueryFirst(scopeEl, rule.selector);
 	}
-	if (el && rule.closest && el.closest) {
-		el = el.closest(rule.closest);
+	if (el && rule.closest) {
+		el = safeClosest(el, rule.closest);
 	}
 	let raw = el ? readAttrOrText(el, rule.attr) : "";
 	if (raw && rule.regex) {
@@ -342,7 +351,9 @@ function evalFieldRule(scopeEl, rule) {
 	}
 	if (!raw) {
 		if (rule.optional) return undefined;
-		if (rule.parse === "number" || rule.parse === "float") return 0;
+		if (rule.parse === "number" || rule.parse === "float") {
+			return omitUnmatchedNumeric ? undefined : 0;
+		}
 		return "";
 	}
 	if (rule.max_chars && rule.max_chars > 0 && raw.length > rule.max_chars) {
@@ -353,11 +364,13 @@ function evalFieldRule(scopeEl, rule) {
 
 	if (rule.parse === "number") {
 		const p = parseCompactFloat(raw);
-		return p.ok ? Math.round(p.val) : 0;
+		if (p.ok) return Math.round(p.val);
+		return omitUnmatchedNumeric ? undefined : 0;
 	}
 	if (rule.parse === "float") {
 		const p = parseCompactFloat(raw);
-		return p.ok ? p.val : 0;
+		if (p.ok) return p.val;
+		return omitUnmatchedNumeric ? undefined : 0;
 	}
 	return raw;
 }
@@ -373,7 +386,7 @@ function evalItemRule(root, itemRule) {
 	for (const match of matches) {
 		let scope = match;
 		if (itemRule.anchor_closest) {
-			let anc = match.closest ? match.closest(itemRule.anchor_closest) : null;
+			let anc = safeClosest(match, itemRule.anchor_closest);
 			if (!anc) {
 				let cur = match;
 				while (cur.parentElement && cur.parentElement !== document.body && cur.parentElement.tagName !== "MAIN") {

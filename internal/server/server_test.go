@@ -768,3 +768,315 @@ func TestS5ErrorCodeOverrideGuardAndS6PreLockDriverResolution(t *testing.T) {
 		t.Fatalf("expected 0 catalog.Get calls during ClaimNextTask filter, got %d", cat.getCalls.Load())
 	}
 }
+
+func TestT1AuthMatrixProposalSecurityBreakerHoldAndLeaseExpiry(t *testing.T) {
+	ctx := context.Background()
+	baseRecipe := contract.Recipe{
+		Name:  "status-board",
+		Topic: "ops",
+		Steps: []contract.Step{{ID: "s1", URL: "https://status.example.com/overview"}},
+	}
+	cat := recipes.NewStaticCatalog(baseRecipe)
+	store := NewMemoryStore()
+	svc := NewService(ServerConfig{
+		Version:            "v1.4.0",
+		DesktopClientToken: "desk-tok",
+		AgentBusToken:      "agent-tok",
+		AdminToken:         "admin-tok",
+		ForbiddenTerms:     []string{"forbidden-secret"},
+	}, store, NewMemoryBlobStore(), cat, nil)
+
+	doReq := func(method, path, token, body string) *httptest.ResponseRecorder {
+		var r *http.Request
+		if body != "" {
+			r = httptest.NewRequest(method, path, strings.NewReader(body))
+		} else {
+			r = httptest.NewRequest(method, path, nil)
+		}
+		if token != "" {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+		w := httptest.NewRecorder()
+		svc.ServeHTTP(w, r)
+		return w
+	}
+
+	// 1. Auth matrix across ScopeDesktop, ScopeAgent, and ScopeAdmin (401/403/200).
+	for _, ep := range []struct{ method, path string }{
+		{http.MethodGet, "/v1/status"},
+		{http.MethodGet, "/v1/tasks"},
+		{http.MethodPost, "/v1/breakers/status.example.com/resume"},
+		{http.MethodPost, "/v1/proposals/prop_x/approve"},
+	} {
+		if w := doReq(ep.method, ep.path, "", ""); w.Code != http.StatusUnauthorized {
+			t.Fatalf("no token %s %s = %d, want 401", ep.method, ep.path, w.Code)
+		}
+		if w := doReq(ep.method, ep.path, "wrong-token", ""); w.Code != http.StatusUnauthorized {
+			t.Fatalf("invalid token %s %s = %d, want 401", ep.method, ep.path, w.Code)
+		}
+	}
+	if w := doReq(http.MethodGet, "/v1/status", "desk-tok", ""); w.Code != http.StatusOK {
+		t.Fatalf("desktop token GET /v1/status = %d, want 200", w.Code)
+	}
+	if w := doReq(http.MethodGet, "/v1/tasks", "desk-tok", ""); w.Code != http.StatusForbidden {
+		t.Fatalf("desktop token GET /v1/tasks = %d, want 403", w.Code)
+	}
+	if w := doReq(http.MethodGet, "/v1/tasks", "agent-tok", ""); w.Code != http.StatusOK {
+		t.Fatalf("agent token GET /v1/tasks = %d, want 200", w.Code)
+	}
+	// S-12 ScopeAdmin: when AdminToken is configured, agent-tok MUST receive 403 on admin routes.
+	for _, ep := range []string{
+		"/v1/breakers/status.example.com/resume",
+		"/v1/proposals/prop_x/approve",
+		"/v1/proposals/prop_x/reject",
+	} {
+		if w := doReq(http.MethodPost, ep, "desk-tok", `{}`); w.Code != http.StatusForbidden {
+			t.Fatalf("desktop token POST %s = %d, want 403", ep, w.Code)
+		}
+		if w := doReq(http.MethodPost, ep, "agent-tok", `{}`); w.Code != http.StatusForbidden {
+			t.Fatalf("agent token POST %s = %d, want 403 when AdminToken configured", ep, w.Code)
+		}
+	}
+
+	// 2. Proposal approval security: unverified 422, domain pivot 403, air-gap 422, reject + conflict 409.
+	pUnverified, _ := store.SaveProposal(ctx, contract.RecipePatchProposal{
+		RecipeName:     "status-board",
+		Verified:       false,
+		ProposedRecipe: baseRecipe,
+	})
+	if w := doReq(http.MethodPost, "/v1/proposals/"+pUnverified.ID+"/approve", "admin-tok", `{}`); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("approve unverified proposal = %d, want 422 (%s)", w.Code, w.Body.String())
+	}
+
+	pivotRecipe := baseRecipe
+	pivotRecipe.Steps = []contract.Step{{ID: "s1", URL: "https://evil.invalid/steal"}}
+	pPivot, _ := store.SaveProposal(ctx, contract.RecipePatchProposal{
+		RecipeName:     "status-board",
+		Verified:       true,
+		ProposedRecipe: pivotRecipe,
+	})
+	if w := doReq(http.MethodPost, "/v1/proposals/"+pPivot.ID+"/approve", "admin-tok", `{}`); w.Code != http.StatusForbidden {
+		t.Fatalf("approve domain pivot proposal = %d, want 403 (%s)", w.Code, w.Body.String())
+	}
+
+	pAirGap, _ := store.SaveProposal(ctx, contract.RecipePatchProposal{
+		RecipeName:     "status-board",
+		Verified:       true,
+		ProposedRecipe: baseRecipe,
+	})
+	if w := doReq(http.MethodPost, "/v1/proposals/"+pAirGap.ID+"/approve", "admin-tok", `{"note":"leaks forbidden-secret"}`); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("approve air-gap note = %d, want 422 (%s)", w.Code, w.Body.String())
+	}
+
+	// Reject succeeds (200) without mutating RECIPES_URI; second review returns 409.
+	pReject, _ := store.SaveProposal(ctx, contract.RecipePatchProposal{
+		RecipeName: "status-board",
+		Verified:   true,
+		ProposedRecipe: contract.Recipe{
+			Name:        "status-board",
+			Topic:       "ops",
+			Description: "must-not-be-written",
+			Steps:       []contract.Step{{ID: "s1", URL: "https://status.example.com/overview"}},
+		},
+	})
+	if w := doReq(http.MethodPost, "/v1/proposals/"+pReject.ID+"/reject", "admin-tok", `{"reviewed_by":"sec-op"}`); w.Code != http.StatusOK {
+		t.Fatalf("reject proposal = %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if cur, _, _ := cat.Get(ctx, "status-board"); cur.Description == "must-not-be-written" {
+		t.Fatal("rejected proposal mutated catalog")
+	}
+	if w := doReq(http.MethodPost, "/v1/proposals/"+pReject.ID+"/approve", "admin-tok", `{}`); w.Code != http.StatusConflict {
+		t.Fatalf("approve after reject = %d, want 409", w.Code)
+	}
+	if w := doReq(http.MethodPost, "/v1/proposals/"+pReject.ID+"/reject", "admin-tok", `{}`); w.Code != http.StatusConflict {
+		t.Fatalf("double reject = %d, want 409", w.Code)
+	}
+
+	// 3. AUTH_EXPIRED breaker hold, req.Domain spoof prevention (S-12), and admin resume.
+	enqW := doReq(http.MethodPost, "/v1/tasks", "agent-tok", `{"recipe":"status-board","domain":"spoofed-bypass.example.com"}`)
+	if enqW.Code != http.StatusCreated {
+		t.Fatalf("enqueue status-board = %d (%s)", enqW.Code, enqW.Body.String())
+	}
+	var enqResp struct {
+		Task contract.Task `json:"task"`
+	}
+	_ = json.Unmarshal(enqW.Body.Bytes(), &enqResp)
+	if enqResp.Task.Domain != "status.example.com" {
+		t.Fatalf("S-12 spoofed req.Domain accepted: got %q, want status.example.com", enqResp.Task.Domain)
+	}
+
+	claimW := doReq(http.MethodPost, "/v1/tasks/claim", "desk-tok", `{"host":"win-pc"}`)
+	if claimW.Code != http.StatusOK || !strings.Contains(claimW.Body.String(), enqResp.Task.ID) {
+		t.Fatalf("initial claim = %d (%s)", claimW.Code, claimW.Body.String())
+	}
+	failW := doReq(http.MethodPost, "/v1/tasks/"+enqResp.Task.ID+"/fail", "desk-tok", `{"from":"win-pc","landed_url":"https://status.example.com/login","error":"redirected to login"}`)
+	if failW.Code != http.StatusOK {
+		t.Fatalf("fail AUTH_EXPIRED = %d (%s)", failW.Code, failW.Body.String())
+	}
+	// Enqueue a second task with spoofed domain while breaker is open: must still be held!
+	_ = doReq(http.MethodPost, "/v1/tasks", "agent-tok", `{"recipe":"status-board","domain":"other-clean.example.com"}`)
+	claimHeld := doReq(http.MethodPost, "/v1/tasks/claim", "desk-tok", `{"host":"win-pc"}`)
+	var heldResp contract.ClaimTaskResponse
+	_ = json.Unmarshal(claimHeld.Body.Bytes(), &heldResp)
+	if heldResp.Task != nil {
+		t.Fatalf("expected tasks held while AUTH_EXPIRED breaker open, got %+v", heldResp.Task)
+	}
+
+	// Admin resumes breaker -> waiting task immediately claimable.
+	resW := doReq(http.MethodPost, "/v1/breakers/status.example.com/resume", "admin-tok", `{}`)
+	if resW.Code != http.StatusOK {
+		t.Fatalf("admin resume breaker = %d (%s)", resW.Code, resW.Body.String())
+	}
+	claimAfter := doReq(http.MethodPost, "/v1/tasks/claim", "desk-tok", `{"host":"win-pc"}`)
+	var afterResp contract.ClaimTaskResponse
+	_ = json.Unmarshal(claimAfter.Body.Bytes(), &afterResp)
+	if afterResp.Task == nil || afterResp.Task.Domain != "status.example.com" {
+		t.Fatalf("expected task claimable after breaker resume, got %+v", afterResp.Task)
+	}
+
+	// 4. Claim lease expiry: attempt < max_attempts requeues to pending; attempt >= max_attempts dead-letters.
+	leaseStore := NewMemoryStore()
+	lt, _, _ := leaseStore.EnqueueTask(ctx, contract.EnqueueTaskRequest{
+		Recipe:      "status-board",
+		Domain:      "status.example.com",
+		MaxAttempts: 2,
+	})
+	c1, err := leaseStore.ClaimNextTask(ctx, "win-pc", time.Minute, nil)
+	if err != nil || c1 == nil || c1.Attempt != 1 {
+		t.Fatalf("lease claim 1 = (%+v, %v)", c1, err)
+	}
+	// Force lease expiry in the past.
+	leaseStore.mu.Lock()
+	leaseStore.tasks[0].LeaseUntil = "2020-01-01T00:00:00Z"
+	leaseStore.mu.Unlock()
+
+	requeued, err := leaseStore.GetTask(ctx, lt.ID)
+	if err != nil || requeued.Status != contract.TaskStatusPending {
+		t.Fatalf("expired attempt 1 status = %q err=%v, want pending", requeued.Status, err)
+	}
+	c2, err := leaseStore.ClaimNextTask(ctx, "win-pc", time.Minute, nil)
+	if err != nil || c2 == nil || c2.Attempt != 2 {
+		t.Fatalf("lease claim 2 = (%+v, %v)", c2, err)
+	}
+	leaseStore.mu.Lock()
+	leaseStore.tasks[0].LeaseUntil = "2020-01-01T00:00:00Z"
+	leaseStore.mu.Unlock()
+
+	dead, err := leaseStore.GetTask(ctx, lt.ID)
+	if err != nil || dead.Status != contract.TaskStatusDeadLetter || dead.LastCode != contract.ErrorCodeCDPTransient {
+		t.Fatalf("expired attempt 2 status = (%q, %q, %v), want (dead_letter, CDP_TRANSIENT, nil)", dead.Status, dead.LastCode, err)
+	}
+}
+
+func TestS12S13HealerErrorLoggingFallbackCloseAndExactStatusCounts(t *testing.T) {
+	ctx := context.Background()
+	var errBuf bytes.Buffer
+	restore := setErrorLogOutputForTest(&errBuf)
+	defer restore()
+
+	cat := recipes.NewStaticCatalog(contract.Recipe{
+		Name:  "status-board",
+		Topic: "ops",
+		Steps: []contract.Step{{ID: "s1", URL: "https://status.example.com/overview"}},
+	})
+	store := NewMemoryStore()
+	failingHealer := &stubHealer{
+		fn: func(_ context.Context, _ HealRequest) (HealResult, error) {
+			return HealResult{}, errors.New("vertex 429 quota exceeded")
+		},
+	}
+	svc := NewService(ServerConfig{
+		Version:            "v1.4.0",
+		DesktopClientToken: "desk-tok",
+		AgentBusToken:      "agent-tok",
+		AdminToken:         "admin-tok",
+	}, store, NewMemoryBlobStore(), cat, failingHealer)
+
+	makeDOMZip := func() []byte {
+		var zb bytes.Buffer
+		zw := zip.NewWriter(&zb)
+		wh, _ := zw.Create("dom.html")
+		_, _ = wh.Write([]byte(`<html><body><div>drifted</div></body></html>`))
+		_ = zw.Close()
+		return zb.Bytes()
+	}
+
+	// 1. S-12: runDriftHealer logs errors to stderr via errLogger instead of dropping them silently.
+	tFail, _, _ := store.EnqueueTask(ctx, contract.EnqueueTaskRequest{Recipe: "status-board", Domain: "status.example.com"})
+	_, _ = store.ClaimNextTask(ctx, "win-pc", time.Minute, nil)
+	var mp1 bytes.Buffer
+	mw1 := multipart.NewWriter(&mp1)
+	_ = mw1.WriteField("payload_json", `{"from":"win-pc","step_id":"s1","landed_url":"https://status.example.com/overview","error":"step \"s1\" missing required field \"status\""}`)
+	fw1, _ := mw1.CreateFormFile("bundle", "debug.zip")
+	_, _ = fw1.Write(makeDOMZip())
+	_ = mw1.Close()
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/tasks/"+tFail.ID+"/fail", &mp1)
+	req1.Header.Set("Authorization", "Bearer desk-tok")
+	req1.Header.Set("Content-Type", mw1.FormDataContentType())
+	w1 := httptest.NewRecorder()
+	svc.ServeHTTP(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("fail task with failing healer = %d (%s)", w1.Code, w1.Body.String())
+	}
+	if !strings.Contains(errBuf.String(), "DRIFT_HEALER") || !strings.Contains(errBuf.String(), "vertex 429 quota exceeded") {
+		t.Fatalf("expected healer error logged to stderr, got %q", errBuf.String())
+	}
+
+	// 2. S-12: handleFallbackResult closes unhealed fallback task to failed_diagnostic (never stuck in claimed).
+	fbTask, _, _ := store.EnqueueTask(ctx, contract.EnqueueTaskRequest{
+		Kind:   contract.TaskKindFallback,
+		Recipe: "status-board",
+		Domain: "status.example.com",
+		FallbackPlan: &contract.FallbackPlan{
+			AllowedDomain: "status.example.com",
+			TargetURL:     "https://status.example.com/overview",
+			Actions:       []contract.FallbackAction{{Action: "wait", WaitMs: 100}},
+		},
+	})
+	_, _ = store.ClaimNextTask(ctx, "win-pc", time.Minute, nil)
+	var mp2 bytes.Buffer
+	mw2 := multipart.NewWriter(&mp2)
+	_ = mw2.WriteField("payload_json", `{"from":"win-pc","step_id":"s1","landed_url":"https://status.example.com/overview"}`)
+	fw2, _ := mw2.CreateFormFile("bundle", "debug.zip")
+	_, _ = fw2.Write(makeDOMZip())
+	_ = mw2.Close()
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/tasks/"+fbTask.ID+"/fallback-result", &mp2)
+	req2.Header.Set("Authorization", "Bearer desk-tok")
+	req2.Header.Set("Content-Type", mw2.FormDataContentType())
+	w2 := httptest.NewRecorder()
+	svc.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("fallback-result = %d (%s)", w2.Code, w2.Body.String())
+	}
+	fbAfter, _ := store.GetTask(ctx, fbTask.ID)
+	if fbAfter.Status != contract.TaskStatusFailedDiagnostic || !strings.Contains(fbAfter.LastError, "vertex 429 quota exceeded") {
+		t.Fatalf("fallback task after healer error = (%q, %q), want failed_diagnostic with healer error", fbAfter.Status, fbAfter.LastError)
+	}
+
+	// 3. S-13: GET /v1/status reports exact pending_tasks count beyond the old 50-item list cap.
+	for i := 0; i < 65; i++ {
+		_, _, _ = store.EnqueueTask(ctx, contract.EnqueueTaskRequest{Recipe: "status-board", Domain: "status.example.com"})
+	}
+	stReq := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
+	stReq.Header.Set("Authorization", "Bearer desk-tok")
+	stW := httptest.NewRecorder()
+	svc.ServeHTTP(stW, stReq)
+	if stW.Code != http.StatusOK {
+		t.Fatalf("GET /v1/status = %d (%s)", stW.Code, stW.Body.String())
+	}
+	var statusResp struct {
+		Summary struct {
+			PendingTasks          int `json:"pending_tasks"`
+			FailedDiagnosticTasks int `json:"failed_diagnostic_tasks"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal(stW.Body.Bytes(), &statusResp); err != nil {
+		t.Fatalf("decode /v1/status: %v", err)
+	}
+	if statusResp.Summary.PendingTasks != 65 {
+		t.Fatalf("/v1/status pending_tasks = %d, want 65", statusResp.Summary.PendingTasks)
+	}
+	if statusResp.Summary.FailedDiagnosticTasks != 2 {
+		t.Fatalf("/v1/status failed_diagnostic_tasks = %d, want 2", statusResp.Summary.FailedDiagnosticTasks)
+	}
+}

@@ -242,3 +242,23 @@ func TestS1FailClosedOnTruncatedHTTPAndInvalidJSONAndM25TransientClassifier(t *t
 		t.Fatal("404 must not classify as transient")
 	}
 }
+
+func TestS13TaskMethodsEnforceValidateAuth(t *testing.T) {
+	unauthed := NewDesktopClient(contract.Config{})
+	ctx := context.Background()
+	if _, err := unauthed.ClaimNextTask(ctx, "win-pc", 30, nil); err == nil {
+		t.Error("ClaimNextTask succeeded without auth config")
+	}
+	if err := unauthed.HeartbeatTask(ctx, "task_1", "win-pc", 30); err == nil {
+		t.Error("HeartbeatTask succeeded without auth config")
+	}
+	if _, err := unauthed.CompleteTask(ctx, "task_1", "all", contract.DropReport{}); err == nil {
+		t.Error("CompleteTask succeeded without auth config")
+	}
+	if _, _, err := unauthed.FailTask(ctx, "task_1", contract.FailReportMetadata{Error: "x"}, nil); err == nil {
+		t.Error("FailTask succeeded without auth config")
+	}
+	if _, _, err := unauthed.SubmitFallbackResult(ctx, "task_1", contract.FailReportMetadata{Error: "x"}, nil); err == nil {
+		t.Error("SubmitFallbackResult succeeded without auth config")
+	}
+}

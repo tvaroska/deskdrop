@@ -58,6 +58,29 @@ func NewMemoryStore() *MemoryStore {
 func (m *MemoryStore) Ping(_ context.Context) error { return nil }
 func (m *MemoryStore) Close() error                 { return nil }
 
+func (m *MemoryStore) CountStatus(_ context.Context) (StatusCounts, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sweepExpiredLeasesLocked(time.Now().UTC())
+	var c StatusCounts
+	for _, t := range m.tasks {
+		switch t.Status {
+		case contract.TaskStatusPending:
+			c.PendingTasks++
+		case contract.TaskStatusClaimed:
+			c.ClaimedTasks++
+		case contract.TaskStatusFailedDiagnostic:
+			c.FailedDiagnosticTasks++
+		}
+	}
+	for _, p := range m.proposals {
+		if p.Status == contract.ProposalStatusPending {
+			c.PendingProposals++
+		}
+	}
+	return c, nil
+}
+
 func (m *MemoryStore) exportSnapshot() storeSnapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()

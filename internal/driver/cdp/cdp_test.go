@@ -10,18 +10,23 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/tvaroska/deskdrop/internal/contract"
 	"github.com/tvaroska/deskdrop/internal/driver"
+	"github.com/tvaroska/deskdrop/internal/verify"
 )
 
 func TestSessionPoolSingleAttemptApprovalLatch(t *testing.T) {
@@ -187,6 +192,7 @@ func TestExecuteStepAndFallbackCloseScratchTabOnFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
 	}
+	client.settleDelay = time.Millisecond
 	defer client.Close()
 
 	// Step expects >=1 item so it fails with StepExecError AND must still close scratch-1 immediately.
@@ -316,6 +322,7 @@ func TestHappyPathSkipsAXTreeAndPaginationLoopsUntilDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
 	}
+	client.settleDelay = time.Millisecond
 	defer client.Close()
 
 	step := contract.Step{
@@ -330,7 +337,7 @@ func TestHappyPathSkipsAXTreeAndPaginationLoopsUntilDisabled(t *testing.T) {
 		Pagination: &contract.PaginationRule{
 			NextSelector: "button.next",
 			MaxPages:     5,
-			WaitMs:       5,
+			WaitMs:       contract.IntPtr(5),
 		},
 		Expect: contract.Expectation{
 			MinItems: 4,
@@ -365,7 +372,10 @@ func TestJSEvalFieldRuleNumericFallbackParity(t *testing.T) {
 	}
 	nodeBin, err := exec.LookPath("node")
 	if err != nil {
-		return
+		if os.Getenv("CI") != "" || os.Getenv("DESKDROP_REQUIRE_NODE") == "1" {
+			t.Fatalf("node is required in CI for JS/Go runtime parity tests: %v", err)
+		}
+		t.Skipf("node not found in PATH; skipping JS runtime execution parity: %v", err)
 	}
 
 	script := shadowDOMHelperJS + `
@@ -509,6 +519,7 @@ func TestS7ExecuteFallbackAndPaginationFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	client.settleDelay = time.Millisecond
 	defer client.Close()
 
 	step := contract.Step{
@@ -558,7 +569,7 @@ func TestS7ExecuteFallbackAndPaginationFailClosed(t *testing.T) {
 	pagedStep := contract.Step{
 		ID:         "list",
 		URL:        "https://example.com/list",
-		Pagination: &contract.PaginationRule{NextSelector: "button.next", MaxPages: 3, WaitMs: 1},
+		Pagination: &contract.PaginationRule{NextSelector: "button.next", MaxPages: 3, WaitMs: contract.IntPtr(1)},
 	}
 	if _, err := client.ExecuteStep(context.Background(), pagedStep); err == nil {
 		t.Fatal("expected pagination to fail closed on non-HTTP file URL")
@@ -647,6 +658,7 @@ func TestS8MatchesTabPatternAndMultiProfileDriftPreservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	client.settleDelay = time.Millisecond
 	defer client.Close()
 
 	_, err = client.ExecuteStep(context.Background(), contract.Step{
@@ -817,4 +829,407 @@ func writeServerWSFrame(conn net.Conn, payload []byte) error {
 	}
 	_, err := conn.Write(payload)
 	return err
+}
+
+func TestT2JSRuntimeScrubberItemRulePaginationAndDriftParity(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		if os.Getenv("CI") != "" || os.Getenv("DESKDROP_REQUIRE_NODE") == "1" {
+			t.Fatalf("node is required in CI for JS/Go runtime parity tests: %v", err)
+		}
+		t.Skipf("node not found in PATH; skipping JS parity test: %v", err)
+	}
+
+	// Verify Go-vs-JS parity on testdata/drift/status_v1.html + buildScrubbedHTMLJS + buildClickNextIfEnabledJS + parseCompactFloat K/M/B.
+	v1RecipeRaw, err := os.ReadFile(filepath.Join("..", "..", "..", "testdata", "drift", "status_v1_recipe.json"))
+	if err != nil {
+		t.Fatalf("read status_v1_recipe.json: %v", err)
+	}
+	var v1Recipe contract.Recipe
+	if err := contract.ParseJSONStrict(v1RecipeRaw, &v1Recipe); err != nil {
+		t.Fatalf("parse v1 recipe: %v", err)
+	}
+	v1HTMLBytes, err := os.ReadFile(filepath.Join("..", "..", "..", "testdata", "drift", "status_v1.html"))
+	if err != nil {
+		t.Fatalf("read status_v1.html: %v", err)
+	}
+	goRes, err := verify.ExtractStepFromHTML(v1Recipe.Steps[0], string(v1HTMLBytes), "https://status.example.com/overview")
+	if err != nil {
+		t.Fatalf("ExtractStepFromHTML failed: %v", err)
+	}
+
+	itemRuleJSON, _ := json.Marshal(v1Recipe.Steps[0].Items)
+	htmlJSON, _ := json.Marshal(string(v1HTMLBytes))
+	scrubJS := buildScrubbedHTMLJS()
+	clickNextJS := buildClickNextIfEnabledJS("button.next")
+
+	script := fmt.Sprintf(`
+%s
+// Minimal DOM mock for Node parity checks (scrubber, evalItemRule, parseCompactFloat, buildClickNextIfEnabledJS).
+class TextNode {
+	constructor(val) { this.nodeType = 3; this.nodeValue = val; }
+	get outerHTML() { return this.nodeValue; }
+}
+class Elem {
+	constructor(tag, attrs = {}, children = []) {
+		this.nodeType = 1;
+		this.tagName = tag.toUpperCase();
+		this._attrs = new Map(Object.entries(attrs));
+		this.childNodes = [];
+		this.children = [];
+		this.parentElement = null;
+		this.hidden = this._attrs.has("hidden");
+		this.disabled = this._attrs.has("disabled");
+		this.clicked = false;
+		this.classList = { contains: (c) => (this.getAttribute("class") || "").split(/\s+/).includes(c) };
+		for (const ch of children) this.appendChild(ch);
+	}
+	get attributes() {
+		const out = [];
+		for (const [name, value] of this._attrs.entries()) out.push({ name, value });
+		return out;
+	}
+	getAttribute(k) { return this._attrs.has(k) ? this._attrs.get(k) : null; }
+	hasAttribute(k) { return this._attrs.has(k); }
+	setAttribute(k, v) { this._attrs.set(k, String(v)); }
+	appendChild(ch) {
+		this.childNodes.push(ch);
+		if (ch.nodeType === 1) { ch.parentElement = this; this.children.push(ch); }
+	}
+	click() { this.clicked = true; }
+	get outerHTML() {
+		const tag = this.tagName.toLowerCase();
+		const aStr = Array.from(this._attrs.entries()).map(([k, v]) => ' ' + k + '="' + v + '"').join('');
+		return '<' + tag + aStr + '>' + this.childNodes.map(c => c.outerHTML).join('') + '</' + tag + '>';
+	}
+	matchesSimple(sel) {
+		sel = sel.trim();
+		const mTag = sel.match(/^[a-zA-Z0-9_-]+/);
+		if (mTag && this.tagName.toLowerCase() !== mTag[0].toLowerCase()) return false;
+		const classes = Array.from(sel.matchAll(/\.([a-zA-Z0-9_-]+)/g)).map(m => m[1]);
+		const have = (this.getAttribute("class") || "").split(/\s+/);
+		for (const c of classes) if (!have.includes(c)) return false;
+		return true;
+	}
+	querySelectorAll(sel) {
+		const out = [];
+		const walk = (n) => {
+			for (const ch of n.children) {
+				if (ch.matchesSimple(sel)) out.push(ch);
+				walk(ch);
+			}
+		};
+		walk(this);
+		return out;
+	}
+	closest(sel) {
+		let cur = this;
+		while (cur) {
+			if (cur.matchesSimple(sel)) return cur;
+			cur = cur.parentElement;
+		}
+		return null;
+	}
+}
+
+// Parse status_v1.html rows into mock DOM to compare evalItemRule against Go verify.
+const rawHTML = %s;
+const body = new Elem("body");
+const rowRe = /<div class="metric-row">([\s\S]*?)<\/div>/g;
+let rm;
+while ((rm = rowRe.exec(rawHTML)) !== null) {
+	const inner = rm[1];
+	const svc = (inner.match(/class="svc-name">([^<]+)</) || [,""])[1];
+	const st = (inner.match(/class="svc-state">([^<]+)</) || [,""])[1];
+	const up = (inner.match(/class="svc-uptime">([^<]+)</) || [,""])[1];
+	body.appendChild(new Elem("div", { class: "metric-row" }, [
+		new Elem("span", { class: "svc-name" }, [new TextNode(svc)]),
+		new Elem("span", { class: "svc-state" }, [new TextNode(st)]),
+		new Elem("span", { class: "svc-uptime" }, [new TextNode(up)]),
+	]));
+}
+body.appendChild(new Elem("script", {}, [new TextNode("evilScript()")]));
+body.appendChild(new Elem("input", { type: "password", value: "top-secret-pw", onclick: "bad()" }));
+body.appendChild(new Elem("textarea", {}, [new TextNode("private-textarea")]));
+const btnEnabled = new Elem("button", { class: "next" }, [new TextNode("Next")]);
+body.appendChild(btnEnabled);
+
+const htmlRoot = new Elem("html", {}, [body]);
+global.window = { getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }) };
+global.document = {
+	documentElement: htmlRoot,
+	body: body,
+	children: [htmlRoot],
+	childNodes: [htmlRoot],
+	createElement: (tag) => new Elem(tag),
+	createTextNode: (v) => new TextNode(v),
+	querySelectorAll: (sel) => htmlRoot.querySelectorAll(sel),
+};
+
+const scrubbed = (%s);
+const items = evalItemRule(document, %s);
+const clickEnabled = (%s);
+
+// Now disable Next button and re-run buildClickNextIfEnabledJS.
+btnEnabled.setAttribute("aria-disabled", "true");
+const clickDisabled = (%s);
+
+console.log(JSON.stringify({
+	scrubbed: scrubbed,
+	items: items,
+	clickEnabled: clickEnabled,
+	btnClicked: btnEnabled.clicked,
+	clickDisabled: clickDisabled,
+	kVal: parseCompactFloat("2.5K").val,
+	mVal: parseCompactFloat("1.5M").val,
+	bVal: parseCompactFloat("3.2B").val,
+}));
+`, shadowDOMHelperJS, string(htmlJSON), scrubJS, string(itemRuleJSON), clickNextJS, clickNextJS)
+
+	out, runErr := exec.Command(nodeBin, "-e", script).CombinedOutput()
+	if runErr != nil {
+		t.Fatalf("node T-2 parity script failed: %v\n%s", runErr, string(out))
+	}
+	var got struct {
+		Scrubbed      string           `json:"scrubbed"`
+		Items         []map[string]any `json:"items"`
+		ClickEnabled  nextClickState   `json:"clickEnabled"`
+		BtnClicked    bool             `json:"btnClicked"`
+		ClickDisabled nextClickState   `json:"clickDisabled"`
+		KVal          float64          `json:"kVal"`
+		MVal          float64          `json:"mVal"`
+		BVal          float64          `json:"bVal"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &got); err != nil {
+		t.Fatalf("unmarshal T-2 output %q: %v", string(out), err)
+	}
+	for _, banned := range []string{"evilScript", "top-secret-pw", "private-textarea", "onclick"} {
+		if strings.Contains(got.Scrubbed, banned) {
+			t.Errorf("buildScrubbedHTMLJS leaked %q:\n%s", banned, got.Scrubbed)
+		}
+	}
+	if len(got.Items) != len(goRes.Items) {
+		t.Fatalf("JS items len=%d != Go verify items len=%d", len(got.Items), len(goRes.Items))
+	}
+	for i := range goRes.Items {
+		if got.Items[i]["service"] != goRes.Items[i]["service"] || got.Items[i]["state"] != goRes.Items[i]["state"] || got.Items[i]["uptime_pct"] != goRes.Items[i]["uptime_pct"] {
+			t.Errorf("item[%d] JS=%+v != Go=%+v", i, got.Items[i], goRes.Items[i])
+		}
+	}
+	if !got.ClickEnabled.Clicked || !got.BtnClicked {
+		t.Fatalf("expected enabled Next click to succeed, got %+v clicked=%v", got.ClickEnabled, got.BtnClicked)
+	}
+	if got.ClickDisabled.Clicked || got.ClickDisabled.Reason != "aria_disabled" {
+		t.Fatalf("expected aria-disabled Next click to stop, got %+v", got.ClickDisabled)
+	}
+	if got.KVal != 2500 || got.MVal != 1500000 || got.BVal != 3200000000 {
+		t.Fatalf("parseCompactFloat K/M/B mismatch: %+v", got)
+	}
+}
+
+func TestS9ClientCloseRaceMarshalCleanupAndWSFramingLimits(t *testing.T) {
+	// 1. WSConn fragmented message reassembly, Ping->Pong, cumulative continuation cap, and unexpected continuation.
+	c1, s1 := net.Pipe()
+	defer c1.Close()
+	defer s1.Close()
+	ws := &WSConn{conn: c1, br: bufio.NewReader(c1), maxMessageBytes: 16, writeTimeout: 200 * time.Millisecond}
+
+	go func() {
+		// Send Ping frame (opcode 0x9, payload "hi"), then fragmented text ("hello " + "world"), then oversized fragments ("1234567890" + "1234567890").
+		_, _ = s1.Write([]byte{0x89, 0x02, 'h', 'i'})
+		// Read expected Pong response from client so pipe doesn't block.
+		pongHdr := make([]byte, 8)
+		_, _ = io.ReadFull(s1, pongHdr)
+		_, _ = s1.Write([]byte{0x01, 0x06, 'h', 'e', 'l', 'l', 'o', ' '})
+		_, _ = s1.Write([]byte{0x80, 0x05, 'w', 'o', 'r', 'l', 'd'})
+		_, _ = s1.Write([]byte{0x01, 0x0a, '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'})
+		_, _ = s1.Write([]byte{0x80, 0x0a, '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'})
+	}()
+
+	msg, err := ws.ReadText()
+	if err != nil || string(msg) != "hello world" {
+		t.Fatalf("fragmented ReadText = (%q, %v), want ('hello world', nil)", string(msg), err)
+	}
+	if _, err := ws.ReadText(); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected cumulative continuation overflow error, got %v", err)
+	}
+
+	// Unexpected continuation frame without initial text frame must error.
+	c2, s2 := net.Pipe()
+	defer c2.Close()
+	defer s2.Close()
+	ws2 := &WSConn{conn: c2, br: bufio.NewReader(c2)}
+	go func() {
+		_, _ = s2.Write([]byte{0x80, 0x02, 'a', 'b'})
+	}()
+	if _, err := ws2.ReadText(); err == nil {
+		t.Fatal("expected unexpected continuation frame error")
+	}
+
+	// 2. Client.Call marshal error must NOT leak c.pending; Close unblocks in-flight Call cleanly under -race.
+	startedCh := make(chan struct{})
+	blockCh := make(chan struct{})
+	srv := newMockCDPServer(t, func(method string, _ map[string]any) (any, error) {
+		if method == "Slow.op" {
+			close(startedCh)
+			<-blockCh
+		}
+		return map[string]any{}, nil
+	})
+	defer func() {
+		close(blockCh)
+		srv.Close()
+	}()
+	client, err := Connect(context.Background(), "ws://"+strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Call(context.Background(), "", "Bad.marshal", map[string]any{"fn": func() {}}, nil); err == nil {
+		t.Fatal("expected json.Marshal error for func param")
+	}
+	client.mu.Lock()
+	leaked := len(client.pending)
+	client.mu.Unlock()
+	if leaked != 0 {
+		t.Fatalf("c.pending leaked %d entry after marshal error", leaked)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- client.Call(context.Background(), "", "Slow.op", nil, nil)
+	}()
+	select {
+	case <-startedCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("mock CDP server did not receive Slow.op request")
+	}
+	_ = client.Close()
+	select {
+	case cerr := <-errCh:
+		if cerr == nil {
+			t.Fatal("expected error when client closed during in-flight Call")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight Call hung after Client.Close()")
+	}
+
+	// 3. Cancelled context before ExecuteStep must return context error, never (StepResult{}, nil).
+	cancelCtx, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
+	if _, err := client.ExecuteStep(cancelCtx, contract.Step{ID: "s1", URL: "https://status.example.com"}); err == nil {
+		t.Fatal("expected cancelled context ExecuteStep to return error, not nil")
+	}
+}
+
+func TestT5ProbeQuietWaitConditionDiscoverAndLauncher(t *testing.T) {
+	// 1. SessionPool.ProbeQuiet respects approval latch without dialing DevToolsActivePort and connects quietly to HTTP /json/version.
+	pool := NewSessionPool()
+	pool.activePortAttempted = true
+	conn, label := pool.ProbeQuiet(context.Background(), "http://127.0.0.1:1")
+	if conn || !strings.Contains(label, "Disconnected") {
+		t.Fatalf("ProbeQuiet latched = (%v, %q), want (false, Disconnected...)", conn, label)
+	}
+
+	mockCDP := newMockCDPServer(t, func(_ string, _ map[string]any) (any, error) { return map[string]any{}, nil })
+	defer mockCDP.Close()
+	wsURL := "ws://" + strings.TrimPrefix(mockCDP.URL, "http://")
+	verSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/json/version" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{"webSocketDebuggerUrl":%q}`, wsURL)
+	}))
+	defer verSrv.Close()
+
+	conn2, label2 := pool.ProbeQuiet(context.Background(), verSrv.URL)
+	if !conn2 || !strings.Contains(label2, "Connected") {
+		t.Fatalf("ProbeQuiet HTTP endpoint = (%v, %q), want connected", conn2, label2)
+	}
+	if pool.CurrentClient() == nil {
+		t.Fatal("expected CurrentClient() after ProbeQuiet connect")
+	}
+	pool.Close()
+
+	// 2. readDevToolsActivePort & DiscoverBrowserWSWithSource coverage.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "DevToolsActivePort"), []byte("9222\n/devtools/browser/abc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gotWS, err := readDevToolsActivePort(dir)
+	if err != nil || gotWS != "ws://127.0.0.1:9222/devtools/browser/abc" {
+		t.Fatalf("readDevToolsActivePort = (%q, %v)", gotWS, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "DevToolsActivePort"), []byte("badport\n/ws\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readDevToolsActivePort(dir); err == nil {
+		t.Fatal("expected invalid port error")
+	}
+	expWS, src, err := DiscoverBrowserWSWithSource(context.Background(), verSrv.URL, "")
+	if err != nil || expWS != wsURL || src != SourceExplicit {
+		t.Fatalf("DiscoverBrowserWSWithSource(http) = (%q, %q, %v)", expWS, src, err)
+	}
+	expWS2, src2, err := DiscoverBrowserWSWithSource(context.Background(), "ws://127.0.0.1:9222/x", "")
+	if err != nil || expWS2 != "ws://127.0.0.1:9222/x" || src2 != SourceExplicit {
+		t.Fatalf("DiscoverBrowserWSWithSource(ws) = (%q, %q, %v)", expWS2, src2, err)
+	}
+
+	// 3. waitForCondition success and timeout.
+	waitCalls := 0
+	waitSrv := newMockCDPServer(t, func(method string, _ map[string]any) (any, error) {
+		if method == "Runtime.evaluate" {
+			waitCalls++
+			if waitCalls >= 2 {
+				return map[string]any{"result": map[string]any{"type": "object", "value": map[string]any{"ok": true}}}, nil
+			}
+			return map[string]any{"result": map[string]any{"type": "object", "value": map[string]any{"ok": false}}}, nil
+		}
+		return map[string]any{}, nil
+	})
+	defer waitSrv.Close()
+	wc, err := Connect(context.Background(), "ws://"+strings.TrimPrefix(waitSrv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wc.Close()
+	if err := wc.waitForCondition(context.Background(), "s1", ".ready", "ok", nil); err != nil {
+		t.Fatalf("waitForCondition failed: %v", err)
+	}
+	tctx, tcancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer tcancel()
+	waitCalls = -100
+	if err := wc.waitForCondition(tctx, "s1", ".never", "", nil); err == nil {
+		t.Fatal("expected waitForCondition timeout error")
+	}
+
+	// 4. launcher.go profile discovery (Local State + directory scan + MatchBrowserProfile).
+	chromeDir := t.TempDir()
+	localState := `{"profile":{"last_used":"Profile 1","info_cache":{"Default":{"name":"Personal","user_name":"alice@example.com"},"Profile 1":{"name":"Work","user_name":"work@example.com"}}}}`
+	if err := os.WriteFile(filepath.Join(chromeDir, "Local State"), []byte(localState), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profs := ListBrowserProfiles("chrome", chromeDir)
+	if len(profs) != 3 || profs[0].DirName != "Profile 1" || !profs[2].IsDedicated {
+		t.Fatalf("ListBrowserProfiles(Local State) = %+v", profs)
+	}
+	if m, ok := MatchBrowserProfile(profs, "alice@example.com"); !ok || m.DirName != "Default" {
+		t.Fatalf("MatchBrowserProfile email = (%+v, %v)", m, ok)
+	}
+	if m, ok := MatchBrowserProfile(profs, "dedicated"); !ok || !m.IsDedicated {
+		t.Fatalf("MatchBrowserProfile dedicated = (%+v, %v)", m, ok)
+	}
+
+	// Directory scan fallback when Local State is absent.
+	scanDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(scanDir, "Default"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scanDir, "Default", "Preferences"), []byte(`{"profile":{"name":"Scanned"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scanned := ListBrowserProfiles("chrome", scanDir)
+	if len(scanned) < 2 || scanned[0].Name != "Scanned" {
+		t.Fatalf("ListBrowserProfiles(scan fallback) = %+v", scanned)
+	}
 }

@@ -6,7 +6,7 @@
 
 ## ADR-002: Strictly Declarative Rules (`0` `eval_js`) Verified Identically in JS and Pure Go (2026-11-21)
 - **Context:** Embedding arbitrary JavaScript snippets (`eval_js`) in recipes mixes code execution with configuration and makes offline verification impossible without a live browser.
-- **Decision:** Retire `eval_js` completely in favor of declarative `FieldRule` and `ItemRule` contracts evaluated identically in browser JS (`internal/driver/cdp/extract.go`) and pure Go (`internal/verify` via `golang.org/x/net/html`), enabling deterministic offline verification against scrubbed `dom.html` snapshots.
+- **Decision:** Retire `eval_js` completely in favor of declarative `FieldRule` and `ItemRule` contracts evaluated identically in browser JS (`internal/driver/cdp/js_runtime.go`) and pure Go (`internal/verify` via `golang.org/x/net/html`), enabling deterministic offline verification against scrubbed `dom.html` snapshots.
 
 ## ADR-003: Atomic JSON `FileStore` & Hot-Reloadable `RECIPES_URI` Over PostgreSQL (2026-11-21)
 - **Context:** A multi-table PostgreSQL database is unnecessary operational overhead for a single-replica personal relay coordinating one desktop worker, while hardcoding personal recipes in git prevents keeping the repository public and clean.

@@ -82,6 +82,9 @@ func (c *Client) ExecuteStep(ctx context.Context, step contract.Step) (contract.
 	var lastErr error
 	for i, candCtx := range candidates {
 		if ctx.Err() != nil {
+			if lastErr == nil {
+				lastErr = ctx.Err()
+			}
 			break
 		}
 		cctx, ccancel := context.WithTimeout(ctx, candTimeout)
@@ -386,13 +389,21 @@ func (c *Client) wrapStepError(sessionID string, stepID string, partial contract
 }
 
 func (c *Client) waitDocumentReady(ctx context.Context, sessionID string) error {
+	settle := c.settleDelay
+	if settle <= 0 {
+		settle = 350 * time.Millisecond
+	}
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		var state string
 		if err := c.EvalJSON(ctx, sessionID, "document.readyState", &state); err == nil {
 			if state == "complete" || state == "interactive" {
-				time.Sleep(350 * time.Millisecond)
-				return nil
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(settle):
+					return nil
+				}
 			}
 		}
 		select {

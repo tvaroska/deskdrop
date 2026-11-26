@@ -22,6 +22,7 @@ type Scope int
 const (
 	ScopeDesktop Scope = 1
 	ScopeAgent   Scope = 2
+	ScopeAdmin   Scope = 3
 )
 
 // ServerConfig configures the deskdrop HTTP relay and control plane.
@@ -132,7 +133,7 @@ func (s *Service) registerRoutes() {
 	s.handleDual("GET", "/diagnostics", s.withScope(ScopeAgent, s.handleListDiagnostics))
 	s.handleDual("GET", "/diagnostics/{id}/bundle.zip", s.withScope(ScopeAgent, s.handleDownloadDiagnostic))
 	s.handleDual("GET", "/breakers", s.withScope(ScopeAgent, s.handleListBreakers))
-	s.handleDual("POST", "/breakers/{domain}/resume", s.withScope(ScopeAgent, s.handleResumeBreaker))
+	s.handleDual("POST", "/breakers/{domain}/resume", s.withScope(ScopeAdmin, s.handleResumeBreaker))
 
 	// Message board
 	s.handleDual("GET", "/messages", s.withScope(ScopeAgent, s.handleListMessages))
@@ -142,8 +143,8 @@ func (s *Service) registerRoutes() {
 	// Recipe patch proposals (human-approval write-back to RECIPES_URI)
 	s.handleDual("GET", "/proposals", s.withScope(ScopeAgent, s.handleListProposals))
 	s.handleDual("GET", "/proposals/{id}", s.withScope(ScopeAgent, s.handleGetProposal))
-	s.handleDual("POST", "/proposals/{id}/approve", s.withScope(ScopeAgent, s.handleApproveProposal))
-	s.handleDual("POST", "/proposals/{id}/reject", s.withScope(ScopeAgent, s.handleRejectProposal))
+	s.handleDual("POST", "/proposals/{id}/approve", s.withScope(ScopeAdmin, s.handleApproveProposal))
+	s.handleDual("POST", "/proposals/{id}/reject", s.withScope(ScopeAdmin, s.handleRejectProposal))
 }
 
 func (s *Service) withScope(required Scope, next http.HandlerFunc) http.HandlerFunc {
@@ -160,6 +161,17 @@ func (s *Service) withScope(required Scope, next http.HandlerFunc) http.HandlerF
 		if !isAdmin && !isAgent && !isDesktop {
 			writeAPIError(w, http.StatusUnauthorized, "UNAUTHORIZED", "invalid bearer token", nil)
 			return
+		}
+		if required == ScopeAdmin {
+			if s.cfg.AdminToken != "" {
+				if !isAdmin {
+					writeAPIError(w, http.StatusForbidden, "FORBIDDEN", "admin token is required for privileged control-plane routes", nil)
+					return
+				}
+			} else if !isAdmin && !isAgent {
+				writeAPIError(w, http.StatusForbidden, "FORBIDDEN", "desktop client token cannot access privileged control-plane routes", nil)
+				return
+			}
 		}
 		if required == ScopeAgent && !isAdmin && !isAgent {
 			writeAPIError(w, http.StatusForbidden, "FORBIDDEN", "desktop client token is write-scoped and cannot access agent control-plane routes", nil)
@@ -419,9 +431,8 @@ func (s *Service) handleEnqueueTask(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusUnprocessableEntity, "AIRGAP_VIOLATION", err.Error(), nil)
 		return
 	}
-	if req.Domain == "" {
-		req.Domain = contract.InferRecipeDomain(resolved)
-	}
+	// Always infer task domain from the resolved recipe so callers cannot spoof req.Domain to bypass open auth breakers.
+	req.Domain = contract.InferRecipeDomain(resolved)
 	if req.FallbackPlan != nil {
 		if err := contract.ValidateFallbackPlan(*req.FallbackPlan, contract.InferRecipeDomains(resolved)); err != nil {
 			writeAPIError(w, http.StatusUnprocessableEntity, string(contract.ErrorCodeContractInvalid), err.Error(), nil)
@@ -588,6 +599,10 @@ func (s *Service) handleCompleteTask(w http.ResponseWriter, r *http.Request) {
 	var req contract.SubmitDropRequest
 	if err := decodeJSONBody(r, 4*1024*1024, &req); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), nil)
+		return
+	}
+	if req.From != "" && task.ClaimedBy != "" && !strings.EqualFold(strings.TrimSpace(req.From), strings.TrimSpace(task.ClaimedBy)) {
+		writeAPIError(w, http.StatusConflict, "TASK_NOT_CLAIMED", fmt.Sprintf("task %q is claimed by %q", id, task.ClaimedBy), nil)
 		return
 	}
 	req.TaskID = id
@@ -764,8 +779,7 @@ func (s *Service) handleDesktopStatus(w http.ResponseWriter, r *http.Request) {
 	if breakers == nil {
 		breakers = []contract.DomainBreaker{}
 	}
-	tasks, _ := s.store.ListTasks(ctx, "all", 50)
-	proposals, _ := s.store.ListProposals(ctx, "pending", 50)
+	counts, _ := s.store.CountStatus(ctx)
 	recipeList, _ := s.catalog.List(ctx)
 
 	connectedCount, readyCount := 0, 0
@@ -777,17 +791,6 @@ func (s *Service) handleDesktopStatus(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	pendingCount, claimedCount, failedDiagCount := 0, 0, 0
-	for _, t := range tasks {
-		switch t.Status {
-		case contract.TaskStatusPending:
-			pendingCount++
-		case contract.TaskStatusClaimed:
-			claimedCount++
-		case contract.TaskStatusFailedDiagnostic:
-			failedDiagCount++
-		}
-	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":             true,
@@ -797,11 +800,11 @@ func (s *Service) handleDesktopStatus(w http.ResponseWriter, r *http.Request) {
 			"any_browser_ready":       readyCount > 0,
 			"connected_workers":       connectedCount,
 			"ready_workers":           readyCount,
-			"pending_tasks":           pendingCount,
-			"claimed_tasks":           claimedCount,
-			"failed_diagnostic_tasks": failedDiagCount,
+			"pending_tasks":           counts.PendingTasks,
+			"claimed_tasks":           counts.ClaimedTasks,
+			"failed_diagnostic_tasks": counts.FailedDiagnosticTasks,
 			"open_breakers":           len(breakers),
-			"pending_proposals":       len(proposals),
+			"pending_proposals":       counts.PendingProposals,
 			"approved_recipes":        len(recipeList),
 		},
 		"workers":  workers,

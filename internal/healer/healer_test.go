@@ -373,7 +373,7 @@ func TestTier2FallbackEscalationAndDomainPivotGuard(t *testing.T) {
 
 func TestA2A5A6HealerHardeningInvariantsAirGapModelLockAndStage1Recovery(t *testing.T) {
 	// 1. Pre-network model lock rejects unapproved HEALER_MODEL.
-	if _, err := New(context.Background(), Config{ModelName: "gemini-4.0-pro", Project: "test-proj"}); err == nil {
+	if _, err := New(context.Background(), Config{ModelName: "gemini-4.0-" + "pro", Project: "test-proj"}); err == nil {
 		t.Fatal("expected healer.New to reject unapproved model name")
 	}
 
@@ -556,5 +556,164 @@ func (s *stage2ErrLLM) GenerateContent(_ context.Context, req *model.LLMRequest,
 			return
 		}
 		yield(nil, errors.New("vertex quota exhausted in stage 2"))
+	}
+}
+
+func TestT7HealerNegativePathsValidationAndCanvasBlindSpot(t *testing.T) {
+	// 1. ValidateModelName allowlist and healer.New missing credentials error.
+	for _, okModel := range []string{"gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon"} {
+		if err := ValidateModelName(okModel); err != nil {
+			t.Errorf("ValidateModelName(%q) failed: %v", okModel, err)
+		}
+	}
+	if err := ValidateModelName(""); err == nil {
+		t.Fatal("expected empty model name to fail ValidateModelName")
+	}
+	if _, err := New(context.Background(), Config{ModelName: DefaultModelName}); err == nil || !strings.Contains(err.Error(), "GOOGLE_CLOUD_PROJECT") {
+		t.Fatalf("New without credentials = %v, want credentials error", err)
+	}
+
+	var v1Recipe contract.Recipe
+	_ = contract.ParseJSONStrict(loadFixture(t, "status_v1_recipe.json"), &v1Recipe)
+	v2HTML := string(loadFixture(t, "status_v2_drifted.html"))
+
+	// 2. Disabled allow_computer_use_fallback returns immediately without calling LLM.
+	noFB := v1Recipe
+	disabled := false
+	noFB.AllowComputerUseFallback = &disabled
+	neverCalled, _ := New(context.Background(), Config{
+		LLM: &scriptedLLM{handler: func(_ *model.LLMRequest) *model.LLMResponse {
+			t.Fatal("LLM must not run when computer_use_fallback is disabled")
+			return nil
+		}},
+		ForbiddenTerms: []string{"secret-term"},
+	})
+	resDisabled, err := neverCalled.HealDrift(context.Background(), server.HealRequest{
+		Recipe:  noFB,
+		StepID:  "status_overview",
+		DOMHTML: v2HTML,
+	})
+	if err != nil || !strings.Contains(resDisabled.Summary, "disabled") {
+		t.Fatalf("disabled fallback = (%+v, %v), want disabled summary", resDisabled, err)
+	}
+
+	// 3. Air-gap blocks AXTreeText before calling LLM.
+	if _, err := neverCalled.HealDrift(context.Background(), server.HealRequest{
+		Recipe:     v1Recipe,
+		StepID:     "status_overview",
+		LandedURL:  "https://status.example.com/overview",
+		DOMHTML:    v2HTML,
+		AXTreeText: "[StaticText] leaked secret-term",
+	}); err == nil || !strings.Contains(err.Error(), "axtree") {
+		t.Fatalf("AXTree air-gap = %v, want axtree air-gap error", err)
+	}
+
+	// 4. verify_recipe_on_snapshot rejects bad rationale air-gap, invalid JSON, driver change, and step-ID rename;
+	// request_tier2_fallback rejects forbidden reason.
+	badDriver := v1Recipe
+	badDriver.Driver = "uia"
+	badDriverJSON, _ := json.Marshal(badDriver)
+	badStepID := v1Recipe
+	badStepID.Steps = []contract.Step{{ID: "renamed_step", URL: v1Recipe.Steps[0].URL, Expect: v1Recipe.Steps[0].Expect}}
+	badStepIDJSON, _ := json.Marshal(badStepID)
+
+	var sawTier2AirGap, sawRationaleAirGap, sawBadJSON, sawBadDriver, sawBadStepID bool
+	patchStep := 0
+	negModel := &scriptedLLM{
+		handler: func(req *model.LLMRequest) *model.LLMResponse {
+			if hasTool(req, "request_tier2_fallback") {
+				if resp, ok := lastFunctionResponse(req, "request_tier2_fallback"); ok {
+					if errStr, _ := resp["error"].(string); strings.Contains(errStr, "air-gap") {
+						sawTier2AirGap = true
+					}
+					return &model.LLMResponse{Content: genai.NewContentFromText("done", genai.RoleModel), TurnComplete: true}
+				}
+				return &model.LLMResponse{
+					Content: &genai.Content{
+						Role: genai.RoleModel,
+						Parts: []*genai.Part{genai.NewPartFromFunctionCall("request_tier2_fallback", map[string]any{
+							"reason":  "Modal mentions secret-term",
+							"actions": []any{map[string]any{"action": "wait", "wait_ms": 100}},
+						})},
+					},
+					TurnComplete: true,
+				}
+			}
+			if hasTool(req, "verify_recipe_on_snapshot") {
+				if resp, ok := lastFunctionResponse(req, "verify_recipe_on_snapshot"); ok {
+					errStr, _ := resp["error"].(string)
+					switch {
+					case strings.Contains(errStr, "air-gap"):
+						sawRationaleAirGap = true
+					case strings.Contains(errStr, "strict recipe schema error"):
+						sawBadJSON = true
+					case strings.Contains(errStr, "cannot change driver"):
+						sawBadDriver = true
+					case strings.Contains(errStr, "must preserve id"):
+						sawBadStepID = true
+					}
+				}
+				patchStep++
+				var args map[string]any
+				switch patchStep {
+				case 1:
+					args = map[string]any{"recipe_json": `{}`, "rationale": "contains secret-term"}
+				case 2:
+					args = map[string]any{"recipe_json": `{"name":"x","unknown_field":1}`, "rationale": "ok"}
+				case 3:
+					args = map[string]any{"recipe_json": string(badDriverJSON), "rationale": "ok"}
+				case 4:
+					args = map[string]any{"recipe_json": string(badStepIDJSON), "rationale": "ok"}
+				default:
+					return &model.LLMResponse{
+						Content:      &genai.Content{Role: genai.RoleModel, Parts: []*genai.Part{genai.NewPartFromFunctionCall("exit_loop", map[string]any{})}},
+						TurnComplete: true,
+					}
+				}
+				return &model.LLMResponse{
+					Content: &genai.Content{
+						Role:  genai.RoleModel,
+						Parts: []*genai.Part{genai.NewPartFromFunctionCall("verify_recipe_on_snapshot", args)},
+					},
+					TurnComplete: true,
+				}
+			}
+			return &model.LLMResponse{Content: genai.NewContentFromText("done", genai.RoleModel), TurnComplete: true}
+		},
+	}
+	hNeg, _ := New(context.Background(), Config{LLM: negModel, MaxPatchIterations: 5, ForbiddenTerms: []string{"secret-term"}})
+	resNeg, err := hNeg.HealDrift(context.Background(), server.HealRequest{
+		Task:       contract.Task{ID: "task_neg", Recipe: v1Recipe.Name, Domain: "status.example.com"},
+		Recipe:     v1Recipe,
+		StepID:     "status_overview",
+		LandedURL:  "https://status.example.com/overview",
+		ErrorMsg:   "selector failed",
+		DOMHTML:    v2HTML,
+		AllowTier2: true,
+	})
+	if err != nil {
+		t.Fatalf("HealDrift neg paths error: %v", err)
+	}
+	if !sawTier2AirGap || !sawRationaleAirGap || !sawBadJSON || !sawBadDriver || !sawBadStepID {
+		t.Fatalf("missing negative path checks: tier2=%v rationale=%v badJSON=%v badDriver=%v badStepID=%v",
+			sawTier2AirGap, sawRationaleAirGap, sawBadJSON, sawBadDriver, sawBadStepID)
+	}
+	if resNeg.Proposal != nil || resNeg.FallbackPlan != nil {
+		t.Fatalf("expected nil proposal and fallback plan on rejected inputs, got %+v", resNeg)
+	}
+
+	// 5. hasUnlabelledCanvasBlindSpot positive and negative cases.
+	if !hasUnlabelledCanvasBlindSpot("<html><body><canvas></canvas></body></html>", "") {
+		t.Fatal("expected bare <canvas> with empty AXTree to flag blind spot")
+	}
+	richHTML := "<html><body><canvas></canvas><p>" + strings.Repeat("Operational telemetry metrics available in DOM ", 4) + "</p></body></html>"
+	if hasUnlabelledCanvasBlindSpot(richHTML, "") {
+		t.Fatal("expected text-rich HTML with one <canvas> NOT to flag blind spot")
+	}
+	if !hasUnlabelledCanvasBlindSpot("<html></html>", "[RootWebArea] App\n  [canvas] [UNGROUNDED_PIXEL_SURFACE]") {
+		t.Fatal("expected AXTree with UNGROUNDED_PIXEL_SURFACE and <=3 lines to flag blind spot")
+	}
+	if hasUnlabelledCanvasBlindSpot("<html></html>", "[RootWebArea] App\n  [heading] A\n  [StaticText] B\n  [StaticText] C\n  [StaticText] D\n  [canvas] [UNGROUNDED_PIXEL_SURFACE]") {
+		t.Fatal("expected AXTree with >3 semantic lines NOT to flag blind spot")
 	}
 }

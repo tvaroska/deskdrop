@@ -1,6 +1,9 @@
 package contract
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -511,5 +514,269 @@ func TestHostileAuditRegressionGuards(t *testing.T) {
 	}
 	if err := ValidateDropReport(emptyItemFB, nil); err == nil {
 		t.Fatal("expected fallback DropReport with items:[{}] to be rejected")
+	}
+}
+
+func TestA8PaginationTableShiftRowCapExplicitZeroWaitAndZeroRequiredField(t *testing.T) {
+	// 1. Explicit wait_ms: 0 must stay 0 (not revert to DefaultPaginationWaitMs).
+	var r Recipe
+	raw := []byte(`{
+		"name": "zero-wait",
+		"topic": "t",
+		"steps": [{
+			"id": "s1",
+			"url": "https://example.com/list",
+			"pagination": {"next_selector": "a.next", "wait_ms": 0}
+		}]
+	}`)
+	if err := ParseJSONStrict(raw, &r); err != nil {
+		t.Fatalf("ParseJSONStrict failed: %v", err)
+	}
+	resolved, err := ResolveRecipe(r, nil)
+	if err != nil {
+		t.Fatalf("ResolveRecipe failed: %v", err)
+	}
+	if resolved.Steps[0].Pagination.EffectiveWaitMs() != 0 {
+		t.Fatalf("EffectiveWaitMs = %d, want 0", resolved.Steps[0].Pagination.EffectiveWaitMs())
+	}
+
+	// Omitted wait_ms defaults to DefaultPaginationWaitMs.
+	rDef, err := ResolveRecipe(Recipe{
+		Name: "def-wait", Topic: "t",
+		Steps: []Step{{ID: "s1", URL: "https://example.com", Pagination: &PaginationRule{NextSelector: "a.next"}}},
+	}, nil)
+	if err != nil || rDef.Steps[0].Pagination.EffectiveWaitMs() != DefaultPaginationWaitMs {
+		t.Fatalf("default wait_ms = %d err=%v, want %d", rDef.Steps[0].Pagination.EffectiveWaitMs(), err, DefaultPaginationWaitMs)
+	}
+
+	// 2. Shifted table index matches by header signature across acc.Tables (no duplication; added == 0).
+	p1 := StepResult{
+		StepID: "s1",
+		Tables: []TableData{
+			{Headers: []string{"Summary", "Value"}, Rows: [][]string{{"Total", "10"}}},
+			{Headers: []string{"Service", "Uptime"}, Rows: [][]string{{"API", "99.9%"}}},
+		},
+	}
+	p2Shifted := StepResult{
+		StepID: "s1",
+		Tables: []TableData{
+			// Table shifted from index 1 -> index 0 on page 2 with identical row.
+			{Headers: []string{"Service", "Uptime"}, Rows: [][]string{{"API", "99.9%"}}},
+		},
+	}
+	merged, added, _ := MergePaginatedStepResult(p1, p2Shifted, nil)
+	if len(merged.Tables) != 2 {
+		t.Fatalf("shifted table duplicated acc.Tables: got %d tables, want 2", len(merged.Tables))
+	}
+	if added != 0 {
+		t.Fatalf("shifted identical table added=%d, want 0 (so StopWhenNoNew triggers)", added)
+	}
+
+	// 3. Cross-page merged table rows capped at MaxMergedTableRows.
+	var manyRows [][]string
+	for i := 0; i < MaxMergedTableRows+50; i++ {
+		manyRows = append(manyRows, []string{fmt.Sprintf("row-%d", i)})
+	}
+	capped, _, _ := MergePaginatedStepResult(
+		StepResult{StepID: "s1", Tables: []TableData{{Headers: []string{"ID"}, Rows: [][]string{{"seed"}}}}},
+		StepResult{StepID: "s1", Tables: []TableData{{Headers: []string{"ID"}, Rows: manyRows}}},
+		nil,
+	)
+	if len(capped.Tables[0].Rows) != MaxMergedTableRows {
+		t.Fatalf("merged rows = %d, want capped at %d", len(capped.Tables[0].Rows), MaxMergedTableRows)
+	}
+
+	// 4. RequiredFields accepts valid numeric 0 (int, int64, float64) while rejecting missing/blank strings.
+	stepReq := Step{
+		ID:     "s1",
+		Expect: Expectation{RequiredFields: []string{"incidents", "errors_i", "delta_f"}},
+	}
+	zeroRes := StepResult{
+		StepID: "s1",
+		URL:    "https://example.com",
+		Fields: map[string]any{"incidents": int64(0), "errors_i": 0, "delta_f": float64(0)},
+	}
+	if err := ValidateStepResult(stepReq, zeroRes); err != nil {
+		t.Fatalf("ValidateStepResult rejected valid numeric 0 on required_fields: %v", err)
+	}
+	if err := ValidateStepResult(Step{ID: "s1", Expect: Expectation{RequiredFields: []string{"title"}}}, StepResult{
+		StepID: "s1", URL: "https://example.com", Fields: map[string]any{"title": "   "},
+	}); err == nil {
+		t.Fatal("expected blank string required field to fail")
+	}
+}
+
+func TestA11ParseJSONStrictRejectsTrailingTokens(t *testing.T) {
+	validWithComment := []byte("// comment\n{\"name\":\"ok\",\"topic\":\"t\",\"steps\":[{\"id\":\"s1\",\"url\":\"https://example.com\"}]}\n// trailing comment\n")
+	var r Recipe
+	if err := ParseJSONStrict(validWithComment, &r); err != nil {
+		t.Fatalf("valid JSON with comments failed: %v", err)
+	}
+
+	smuggled := []byte(`{"name":"ok","topic":"t","steps":[{"id":"s1","url":"https://example.com"}]}{"eval_js":"1"}`)
+	if err := ParseJSONStrict(smuggled, &r); err == nil {
+		t.Fatal("expected ParseJSONStrict to reject trailing JSON object")
+	}
+	trailingNum := []byte(`{"name":"ok","topic":"t","steps":[{"id":"s1","url":"https://example.com"}]} 123`)
+	if err := ParseJSONStrict(trailingNum, &r); err == nil {
+		t.Fatal("expected ParseJSONStrict to reject trailing scalar token")
+	}
+}
+
+func TestT3AirGapAllBuiltinRulesHermeticHomeAndContractSuite(t *testing.T) {
+	// 1. Unit tests remain hermetic even when $HOME/.config/agent-guard/customer_terms.txt exists.
+	fakeHome := t.TempDir()
+	guardDir := filepath.Join(fakeHome, ".config", "agent-guard")
+	if err := os.MkdirAll(guardDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(guardDir, "customer_terms.txt"), []byte("# comment\nHostOnlySecret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", fakeHome)
+	if err := EnforceAirGap("contains HostOnlySecret in unit test", nil); err != nil {
+		t.Fatalf("EnforceAirGap must not read host $HOME implicitly: %v", err)
+	}
+	loaded := LoadLocalGuardTerms()
+	if len(loaded) != 1 || loaded[0] != "HostOnlySecret" {
+		t.Fatalf("LoadLocalGuardTerms = %v, want [HostOnlySecret]", loaded)
+	}
+	if err := EnforceAirGap("contains hostonlysecret", loaded); err == nil {
+		t.Fatal("expected EnforceAirGap to block explicitly injected local terms")
+	}
+
+	// 2. All builtin air-gap patterns trigger reliably (mutation guard for airgap.go).
+	samples := []string{
+		"path " + "//" + "depot/project/file.go",
+		"see " + "b" + "/12345678 for details",
+		"open " + "go" + "/internal-roadmap",
+		"url https://" + "go" + "/internal-doc",
+		"host foo." + "corp" + ".google.com",
+	}
+	for _, s := range samples {
+		if err := EnforceAirGap(s, nil); err == nil {
+			t.Errorf("EnforceAirGap failed to block builtin pattern sample %q", s)
+		}
+	}
+
+	// 3. ValidateStepResult covers all expectation guards.
+	fullStep := Step{
+		ID: "s1",
+		Expect: Expectation{
+			NotURLContains:  []string{"/login"},
+			MustContainText: []string{"operational"},
+			MinTables:       1,
+			MinMetrics:      1,
+			MinItems:        1,
+			MinSelectorHits: 1,
+			RequiredFields:  []string{"status"},
+		},
+	}
+	goodRes := StepResult{
+		StepID:    "s1",
+		URL:       "https://status.example.com/ok",
+		Tables:    []TableData{{Rows: [][]string{{"a"}}}},
+		Metrics:   []MetricPair{{Label: "CPU", Value: "10%"}},
+		Items:     []map[string]any{{"name": "api"}},
+		Selectors: map[string]string{"banner": "Operational"},
+		Fields:    map[string]any{"status": "Operational"},
+	}
+	if err := ValidateStepResult(fullStep, goodRes); err != nil {
+		t.Fatalf("expected valid StepResult to pass, got %v", err)
+	}
+	badCases := []StepResult{
+		{StepID: "s1", URL: "https://status.example.com/login"},
+		{StepID: "s1", URL: "https://status.example.com/ok"},
+		{StepID: "s1", URL: "https://status.example.com/ok", TextExcerpt: "operational"},
+		{StepID: "s1", URL: "https://status.example.com/ok", TextExcerpt: "operational", Tables: goodRes.Tables},
+		{StepID: "s1", URL: "https://status.example.com/ok", TextExcerpt: "operational", Tables: goodRes.Tables, Metrics: goodRes.Metrics},
+		{StepID: "s1", URL: "https://status.example.com/ok", TextExcerpt: "operational", Tables: goodRes.Tables, Metrics: goodRes.Metrics, Items: goodRes.Items},
+		{StepID: "s1", URL: "https://status.example.com/ok", TextExcerpt: "operational", Tables: goodRes.Tables, Metrics: goodRes.Metrics, Items: goodRes.Items, Selectors: goodRes.Selectors},
+	}
+	for i, bc := range badCases {
+		if err := ValidateStepResult(fullStep, bc); err == nil {
+			t.Errorf("badCase[%d] unexpectedly passed ValidateStepResult", i)
+		}
+	}
+
+	// 4. ValidateFallbackPlan negative paths (empty actions, wait bounds, click missing selector, scroll 0, userinfo URL).
+	badPlans := []FallbackPlan{
+		{AllowedDomain: "example.com", TargetURL: "https://example.com", Actions: nil},
+		{AllowedDomain: "example.com", TargetURL: "https://user@example.com", Actions: []FallbackAction{{Action: "wait", WaitMs: 10}}},
+		{AllowedDomain: "", TargetURL: "https://example.com", Actions: []FallbackAction{{Action: "wait", WaitMs: 10}}},
+		{AllowedDomain: "example.com", TargetURL: "https://example.com", Actions: []FallbackAction{{Action: "scroll", DeltaY: 0}}},
+		{AllowedDomain: "example.com", TargetURL: "https://example.com", Actions: []FallbackAction{{Action: "wait", WaitMs: 6000}}},
+		{AllowedDomain: "example.com", TargetURL: "https://example.com", Actions: []FallbackAction{{Action: "click", Selector: ""}}},
+	}
+	for i, bp := range badPlans {
+		if err := ValidateFallbackPlan(bp, []string{"example.com"}); err == nil {
+			t.Errorf("badPlans[%d] unexpectedly passed ValidateFallbackPlan", i)
+		}
+	}
+
+	// 5. ValidateDropReport negative paths (missing recipe/topic/steps/step_id, invalid mode).
+	badDrops := []DropReport{
+		{Topic: "t", Steps: []StepResult{{StepID: "s1"}}},
+		{Recipe: "r", Steps: []StepResult{{StepID: "s1"}}},
+		{Recipe: "r", Topic: "t", Mode: "unknown", Steps: []StepResult{{StepID: "s1"}}},
+		{Recipe: "r", Topic: "t"},
+		{Recipe: "r", Topic: "t", Steps: []StepResult{{StepID: ""}}},
+	}
+	for i, bd := range badDrops {
+		if err := ValidateDropReport(bd, nil); err == nil {
+			t.Errorf("badDrops[%d] unexpectedly passed ValidateDropReport", i)
+		}
+	}
+
+	// 6. Semantic tree full path (headings, metric cards, tables, ItemRule + AnchorClosest + DedupeBy + Limit, fallback_regex, CSS AST).
+	semNodes := []AXNode{
+		{NodeID: "1", Role: &AXValue{Value: "window"}, Name: &AXValue{Value: "Console"}, ChildIDs: []string{"2", "3", "4", "8"}},
+		{NodeID: "2", Role: &AXValue{Value: "heading"}, Name: &AXValue{Value: "System Metrics"}},
+		{NodeID: "3", Role: &AXValue{Value: "group"}, ChildIDs: []string{"3a", "3b"}},
+		{NodeID: "3a", Role: &AXValue{Value: "StaticText"}, Name: &AXValue{Value: "Active Jobs"}},
+		{NodeID: "3b", Role: &AXValue{Value: "StaticText"}, Name: &AXValue{Value: "0"}},
+		{NodeID: "4", Role: &AXValue{Value: "table"}, ChildIDs: []string{"5", "6"}},
+		{NodeID: "5", Role: &AXValue{Value: "columnheader"}, Name: &AXValue{Value: "Name"}},
+		{NodeID: "6", Role: &AXValue{Value: "row"}, ChildIDs: []string{"7"}},
+		{NodeID: "7", Role: &AXValue{Value: "cell"}, Name: &AXValue{Value: "worker-1"}},
+		{NodeID: "8", Role: &AXValue{Value: "list"}, ChildIDs: []string{"9", "10"}},
+		{NodeID: "9", Role: &AXValue{Value: "listitem"}, AutomationID: "item-1", ChildIDs: []string{"9a", "9b"}},
+		{NodeID: "9a", Role: &AXValue{Value: "StaticText"}, Name: &AXValue{Value: "Service A"}},
+		{NodeID: "9b", Role: &AXValue{Value: "StaticText"}, Name: &AXValue{Value: "Views: 1.5K"}},
+		{NodeID: "10", Role: &AXValue{Value: "listitem"}, AutomationID: "item-2", ChildIDs: []string{"10a", "10b"}},
+		{NodeID: "10a", Role: &AXValue{Value: "StaticText"}, Name: &AXValue{Value: "Service B"}},
+		{NodeID: "10b", Role: &AXValue{Value: "StaticText"}, Name: &AXValue{Value: "Views: 0"}},
+	}
+	semRes, err := ExtractStepFromAXNodes(Step{
+		ID: "sem",
+		Fields: map[string]FieldRule{
+			"jobs":    {Selector: "group > statictext:last-child", Parse: "number"},
+			"missing": {Selector: "#does-not-exist", Parse: "number"},
+		},
+		Items: &ItemRule{
+			Container: "list > listitem",
+			DedupeBy:  "name",
+			Limit:     5,
+			Fields: map[string]FieldRule{
+				"name":  {Selector: "text:first-child"},
+				"views": {Selector: "text:nth-child(2)", FallbackRegex: `Views:\s*([\d.]+[Kk]?)`, Parse: "number"},
+			},
+		},
+		Expect: Expectation{RequiredFields: []string{"jobs"}, MinItems: 2, MinTables: 1, MinMetrics: 1},
+	}, semNodes, "uia://window/Console")
+	if err != nil {
+		t.Fatalf("ExtractStepFromAXNodes failed: %v", err)
+	}
+	if err := ValidateStepResult(Step{ID: "sem", Expect: Expectation{RequiredFields: []string{"jobs"}, MinItems: 2, MinTables: 1, MinMetrics: 1}}, semRes); err != nil {
+		t.Fatalf("semantic ValidateStepResult failed: %v (res=%+v)", err, semRes)
+	}
+	if _, exists := semRes.Fields["missing"]; exists {
+		t.Fatalf("expected unmatched top-level numeric field to be omitted, got %+v", semRes.Fields)
+	}
+	if len(semRes.Headings) != 1 || semRes.Headings[0] != "System Metrics" {
+		t.Fatalf("headings = %v, want [System Metrics]", semRes.Headings)
+	}
+	if semRes.Items[0]["views"] != int64(1500) || semRes.Items[1]["views"] != int64(0) {
+		t.Fatalf("unexpected semantic item views: %+v", semRes.Items)
 	}
 }

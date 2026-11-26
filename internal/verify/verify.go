@@ -169,7 +169,7 @@ func ExtractStepFromHTML(step contract.Step, htmlDoc string, landedURL string) (
 	if len(step.Fields) > 0 {
 		fieldsOut = make(map[string]any, len(step.Fields))
 		for k, rule := range step.Fields {
-			if val, ok := evalFieldRule(body, rule); ok {
+			if val, ok := evalFieldRule(body, rule, true); ok {
 				fieldsOut[k] = val
 			}
 		}
@@ -220,7 +220,7 @@ func ExtractStepFromHTML(step contract.Step, htmlDoc string, landedURL string) (
 	return res, nil
 }
 
-func evalFieldRule(scope *html.Node, rule contract.FieldRule) (any, bool) {
+func evalFieldRule(scope *html.Node, rule contract.FieldRule, omitUnmatchedNumeric bool) (any, bool) {
 	if scope == nil {
 		return nil, false
 	}
@@ -255,9 +255,15 @@ func evalFieldRule(scope *html.Node, rule contract.FieldRule) (any, bool) {
 			return nil, false
 		}
 		if rule.Parse == "number" {
+			if omitUnmatchedNumeric {
+				return nil, false
+			}
 			return int64(0), true
 		}
 		if rule.Parse == "float" {
+			if omitUnmatchedNumeric {
+				return nil, false
+			}
 			return float64(0), true
 		}
 		return "", true
@@ -277,10 +283,16 @@ func evalFieldRule(scope *html.Node, rule contract.FieldRule) (any, bool) {
 		if n, ok := contract.ParseCompactNumber(raw); ok {
 			return n, true
 		}
+		if omitUnmatchedNumeric {
+			return nil, false
+		}
 		return int64(0), true
 	case "float":
 		if f, ok := contract.ParseCompactFloat(raw); ok {
 			return f, true
+		}
+		if omitUnmatchedNumeric {
+			return nil, false
 		}
 		return float64(0), true
 	default:
@@ -329,7 +341,7 @@ func evalItemRule(doc *html.Node, body *html.Node, rule contract.ItemRule) []map
 
 		row := make(map[string]any, len(rule.Fields))
 		for _, k := range keys {
-			if val, ok := evalFieldRule(scope, rule.Fields[k]); ok {
+			if val, ok := evalFieldRule(scope, rule.Fields[k], false); ok {
 				row[k] = val
 			}
 		}

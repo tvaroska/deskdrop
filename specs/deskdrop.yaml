@@ -1,34 +1,42 @@
 openapi: 3.0.3
 info:
   title: DeskDrop Control Plane API
-  version: 1.0.0
+  version: 1.4.0
   description: >-
     Wire-compatible relay API exposed identically under /v1/* and /desktop/v1/*.
     Backed by an atomic JSON FileStore and hot-reloadable RECIPES_URI catalog.
+    Scoped bearer auth distinguishes ScopeDesktop (DESKTOP_CLIENT_TOKEN),
+    ScopeAgent (AGENT_BUS_TOKEN), and ScopeAdmin (ADMIN_TOKEN when configured).
 servers:
   - url: https://relay.example.com
   - url: https://relay.example.com/desktop
 components:
   securitySchemes:
-    bearerAuth:
+    desktopAuth:
       type: http
       scheme: bearer
+      description: ScopeDesktop — accepts DESKTOP_CLIENT_TOKEN, AGENT_BUS_TOKEN, or ADMIN_TOKEN.
+    agentAuth:
+      type: http
+      scheme: bearer
+      description: ScopeAgent — accepts AGENT_BUS_TOKEN or ADMIN_TOKEN (desktop token rejected with 403).
+    adminAuth:
+      type: http
+      scheme: bearer
+      description: ScopeAdmin — requires ADMIN_TOKEN when configured (falls back to AGENT_BUS_TOKEN only when ADMIN_TOKEN is unset).
   schemas:
     APIError:
       type: object
       required: [ok, error]
       properties:
-        ok:
-          type: boolean
-          enum: [false]
+        ok: { type: boolean, enum: [false] }
         error:
           type: object
           required: [code, message]
           properties:
-            code:
-              type: string
-            message:
-              type: string
+            code: { type: string }
+            message: { type: string }
+            details: {}
     FieldRule:
       type: object
       properties:
@@ -65,6 +73,47 @@ components:
         wait_ms: { type: integer, minimum: 0, maximum: 10000, default: 600 }
         wait_selector: { type: string }
         stop_on_no_new: { type: boolean, default: true }
+    Expectation:
+      type: object
+      properties:
+        not_url_contains: { type: array, items: { type: string } }
+        must_contain_text: { type: array, items: { type: string } }
+        min_tables: { type: integer }
+        min_metrics: { type: integer }
+        min_selector_hits: { type: integer }
+        min_items: { type: integer }
+        required_fields: { type: array, items: { type: string } }
+    Step:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+        url: { type: string }
+        match_tab_url: { type: string }
+        window_title: { type: string }
+        reuse_open_tab: { type: boolean }
+        wait_selector: { type: string }
+        wait_text: { type: string }
+        wait_ms: { type: integer }
+        timeout_ms: { type: integer }
+        click_selector: { type: string }
+        click_if_present: { type: string }
+        selectors:
+          type: object
+          additionalProperties: { type: string }
+        fields:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/FieldRule"
+        items:
+          $ref: "#/components/schemas/ItemRule"
+        pagination:
+          $ref: "#/components/schemas/PaginationRule"
+        include_tables: { type: boolean, default: true }
+        include_cards: { type: boolean, default: true }
+        max_text_chars: { type: integer }
+        expect:
+          $ref: "#/components/schemas/Expectation"
     Recipe:
       type: object
       required: [name, topic, steps]
@@ -74,28 +123,75 @@ components:
         description: { type: string }
         driver: { type: string, enum: ["", cdp, uia], default: cdp }
         allow_computer_use_fallback: { type: boolean, default: true }
-        allowed_domains:
-          type: array
-          items: { type: string }
+        allowed_domains: { type: array, items: { type: string } }
+        defaults:
+          type: object
+          additionalProperties: { type: string }
         steps:
           type: array
+          minItems: 1
           items:
-            type: object
-            required: [id]
-            properties:
-              id: { type: string }
-              url: { type: string }
-              match_tab_url: { type: string }
-              window_title: { type: string }
-              click_if_present: { type: string }
-              fields:
-                type: object
-                additionalProperties:
-                  $ref: "#/components/schemas/FieldRule"
-              items:
-                $ref: "#/components/schemas/ItemRule"
-              pagination:
-                $ref: "#/components/schemas/PaginationRule"
+            $ref: "#/components/schemas/Step"
+    MetricPair:
+      type: object
+      required: [label, value]
+      properties:
+        label: { type: string }
+        value: { type: string }
+    TableData:
+      type: object
+      properties:
+        title: { type: string }
+        headers: { type: array, items: { type: string } }
+        rows: { type: array, items: { type: array, items: { type: string } } }
+    StepResult:
+      type: object
+      required: [step_id, title, url]
+      properties:
+        step_id: { type: string }
+        title: { type: string }
+        url: { type: string }
+        reused_tab: { type: boolean }
+        pages_visited: { type: integer }
+        headings: { type: array, items: { type: string } }
+        metrics: { type: array, items: { $ref: "#/components/schemas/MetricPair" } }
+        selectors: { type: object, additionalProperties: { type: string } }
+        fields: { type: object, additionalProperties: true }
+        items: { type: array, items: { type: object, additionalProperties: true } }
+        tables: { type: array, items: { $ref: "#/components/schemas/TableData" } }
+        text_excerpt: { type: string }
+    DropReport:
+      type: object
+      required: [schema_version, recipe, topic, steps]
+      properties:
+        schema_version: { type: string }
+        mode: { type: string, enum: [deterministic, computer_use_fallback] }
+        recipe: { type: string }
+        topic: { type: string }
+        host: { type: string }
+        captured_at_utc: { type: string }
+        steps: { type: array, items: { $ref: "#/components/schemas/StepResult" } }
+    SubmitDropRequest:
+      type: object
+      required: [report]
+      properties:
+        from: { type: string }
+        to: { type: string }
+        task_id: { type: string }
+        report: { $ref: "#/components/schemas/DropReport" }
+    DropRecord:
+      type: object
+      required: [id, short_id, from, to, report, received_at_utc]
+      properties:
+        id: { type: string }
+        short_id: { type: string }
+        task_id: { type: string }
+        message_id: { type: string }
+        from: { type: string }
+        to: { type: string }
+        idempotency_key: { type: string }
+        report: { $ref: "#/components/schemas/DropReport" }
+        received_at_utc: { type: string }
     FallbackAction:
       type: object
       required: [action]
@@ -116,8 +212,135 @@ components:
           type: array
           minItems: 1
           maxItems: 3
-          items:
-            $ref: "#/components/schemas/FallbackAction"
+          items: { $ref: "#/components/schemas/FallbackAction" }
+    WorkerStatus:
+      type: object
+      properties:
+        host: { type: string }
+        hostname: { type: string }
+        version: { type: string }
+        os: { type: string }
+        arch: { type: string }
+        connected: { type: boolean }
+        age_seconds: { type: integer }
+        browser_connected: { type: boolean }
+        browser_status: { type: string }
+        ready_to_accept: { type: boolean }
+        busy: { type: boolean }
+        fallback_gate: { type: string, enum: [auto, tray] }
+        chrome_session: { type: string }
+        available_sessions: { type: array, items: { type: string } }
+        open_tabs_count: { type: integer }
+        last_action: { type: string }
+        last_error: { type: string }
+        last_seen_utc: { type: string }
+    EnqueueTaskRequest:
+      type: object
+      properties:
+        kind: { type: string, enum: [extract, fallback_task] }
+        parent_task_id: { type: string }
+        recipe: { type: string }
+        vars: { type: object, additionalProperties: { type: string } }
+        custom_recipe: { $ref: "#/components/schemas/Recipe" }
+        fallback_plan: { $ref: "#/components/schemas/FallbackPlan" }
+        domain: { type: string, description: "Ignored on enqueue; inferred strictly from resolved recipe." }
+        priority: { type: integer }
+        max_attempts: { type: integer }
+        requested_by: { type: string }
+        notify_to: { type: string }
+        dedupe_key: { type: string }
+    ClaimTaskRequest:
+      type: object
+      required: [host]
+      properties:
+        host: { type: string }
+        lease_seconds: { type: integer, minimum: 1, maximum: 600 }
+        allowed_drivers:
+          type: array
+          items: { type: string, enum: [cdp, uia] }
+        worker: { $ref: "#/components/schemas/WorkerStatus" }
+    Task:
+      type: object
+      required: [id, recipe, status]
+      properties:
+        id: { type: string }
+        kind: { type: string, enum: [extract, fallback_task] }
+        parent_task_id: { type: string }
+        recipe: { type: string }
+        vars: { type: object, additionalProperties: { type: string } }
+        custom_recipe: { $ref: "#/components/schemas/Recipe" }
+        fallback_plan: { $ref: "#/components/schemas/FallbackPlan" }
+        domain: { type: string }
+        priority: { type: integer }
+        status: { type: string, enum: [pending, claimed, succeeded, failed_diagnostic, dead_letter] }
+        attempt: { type: integer }
+        max_attempts: { type: integer }
+        requested_by: { type: string }
+        notify_to: { type: string }
+        dedupe_key: { type: string }
+        claimed_by: { type: string }
+        lease_until: { type: string }
+        next_run_at: { type: string }
+        drop_id: { type: string }
+        diagnostic_id: { type: string }
+        proposal_id: { type: string }
+        last_error: { type: string }
+        last_code: { type: string }
+        created_at_utc: { type: string }
+        updated_at_utc: { type: string }
+    ClaimTaskResponse:
+      type: object
+      properties:
+        task: { $ref: "#/components/schemas/Task" }
+        resolved_recipe: { $ref: "#/components/schemas/Recipe" }
+    FailReportMetadata:
+      type: object
+      required: [error]
+      properties:
+        from: { type: string }
+        to: { type: string }
+        topic: { type: string }
+        recipe: { type: string }
+        step_id: { type: string }
+        landed_url: { type: string }
+        domain: { type: string }
+        error_code:
+          type: string
+          enum: [AUTH_EXPIRED, SELECTOR_DRIFT, CDP_TRANSIENT, CONTRACT_INVALID, FALLBACK_DECLINED, EXTRACTION_FAILED]
+        error: { type: string }
+    ErrorTriage:
+      type: object
+      required: [code, action]
+      properties:
+        code: { type: string }
+        action: { type: string, enum: [hold_domain_auth, diagnostic_escalation, retry_backoff] }
+        domain: { type: string }
+    DiagnosticRecord:
+      type: object
+      required: [id, topic, error_code, error, size_bytes, created_at_utc]
+      properties:
+        id: { type: string }
+        task_id: { type: string }
+        topic: { type: string }
+        recipe: { type: string }
+        host: { type: string }
+        domain: { type: string }
+        error_code: { type: string }
+        error: { type: string }
+        blob_key: { type: string }
+        size_bytes: { type: integer }
+        created_at_utc: { type: string }
+        download_path: { type: string }
+    DomainBreaker:
+      type: object
+      required: [domain, state, updated_at_utc]
+      properties:
+        domain: { type: string }
+        state: { type: string, enum: [closed, paused_auth] }
+        reason: { type: string }
+        alerted: { type: boolean }
+        tripped_at_utc: { type: string }
+        updated_at_utc: { type: string }
     RecipePatchProposal:
       type: object
       required: [id, recipe_name, status, verified, proposed_recipe]
@@ -129,138 +352,548 @@ components:
         status: { type: string, enum: [pending, approved, rejected] }
         rationale: { type: string }
         verified: { type: boolean }
+        verification_summary: { type: string }
         iterations: { type: integer }
-        proposed_recipe:
-          $ref: "#/components/schemas/Recipe"
+        model: { type: string }
+        proposed_recipe: { $ref: "#/components/schemas/Recipe" }
+        reviewed_by: { type: string }
+        review_note: { type: string }
+        reviewed_at_utc: { type: string }
+    ProposalReviewRequest:
+      type: object
+      properties:
+        reviewed_by: { type: string }
+        note: { type: string }
+    PostMessageRequest:
+      type: object
+      required: [body]
+      properties:
+        from: { type: string }
+        to: { type: array, items: { type: string } }
+        topic: { type: string }
+        body: { type: string }
+        meta: { type: object, additionalProperties: true }
+    AckMessageRequest:
+      type: object
+      properties:
+        from: { type: string }
+        status: { type: string, enum: [claim, claimed, done] }
+        note: { type: string }
+    BusMessage:
+      type: object
+      required: [id, short_id, from, to, status, body, timestamp]
+      properties:
+        id: { type: string }
+        short_id: { type: string }
+        from: { type: string }
+        to: { type: array, items: { type: string } }
+        topic: { type: string }
+        status: { type: string, enum: [open, claimed, done] }
+        body: { type: string }
+        notes: { type: array, items: { type: string } }
+        meta: { type: object, additionalProperties: true }
+        timestamp: { type: string }
 paths:
   /healthz:
     get:
-      summary: Relay health probe
+      summary: Relay health probe (also exposed at /desktop/healthz)
       responses:
         "200":
           description: Healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  service: { type: string }
+                  version: { type: string }
+        "503":
+          description: Store unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/APIError" }
   /v1/recipes:
     get:
       summary: List approved declarative recipes from RECIPES_URI
-      security: [{ bearerAuth: [] }]
+      security: [{ desktopAuth: [] }]
       responses:
         "200":
           description: Approved recipes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  recipes: { type: array, items: { $ref: "#/components/schemas/Recipe" } }
+  /v1/release/{asset}:
+    get:
+      summary: Download packaged deskdrop binary or SHA256SUMS.txt from container release directory
+      security: [{ desktopAuth: [] }]
+      parameters:
+        - in: path
+          name: asset
+          required: true
+          schema: { type: string, enum: [deskdrop, deskdrop.exe, SHA256SUMS.txt] }
+      responses:
+        "200":
+          description: Release asset bytes with X-DeskDrop-Version header
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "400": { description: Invalid asset name }
+        "404": { description: Release asset not found }
+  /v1/workers/heartbeat:
+    post:
+      summary: Upsert live desktop worker readiness telemetry
+      security: [{ desktopAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WorkerStatus" }
+      responses:
+        "200":
+          description: Updated worker status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  worker: { $ref: "#/components/schemas/WorkerStatus" }
+  /v1/workers:
+    get:
+      summary: List known desktop workers and connectivity status
+      security: [{ desktopAuth: [] }]
+      responses:
+        "200":
+          description: Worker status list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  server_version: { type: string }
+                  workers: { type: array, items: { $ref: "#/components/schemas/WorkerStatus" } }
+  /v1/status:
+    get:
+      summary: Relay version, worker readiness, exact queue counts, breakers, and pending proposals summary
+      security: [{ desktopAuth: [] }]
+      responses:
+        "200":
+          description: Status summary
+  /v1/errors:
+    post:
+      summary: Report ad-hoc extraction error + optional scrubbed debug.zip (JSON or multipart/form-data)
+      security: [{ desktopAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FailReportMetadata" }
+          multipart/form-data:
+            schema:
+              type: object
+              required: [payload_json]
+              properties:
+                payload_json: { type: string }
+                bundle: { type: string, format: binary }
+      responses:
+        "201": { description: Triaged and persisted }
+        "422": { description: Validation, zip bounds, or air-gap violation }
   /v1/tasks:
     post:
-      summary: Enqueue an extraction task for an approved recipe
-      security: [{ bearerAuth: [] }]
+      summary: Enqueue an extraction task for an approved recipe (domain inferred server-side)
+      security: [{ agentAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EnqueueTaskRequest" }
       responses:
         "201": { description: Created }
+        "200": { description: Deduplicated existing active task }
         "403": { description: Unapproved recipe or target URL }
         "422": { description: Validation or air-gap violation }
     get:
-      summary: List tasks
-      security: [{ bearerAuth: [] }]
+      summary: List tasks filtered by optional status and limit
+      security: [{ agentAuth: [] }]
+      parameters:
+        - in: query
+          name: status
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer }
       responses:
-        "200": { description: Task list }
-  /v1/tasks/claim:
-    post:
-      summary: Lease next runnable extraction or fallback task
-      security: [{ bearerAuth: [] }]
-      responses:
-        "200": { description: Claimed task or empty response }
-  /v1/tasks/{id}/complete:
-    post:
-      summary: Submit validated DropReport and complete task
-      security: [{ bearerAuth: [] }]
+        "200":
+          description: Task list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  tasks: { type: array, items: { $ref: "#/components/schemas/Task" } }
+  /v1/tasks/{id}:
+    get:
+      summary: Fetch a single task by ID
+      security: [{ agentAuth: [] }]
       parameters:
         - in: path
           name: id
           required: true
           schema: { type: string }
       responses:
+        "200":
+          description: Task record
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "404": { description: Task not found }
+  /v1/tasks/claim:
+    post:
+      summary: Lease next runnable extraction or fallback task filtered by allowed_drivers
+      security: [{ desktopAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ClaimTaskRequest" }
+      responses:
+        "200":
+          description: Claimed task or empty object
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ClaimTaskResponse" }
+  /v1/tasks/{id}/heartbeat:
+    post:
+      summary: Extend active task claim lease for the owning worker
+      security: [{ desktopAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ClaimTaskRequest" }
+      responses:
+        "200": { description: Lease extended }
+        "404": { description: Task not found }
+        "409": { description: Task not claimed or owned by another worker }
+  /v1/tasks/{id}/complete:
+    post:
+      summary: Submit validated DropReport and complete claimed task
+      security: [{ desktopAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SubmitDropRequest" }
+      responses:
         "200": { description: Completed }
+        "404": { description: Task not found }
+        "409": { description: Task not claimed }
+        "422": { description: Contract or air-gap violation }
   /v1/tasks/{id}/fail:
     post:
       summary: Report failure + optional scrubbed debug.zip (triggers healer strictly on SELECTOR_DRIFT)
-      security: [{ bearerAuth: [] }]
+      security: [{ desktopAuth: [] }]
       parameters:
         - in: path
           name: id
           required: true
           schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FailReportMetadata" }
+          multipart/form-data:
+            schema:
+              type: object
+              required: [payload_json]
+              properties:
+                payload_json: { type: string }
+                bundle: { type: string, format: binary }
       responses:
         "200": { description: Triaged }
-        "422": { description: Air-gap violation }
+        "404": { description: Task not found }
+        "409": { description: Task not claimed or owner mismatch }
+        "422": { description: Validation, zip bounds, or air-gap violation }
   /v1/tasks/{id}/fallback-result:
     post:
-      summary: Submit scrubbed Tier-2 fallback snapshot for Tier-1 offline extraction
-      security: [{ bearerAuth: [] }]
+      summary: Submit scrubbed Tier-2 fallback snapshot for offline Tier-1 healing (closes unhealed tasks to failed_diagnostic)
+      security: [{ desktopAuth: [] }]
       parameters:
         - in: path
           name: id
           required: true
           schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [payload_json, bundle]
+              properties:
+                payload_json: { type: string }
+                bundle: { type: string, format: binary }
       responses:
         "200": { description: Processed }
-  /v1/proposals:
-    get:
-      summary: List verified recipe patch proposals
-      security: [{ bearerAuth: [] }]
-      responses:
-        "200": { description: Proposal list }
-  /v1/proposals/{id}/approve:
-    post:
-      summary: Approve a verified proposal and write back atomically to RECIPES_URI
-      security: [{ bearerAuth: [] }]
-      parameters:
-        - in: path
-          name: id
-          required: true
-          schema: { type: string }
-      responses:
-        "200": { description: Approved and written back }
-        "403": { description: Domain pivot blocked }
-        "409": { description: Proposal already reviewed }
-        "422": { description: Proposal unverified or air-gap violation }
-  /v1/proposals/{id}/reject:
-    post:
-      summary: Reject a pending proposal without touching RECIPES_URI
-      security: [{ bearerAuth: [] }]
-      parameters:
-        - in: path
-          name: id
-          required: true
-          schema: { type: string }
-      responses:
-        "200": { description: Rejected }
+        "404": { description: Task not found }
+        "409": { description: Task not claimed }
+        "422": { description: Invalid fallback task, bundle, or air-gap violation }
   /v1/drops:
     post:
       summary: Upload a structured DropReport
-      security: [{ bearerAuth: [] }]
+      security: [{ desktopAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SubmitDropRequest" }
       responses:
         "201": { description: Stored }
+        "200": { description: Deduplicated via Idempotency-Key }
+        "422": { description: Contract or air-gap violation }
     get:
       summary: List stored drops
-      security: [{ bearerAuth: [] }]
+      security: [{ agentAuth: [] }]
+      parameters:
+        - in: query
+          name: topic
+          schema: { type: string }
+        - in: query
+          name: recipe
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer }
       responses:
-        "200": { description: Drop list }
-  /v1/messages:
+        "200":
+          description: Drop list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  drops: { type: array, items: { $ref: "#/components/schemas/DropRecord" } }
+  /v1/drops/{id}:
     get:
-      summary: Read message board inbox
-      security: [{ bearerAuth: [] }]
+      summary: Fetch a single DropRecord by ID or short ID
+      security: [{ agentAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
       responses:
-        "200": { description: Message list }
-    post:
-      summary: Post air-gapped message
-      security: [{ bearerAuth: [] }]
+        "200":
+          description: Drop record
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DropRecord" }
+        "404": { description: Drop not found }
+  /v1/diagnostics:
+    get:
+      summary: List stored failure diagnostic bundle metadata
+      security: [{ agentAuth: [] }]
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer }
       responses:
-        "201": { description: Posted }
+        "200":
+          description: Diagnostic list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  diagnostics: { type: array, items: { $ref: "#/components/schemas/DiagnosticRecord" } }
+  /v1/diagnostics/{id}/bundle.zip:
+    get:
+      summary: Download a stored scrubbed diagnostic bundle archive
+      security: [{ agentAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Zip archive
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+        "404": { description: Diagnostic bundle not found }
   /v1/breakers:
     get:
       summary: List open per-domain AUTH_EXPIRED circuit breakers
-      security: [{ bearerAuth: [] }]
+      security: [{ agentAuth: [] }]
       responses:
-        "200": { description: Breaker list }
-  /v1/status:
+        "200":
+          description: Breaker list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  breakers: { type: array, items: { $ref: "#/components/schemas/DomainBreaker" } }
+  /v1/breakers/{domain}/resume:
+    post:
+      summary: Clear a paused per-domain AUTH_EXPIRED circuit breaker
+      security: [{ adminAuth: [] }]
+      parameters:
+        - in: path
+          name: domain
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Breaker cleared }
+        "403": { description: Admin scope required }
+  /v1/messages:
     get:
-      summary: Relay version, worker readiness, pending tasks, and pending proposals summary
-      security: [{ bearerAuth: [] }]
+      summary: Read message board inbox
+      security: [{ agentAuth: [] }]
+      parameters:
+        - in: query
+          name: for
+          schema: { type: string }
+        - in: query
+          name: status
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer }
       responses:
-        "200": { description: Status summary }
+        "200":
+          description: Message list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  target: { type: string }
+                  messages: { type: array, items: { $ref: "#/components/schemas/BusMessage" } }
+    post:
+      summary: Post air-gapped message
+      security: [{ agentAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostMessageRequest" }
+      responses:
+        "201": { description: Posted }
+        "200": { description: Deduplicated via Idempotency-Key }
+        "422": { description: Validation or air-gap violation }
+  /v1/messages/{id}/ack:
+    post:
+      summary: Claim or complete a message board entry
+      security: [{ agentAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AckMessageRequest" }
+      responses:
+        "200": { description: Acknowledged }
+        "404": { description: Message not found }
+        "422": { description: Validation or air-gap violation }
+  /v1/proposals:
+    get:
+      summary: List verified recipe patch proposals
+      security: [{ agentAuth: [] }]
+      parameters:
+        - in: query
+          name: status
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer }
+      responses:
+        "200":
+          description: Proposal list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  proposals: { type: array, items: { $ref: "#/components/schemas/RecipePatchProposal" } }
+  /v1/proposals/{id}:
+    get:
+      summary: Fetch a single recipe patch proposal by ID
+      security: [{ agentAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Proposal record
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RecipePatchProposal" }
+        "404": { description: Proposal not found }
+  /v1/proposals/{id}/approve:
+    post:
+      summary: Approve a verified proposal and write back atomically to RECIPES_URI
+      security: [{ adminAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProposalReviewRequest" }
+      responses:
+        "200": { description: Approved and written back }
+        "403": { description: Admin scope required or domain pivot blocked }
+        "404": { description: Proposal not found }
+        "409": { description: Proposal already reviewed }
+        "422": { description: Proposal unverified, name mismatch, or air-gap violation }
+  /v1/proposals/{id}/reject:
+    post:
+      summary: Reject a pending proposal without touching RECIPES_URI
+      security: [{ adminAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProposalReviewRequest" }
+      responses:
+        "200": { description: Rejected }
+        "403": { description: Admin scope required }
+        "404": { description: Proposal not found }
+        "409": { description: Proposal already reviewed }

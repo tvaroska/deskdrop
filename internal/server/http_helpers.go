@@ -397,6 +397,12 @@ func setErrorLogOutputForTest(w io.Writer) func() {
 	}
 }
 
+func logServerError(component string, message string) {
+	errLogMu.Lock()
+	errLogger.Printf("ERROR %s %s", component, message)
+	errLogMu.Unlock()
+}
+
 func writeAPIError(w http.ResponseWriter, status int, code string, message string, details any) {
 	if status >= http.StatusInternalServerError {
 		method, path := "-", "-"

@@ -18,8 +18,11 @@ fi
 
 go vet ./...
 GOOS=windows GOARCH=amd64 go vet ./cmd/deskdrop ./internal/driver/...
+if command -v ast-grep >/dev/null 2>&1; then
+  ast-grep scan -r specs/ast.rules.yaml
+fi
 if [[ $# -eq 0 ]]; then
-  go test -race ./...
+  go test -race -count=1 ./...
 else
-  go test "$@"
+  go test -race -count=1 "$@"
 fi

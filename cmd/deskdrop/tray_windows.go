@@ -167,6 +167,7 @@ type trayApp struct {
 	iconGreen uintptr
 	iconAmber uintptr
 
+	notifyMu        sync.Mutex
 	mu              sync.Mutex
 	browserStat     string
 	lastAction      string
@@ -339,6 +340,8 @@ func (a *trayApp) currentTooltip() string {
 }
 
 func (a *trayApp) addTrayIcon() {
+	a.notifyMu.Lock()
+	defer a.notifyMu.Unlock()
 	nid := notifyIconDataW{
 		CbSize:           uint32(unsafe.Sizeof(notifyIconDataW{})),
 		HWnd:             a.hwnd,
@@ -352,6 +355,8 @@ func (a *trayApp) addTrayIcon() {
 }
 
 func (a *trayApp) updateTrayIcon(balloonTitle string, balloonBody string, infoFlags uint32) {
+	a.notifyMu.Lock()
+	defer a.notifyMu.Unlock()
 	nid := notifyIconDataW{
 		CbSize:           uint32(unsafe.Sizeof(notifyIconDataW{})),
 		HWnd:             a.hwnd,
@@ -371,6 +376,8 @@ func (a *trayApp) updateTrayIcon(balloonTitle string, balloonBody string, infoFl
 }
 
 func (a *trayApp) removeTrayIcon() {
+	a.notifyMu.Lock()
+	defer a.notifyMu.Unlock()
 	nid := notifyIconDataW{CbSize: uint32(unsafe.Sizeof(notifyIconDataW{})), HWnd: a.hwnd, UID: 1}
 	procShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&nid)))
 }
@@ -504,6 +511,14 @@ func (a *trayApp) tryConnectOnce(notifyOnSuccess bool) {
 	if a.cdpURL != "" {
 		cfg.CDPURL = a.cdpURL
 	}
+	if cfg.NormalizedDriver() == "uia" {
+		a.refreshStatus()
+		if notifyOnSuccess {
+			a.setBusy(false, "Ready (Windows UIA mode)")
+			a.updateTrayIcon("DeskDrop", "Running in Windows UIA mode.", niifInfo)
+		}
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 
@@ -532,9 +547,23 @@ func (a *trayApp) refreshStatus() {
 	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
 
-	conn, label := a.pool.ProbeQuiet(ctx, cfg.CDPURL)
+	var (
+		conn  bool
+		label string
+	)
 	if cfgErr != nil {
 		label = "Config error: " + cfgErr.Error()
+	} else if cfg.NormalizedDriver() == "uia" {
+		drv := newTargetDriver("uia", a.pool, cfg)
+		st := drv.ProbeStatus(ctx)
+		_ = drv.Close()
+		conn = st.Connected
+		label = st.BrowserStatus
+		if label == "" {
+			label = st.Label
+		}
+	} else {
+		conn, label = a.pool.ProbeQuiet(ctx, cfg.CDPURL)
 	}
 	a.mu.Lock()
 	changed := (a.connected != conn || a.browserStat != label)
@@ -564,7 +593,8 @@ func (a *trayApp) sendBackgroundHeartbeat(cfg contract.Config) {
 	if svcClient.ValidateAuth() != nil {
 		return
 	}
-	drv := cdp.NewDriver(a.pool, cfg)
+	drv := newTargetDriver(cfg.NormalizedDriver(), a.pool, cfg)
+	defer drv.Close()
 	ws := collectWorkerStatus(ctx, drv, cfg, cfg.From, busy, lastAct, "")
 	_ = svcClient.ReportWorkerStatus(ctx, ws)
 }
@@ -627,7 +657,8 @@ func (a *trayApp) runSyncCycle(manual bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	drv := cdp.NewDriver(a.pool, cfg)
+	drv := newTargetDriver(cfg.NormalizedDriver(), a.pool, cfg)
+	defer drv.Close()
 	approver := makeFallbackApprover(cfg.NormalizedFallbackGate())
 	drained, updated, derr := runTraySyncStep(ctx, drv, cfg, svcClient, resolveHostLabel(cfg), approver, func(_ string) bool {
 		return a.doSelfUpdate(false)
@@ -699,7 +730,7 @@ func copyUTF16(dst []uint16, s string) {
 
 func createBadgeIcon(hInst uintptr, r byte, g byte, b byte) uintptr {
 	const size = 16
-	var andMask [size * 4]byte
+	var andMask [size * 2]byte
 	for i := range andMask {
 		andMask[i] = 0xFF
 	}
@@ -711,7 +742,7 @@ func createBadgeIcon(hInst uintptr, r byte, g byte, b byte) uintptr {
 			distSq := dx*dx + dy*dy
 			idx := (y*size + x) * 4
 			if distSq <= 49.0 {
-				andMask[y*4+(x/8)] &^= (0x80 >> (x % 8))
+				andMask[y*2+(x/8)] &^= (0x80 >> (x % 8))
 				if distSq >= 34.0 {
 					xorMask[idx+0] = 0x19
 					xorMask[idx+1] = 0x11

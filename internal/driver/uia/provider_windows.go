@@ -39,6 +39,8 @@ var (
 	clsidCUIAutomation = comGUID{0xff48dba4, 0x60ef, 0x4201, [8]byte{0xaa, 0x87, 0x54, 0x10, 0x3e, 0xef, 0x59, 0x4e}}
 	// IID_IUIAutomation {30cbe57d-d9d0-452a-ab13-7ac5ac4825ee}
 	iidIUIAutomation = comGUID{0x30cbe57d, 0xd9d0, 0x452a, [8]byte{0xab, 0x13, 0x7a, 0xc5, 0xac, 0x48, 0x25, 0xee}}
+	// IID_IUIAutomationValuePattern {a94cd8b1-0844-4cd6-9d2d-640537ab39e9}
+	iidIUIAutomationValuePattern = comGUID{0xa94cd8b1, 0x0844, 0x4cd6, [8]byte{0x9d, 0x2d, 0x64, 0x05, 0x37, 0xab, 0x39, 0xe9}}
 
 	ole32    = syscall.NewLazyDLL("ole32.dll")
 	oleaut32 = syscall.NewLazyDLL("oleaut32.dll")
@@ -239,6 +241,9 @@ func (win32Provider) CaptureWindowTree(ctx context.Context, windowQuery string, 
 			next, _ := walkerNextSibling(walker, cur)
 			releaseElement(cur)
 			cur = next
+		}
+		if target == nil && cur != nil {
+			releaseElement(cur)
 		}
 		if target == nil {
 			return fmt.Errorf("no open desktop window matched %q", windowQuery)
@@ -508,9 +513,10 @@ func elemIsPassword(el *iUIAutomationElement) bool {
 func elemValuePattern(el *iUIAutomationElement) string {
 	var pat *iUIAutomationValuePattern
 	hr, _, _ := syscall.SyscallN(
-		el.lpVtbl.GetCurrentPattern,
+		el.lpVtbl.GetCurrentPatternAs,
 		uintptr(unsafe.Pointer(el)),
 		uiaValuePatternID,
+		uintptr(unsafe.Pointer(&iidIUIAutomationValuePattern)),
 		uintptr(unsafe.Pointer(&pat)),
 	)
 	if int32(hr) < 0 || pat == nil || pat.lpVtbl == nil {

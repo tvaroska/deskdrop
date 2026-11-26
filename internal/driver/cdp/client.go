@@ -55,6 +55,7 @@ type Client struct {
 	userDataDir       string
 	preferredSession  string
 	verifiedContextID string
+	settleDelay       time.Duration
 }
 
 // SetPreferredSession configures which browser profile/session to prefer for tabs and scratch pages.
@@ -101,12 +102,12 @@ func Connect(ctx context.Context, wsURL string) (*Client, error) {
 func (c *Client) readLoop() {
 	defer func() {
 		c.mu.Lock()
+		c.closeMu.Do(func() { close(c.closed) })
 		for id, ch := range c.pending {
 			close(ch)
 			delete(c.pending, id)
 		}
 		c.mu.Unlock()
-		c.closeMu.Do(func() { close(c.closed) })
 	}()
 
 	for {
@@ -135,8 +136,17 @@ func (c *Client) readLoop() {
 // Call invokes a CDP method (optionally scoped to a flattened page sessionID) and decodes the result.
 func (c *Client) Call(ctx context.Context, sessionID string, method string, params any, out any) error {
 	id := c.nextID.Add(1)
-	ch := make(chan rpcMessage, 1)
+	reqBytes, err := json.Marshal(rpcRequest{
+		ID:        id,
+		Method:    method,
+		Params:    params,
+		SessionID: sessionID,
+	})
+	if err != nil {
+		return err
+	}
 
+	ch := make(chan rpcMessage, 1)
 	c.mu.Lock()
 	select {
 	case <-c.closed:
@@ -147,15 +157,6 @@ func (c *Client) Call(ctx context.Context, sessionID string, method string, para
 	c.pending[id] = ch
 	c.mu.Unlock()
 
-	reqBytes, err := json.Marshal(rpcRequest{
-		ID:        id,
-		Method:    method,
-		Params:    params,
-		SessionID: sessionID,
-	})
-	if err != nil {
-		return err
-	}
 	if err := c.ws.WriteText(reqBytes); err != nil {
 		c.mu.Lock()
 		delete(c.pending, id)
@@ -169,6 +170,11 @@ func (c *Client) Call(ctx context.Context, sessionID string, method string, para
 		delete(c.pending, id)
 		c.mu.Unlock()
 		return ctx.Err()
+	case <-c.closed:
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+		return fmt.Errorf("cdp socket closed while waiting for %s", method)
 	case msg, ok := <-ch:
 		if !ok {
 			return fmt.Errorf("cdp socket closed while waiting for %s", method)
@@ -724,6 +730,8 @@ func (c *Client) IsClosed() bool {
 
 // Close detaches the CDP WebSocket without closing the user's running browser.
 func (c *Client) Close() error {
+	c.mu.Lock()
 	c.closeMu.Do(func() { close(c.closed) })
+	c.mu.Unlock()
 	return c.ws.Close()
 }

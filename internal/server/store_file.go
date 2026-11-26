@@ -105,6 +105,12 @@ func (f *FileStore) Ping(_ context.Context) error {
 
 func (f *FileStore) Close() error { return nil }
 
+func (f *FileStore) CountStatus(ctx context.Context) (StatusCounts, error) {
+	f.ioMu.RLock()
+	defer f.ioMu.RUnlock()
+	return f.mem.CountStatus(ctx)
+}
+
 func (f *FileStore) PostMessage(ctx context.Context, req contract.PostMessageRequest, idempotencyKey string) (contract.BusMessage, bool, error) {
 	f.ioMu.Lock()
 	defer f.ioMu.Unlock()

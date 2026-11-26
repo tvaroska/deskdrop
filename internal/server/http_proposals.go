@@ -307,6 +307,10 @@ func (s *Service) handleFallbackResult(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
 		return
 	}
+	if meta.From != "" && task.ClaimedBy != "" && !strings.EqualFold(strings.TrimSpace(meta.From), strings.TrimSpace(task.ClaimedBy)) {
+		writeAPIError(w, http.StatusConflict, "TASK_NOT_CLAIMED", fmt.Sprintf("task %q is claimed by %q", id, task.ClaimedBy), nil)
+		return
+	}
 	if err := contract.EnforceAirGap(failMetadataAirGapText(meta), s.cfg.ForbiddenTerms); err != nil {
 		writeAPIError(w, http.StatusUnprocessableEntity, "AIRGAP_VIOLATION", err.Error(), nil)
 		return
@@ -341,10 +345,35 @@ func (s *Service) handleFallbackResult(w http.ResponseWriter, r *http.Request) {
 		rcp, rerr := s.catalog.ValidateAndResolveTask(r.Context(), task.Recipe, task.CustomRecipe, task.Vars)
 		if rerr == nil && rcp.AllowsComputerUseFallback() {
 			healOut = s.runDriftHealer(r.Context(), task, rcp, meta.StepID, meta.LandedURL, meta.Error, diagID, zdata.DOMHTML, zdata.AXTreeText, zdata.ScreenshotPNG, false)
+		} else if rerr != nil {
+			logServerError("FALLBACK_RESULT", fmt.Sprintf("task=%s resolve recipe %q failed: %v", id, task.Recipe, rerr))
 		}
 	}
 
+	// Ensure unhealed fallback tasks never remain stuck in claimed state until lease expiry.
 	updated, _ := s.store.GetTask(r.Context(), id)
+	if updated.Status == contract.TaskStatusClaimed {
+		host := meta.From
+		if host == "" {
+			host = task.ClaimedBy
+		}
+		failReason := "fallback snapshot did not produce a verified drop"
+		if healOut.HealErr != "" {
+			failReason = "healer error on fallback snapshot: " + healOut.HealErr
+		} else if s.healer == nil {
+			failReason = "exception healer is disabled; fallback snapshot archived for manual triage"
+		}
+		closed, _, _, ferr := s.store.FailTask(r.Context(), id, host, triage, failReason, diagID)
+		if errors.Is(ferr, ErrConflict) {
+			writeAPIError(w, http.StatusConflict, "TASK_NOT_CLAIMED", "task is no longer in claimed state", nil)
+			return
+		}
+		if ferr != nil {
+			writeAPIError(w, http.StatusInternalServerError, "STORE_ERROR", ferr.Error(), nil)
+			return
+		}
+		updated = closed
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":               true,
 		"task":             updated,
@@ -358,6 +387,7 @@ type driftHealSummary struct {
 	DropID         string
 	FallbackTaskID string
 	ProposalID     string
+	HealErr        string
 }
 
 func (s *Service) runDriftHealer(
@@ -387,6 +417,8 @@ func (s *Service) runDriftHealer(
 		AllowTier2:    allowTier2,
 	})
 	if err != nil {
+		out.HealErr = err.Error()
+		logServerError("DRIFT_HEALER", fmt.Sprintf("recipe=%q task=%q diag=%q err=%q", rcp.Name, task.ID, diagID, err.Error()))
 		return out
 	}
 

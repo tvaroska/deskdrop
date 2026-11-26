@@ -20,9 +20,15 @@
 - [`prompts/REGENERATE.md`](prompts/REGENERATE.md) — Single-adapter regenerative blueprint.
 
 ## 3. Canonical Commands
-- **Full verification gate:** `gate test deskdrop` (runs `scripts/gate.sh`: `gofmt -s`, `go vet ./...`, `go test -race ./...`)
+- **Full verification gate:** `gate test deskdrop` (runs `scripts/gate.sh`: `gofmt -s`, `go vet ./...`, Windows `go vet`, `ast-grep scan -r specs/ast.rules.yaml`, `go test -race -count=1 ./...`)
 - **Cross-compile CLI, Windows `.exe`, and server:** `make build`
 - **Verify zero-dependency desktop CLI invariant:** `go test -run TestZeroExternalDepsInDesktopCLI .`
 
-## 4. Hard Invariants
+## 4. E2E / Production → Unit Escape-Analysis Rule
+Whenever a defect escapes unit tests and is caught only in compiled CLI → relay loopback E2E, container smoke (`verify-nonroot-and-healthcheck`), or live production:
+1. **Explain the escape:** Record why existing unit tests passed (missing boundary condition, unexercised error branch, OS-tag skew, or missing JS/Go parity check).
+2. **Add a targeted unit/mutation regression test:** Before closing the fix, add a deterministic unit test (and verify a 1-line mutant fails it) covering that exact failure mode so it cannot regress without a full E2E run.
+3. **Keep E2E focused on wiring:** Loopback E2E proves binary packaging, HTTP/WebSocket serialization, `FileStore` restart persistence, and CLI flag plumbing — never rely on E2E alone to guard domain invariants.
+
+## 5. Hard Invariants
 See [`CRITICAL.md`](CRITICAL.md), [`DECISIONS.md`](DECISIONS.md), and [`docs/roadmap.md`](docs/roadmap.md).

@@ -193,6 +193,9 @@ func (c *DesktopClient) SendErrorWithContext(ctx context.Context, to string, met
 }
 
 func (c *DesktopClient) ClaimNextTask(ctx context.Context, host string, leaseSeconds int, worker *contract.WorkerStatus, allowedDrivers ...string) (contract.ClaimTaskResponse, error) {
+	if err := c.ValidateAuth(); err != nil {
+		return contract.ClaimTaskResponse{}, err
+	}
 	var resp contract.ClaimTaskResponse
 	err := c.postJSONWithRetry(ctx, "/v1/tasks/claim", "", contract.ClaimTaskRequest{
 		Host:           host,
@@ -277,6 +280,9 @@ func (c *DesktopClient) DownloadReleaseChecksums(ctx context.Context) (string, e
 }
 
 func (c *DesktopClient) HeartbeatTask(ctx context.Context, taskID string, host string, leaseSeconds int) error {
+	if err := c.ValidateAuth(); err != nil {
+		return err
+	}
 	return c.postJSONWithRetry(ctx, "/v1/tasks/"+taskID+"/heartbeat", "", contract.ClaimTaskRequest{
 		Host:         host,
 		LeaseSeconds: leaseSeconds,
@@ -284,6 +290,9 @@ func (c *DesktopClient) HeartbeatTask(ctx context.Context, taskID string, host s
 }
 
 func (c *DesktopClient) CompleteTask(ctx context.Context, taskID string, to string, report contract.DropReport) (SendResult, error) {
+	if err := c.ValidateAuth(); err != nil {
+		return SendResult{}, err
+	}
 	pretty, err := json.Marshal(report)
 	if err != nil {
 		return SendResult{}, err
@@ -314,6 +323,9 @@ func (c *DesktopClient) CompleteTask(ctx context.Context, taskID string, to stri
 }
 
 func (c *DesktopClient) FailTask(ctx context.Context, taskID string, meta contract.FailReportMetadata, zipBytes []byte) (contract.ErrorTriage, string, error) {
+	if err := c.ValidateAuth(); err != nil {
+		return contract.ErrorTriage{}, "", err
+	}
 	if meta.From == "" {
 		meta.From = c.From
 	}
@@ -332,6 +344,9 @@ func (c *DesktopClient) FailTask(ctx context.Context, taskID string, meta contra
 
 // SubmitFallbackResult uploads a fresh scrubbed Tier-2 snapshot bundle for offline Tier-1 healing.
 func (c *DesktopClient) SubmitFallbackResult(ctx context.Context, taskID string, meta contract.FailReportMetadata, zipBytes []byte) (string, string, error) {
+	if err := c.ValidateAuth(); err != nil {
+		return "", "", err
+	}
 	if meta.From == "" {
 		meta.From = c.From
 	}

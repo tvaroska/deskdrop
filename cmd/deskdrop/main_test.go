@@ -403,3 +403,127 @@ func TestM25RunTraySyncStepSkipsDrainOnRelay503(t *testing.T) {
 		t.Fatalf("expected <=4 /v1/status calls per tick, got %d", statusHits.Load())
 	}
 }
+
+func TestS11S13T7ConfigCommentsAtomicSaveAndCLINegativePaths(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	// S-11: saveConfigChromeSession handles // comments without shadowing into CWD deskdrop.json.
+	cfgDir := t.TempDir()
+	cfgFile := filepath.Join(cfgDir, "deskdrop.json")
+	commented := "// User deskdrop config\n{\n  \"service_url\": \"https://relay.example.com\",\n  \"chrome-session\": \"OldProfile\",\n  \"chrome_profile\": \"OldProfile\"\n}\n"
+	if err := os.WriteFile(cfgFile, []byte(commented), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cwdDir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(cwdDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(origWD) }()
+
+	if err := saveConfigChromeSession(cfgFile, "Profile 2"); err != nil {
+		t.Fatalf("saveConfigChromeSession on commented config failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cwdDir, "deskdrop.json")); err == nil {
+		t.Fatal("saveConfigChromeSession shadowed config into CWD deskdrop.json")
+	}
+	updated, err := loadConfig(cfgFile)
+	if err != nil || updated.ChromeSession != "Profile 2" || updated.ServiceURL != "https://relay.example.com" {
+		t.Fatalf("reloaded config mismatch: cfg=%+v err=%v", updated, err)
+	}
+
+	// S-13: cmdOpenBrowser propagates --config errors instead of ignoring them.
+	if err := cmdOpenBrowser([]string{"--config", filepath.Join(cfgDir, "missing.json")}); err == nil {
+		t.Fatal("expected cmdOpenBrowser to return error on missing explicit --config")
+	}
+
+	// T-7: CLI argument parsing, unknown commands, recipe loading, and local recipes listing.
+	if err := run([]string{"help"}); err != nil {
+		t.Fatalf("run(help) failed: %v", err)
+	}
+	if err := run([]string{"version"}); err != nil {
+		t.Fatalf("run(version) failed: %v", err)
+	}
+	if err := run([]string{"unknown-subcmd"}); err == nil {
+		t.Fatal("expected unknown command error")
+	}
+	if err := cmdRun([]string{"--dry-run"}); err == nil {
+		t.Fatal("expected cmdRun without recipe arg to fail")
+	}
+	if err := cmdRun([]string{"--driver", "invalid", "foo.json"}); err == nil {
+		t.Fatal("expected cmdRun with invalid --driver to fail")
+	}
+	if err := cmdSync([]string{"--config", cfgFile, "--fallback-gate", "invalid"}); err == nil {
+		t.Fatal("expected cmdSync with invalid --fallback-gate to fail")
+	}
+
+	// loadLocalRecipesFile handles bundle, slice, single recipe, and rejects invalid JSON.
+	singlePath := filepath.Join(cfgDir, "single.json")
+	_ = os.WriteFile(singlePath, []byte(`{"name":"s1","topic":"t","steps":[{"id":"st1","url":"https://example.com"}]}`), 0o600)
+	list, err := loadLocalRecipesFile(singlePath)
+	if err != nil || len(list) != 1 || list[0].Name != "s1" {
+		t.Fatalf("loadLocalRecipesFile single = (%+v, %v)", list, err)
+	}
+	bundlePath := filepath.Join(cfgDir, "bundle.json")
+	_ = os.WriteFile(bundlePath, []byte(`{"schema_version":"2.0","recipes":[{"name":"b1","topic":"t","steps":[{"id":"st1","url":"https://example.com"}]}]}`), 0o600)
+	bList, err := loadLocalRecipesFile(bundlePath)
+	if err != nil || len(bList) != 1 || bList[0].Name != "b1" {
+		t.Fatalf("loadLocalRecipesFile bundle = (%+v, %v)", bList, err)
+	}
+
+	// cmdRecipes against local recipes_uri succeeds.
+	localCfg := filepath.Join(cfgDir, "recipes-only.json")
+	_ = os.WriteFile(localCfg, []byte(`{"recipes_uri":"`+filepath.ToSlash(bundlePath)+`"}`), 0o600)
+	if err := cmdRecipes([]string{"--config", localCfg}); err != nil {
+		t.Fatalf("cmdRecipes(local recipes_uri) failed: %v", err)
+	}
+	if err := cmdRecipes([]string{"--config", filepath.Join(cfgDir, "missing.json")}); err == nil {
+		t.Fatal("expected cmdRecipes missing config to fail")
+	}
+
+	// splitPositionalFirst handles flags before and after positional target.
+	pos, rest, err := splitPositionalFirst([]string{"--dry-run", "--var", "a=1", "my-recipe"})
+	if err != nil || pos != "my-recipe" || len(rest) != 3 {
+		t.Fatalf("splitPositionalFirst = (%q, %v, %v)", pos, rest, err)
+	}
+
+	// executeRecipeAndDeliver sends X-DeskDrop-Version header on deskdrop run uploads (S-13).
+	var gotDropVer atomic.Value
+	var gotRecipesVer atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/drops":
+			gotDropVer.Store(r.Header.Get("X-DeskDrop-Version"))
+			_, _ = w.Write([]byte(`{"ok":true,"drop_id":"d1","short_id":"s1","message_id":"m1"}`))
+		default:
+			gotRecipesVer.Store(r.Header.Get("X-DeskDrop-Version"))
+			_, _ = w.Write([]byte(`{"ok":true,"recipes":[]}`))
+		}
+	}))
+	defer srv.Close()
+	origMake := makeTargetDriver
+	makeTargetDriver = func(_ string, _ *cdp.SessionPool, _ contract.Config) driver.TargetDriver {
+		return &fakeDriver{name: "cdp"}
+	}
+	defer func() { makeTargetDriver = origMake }()
+
+	runCfg := contract.Config{From: "win-pc", ServiceURL: srv.URL, ServiceToken: "tok"}
+	runRecipe := contract.Recipe{
+		Name:  "demo",
+		Topic: "ops",
+		Steps: []contract.Step{{ID: "s1", URL: "https://example.com"}},
+	}
+	if err := executeRecipeAndDeliver(runRecipe, "cdp", runCfg, "all", false); err != nil {
+		t.Fatalf("executeRecipeAndDeliver failed: %v", err)
+	}
+	if v, _ := gotDropVer.Load().(string); v != version {
+		t.Fatalf("deskdrop run X-DeskDrop-Version = %q, want %q", v, version)
+	}
+	verCfg := filepath.Join(cfgDir, "http-ver.json")
+	_ = os.WriteFile(verCfg, []byte(`{"service_url":"`+srv.URL+`","service_token":"tok"}`), 0o600)
+	if err := cmdRecipes([]string{"--config", verCfg}); err != nil {
+		t.Fatalf("cmdRecipes HTTP failed: %v", err)
+	}
+	if v, _ := gotRecipesVer.Load().(string); v != version {
+		t.Fatalf("cmdRecipes X-DeskDrop-Version = %q, want %q", v, version)
+	}
+}

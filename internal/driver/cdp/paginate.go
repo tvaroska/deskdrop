@@ -36,16 +36,12 @@ func (c *Client) runPaginationLoop(
 	}
 
 	allowedDomains := contract.StepDomains(step)
-	baseDomain := ""
-	if len(allowedDomains) > 0 {
-		baseDomain = allowedDomains[0]
-	} else {
-		baseDomain = contract.ExtractDomain(initial.URL)
-		if baseDomain != "" {
+	if len(allowedDomains) == 0 {
+		if baseDomain := contract.ExtractDomain(initial.URL); baseDomain != "" {
 			allowedDomains = []string{baseDomain}
 		}
 	}
-	if baseDomain == "" {
+	if len(allowedDomains) == 0 {
 		return acc, errors.New("pagination requires a valid HTTP/HTTPS base domain")
 	}
 
@@ -53,7 +49,7 @@ func (c *Client) runPaginationLoop(
 	extractExpr := buildDeclarativeExtractJS(step, maxText)
 
 	for pageIdx := 2; pageIdx <= pag.MaxPages; pageIdx++ {
-		if _, err := c.verifyAllowedSessionURL(sctx, sessionID, step, baseDomain, allowedDomains, "pagination"); err != nil {
+		if _, err := c.verifyAllowedSessionURL(sctx, sessionID, step, "", allowedDomains, "pagination"); err != nil {
 			return acc, err
 		}
 		var clickRes nextClickState
@@ -64,11 +60,12 @@ func (c *Client) runPaginationLoop(
 			break
 		}
 
-		if pag.WaitMs > 0 {
+		waitMs := pag.EffectiveWaitMs()
+		if waitMs > 0 {
 			select {
 			case <-sctx.Done():
 				return acc, sctx.Err()
-			case <-time.After(time.Duration(pag.WaitMs) * time.Millisecond):
+			case <-time.After(time.Duration(waitMs) * time.Millisecond):
 			}
 		}
 
@@ -78,7 +75,7 @@ func (c *Client) runPaginationLoop(
 			}
 		}
 
-		if _, err := c.verifyAllowedSessionURL(sctx, sessionID, step, baseDomain, allowedDomains, "pagination"); err != nil {
+		if _, err := c.verifyAllowedSessionURL(sctx, sessionID, step, "", allowedDomains, "pagination"); err != nil {
 			return acc, err
 		}
 

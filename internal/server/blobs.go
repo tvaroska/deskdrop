@@ -60,24 +60,72 @@ type DirBlobStore struct {
 	Root string
 }
 
-func (d *DirBlobStore) Put(_ context.Context, key string, _ string, data []byte) error {
-	clean := filepath.Clean(strings.TrimLeft(key, "/"))
-	if strings.HasPrefix(clean, "..") {
-		return errors.New("invalid blob key")
+func (d *DirBlobStore) resolveKeyPath(key string) (string, error) {
+	trimmed := strings.TrimSpace(key)
+	if trimmed == "" || strings.Contains(trimmed, "\\") {
+		return "", errors.New("invalid blob key")
 	}
-	target := filepath.Join(d.Root, clean)
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+	clean := filepath.Clean(strings.TrimLeft(trimmed, "/"))
+	if clean == "" || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || filepath.IsAbs(clean) {
+		return "", errors.New("invalid blob key")
+	}
+	rootAbs, err := filepath.Abs(d.Root)
+	if err != nil {
+		return "", err
+	}
+	target := filepath.Join(rootAbs, clean)
+	rel, err := filepath.Rel(rootAbs, target)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", errors.New("invalid blob key")
+	}
+	return target, nil
+}
+
+func (d *DirBlobStore) Put(_ context.Context, key string, _ string, data []byte) error {
+	target, err := d.resolveKeyPath(key)
+	if err != nil {
 		return err
 	}
-	return os.WriteFile(target, data, 0o600)
+	dir := filepath.Dir(target)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".blob-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Chmod(tmpPath, 0o600); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, target); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 func (d *DirBlobStore) Get(_ context.Context, key string) ([]byte, error) {
-	clean := filepath.Clean(strings.TrimLeft(key, "/"))
-	if strings.HasPrefix(clean, "..") {
+	target, err := d.resolveKeyPath(key)
+	if err != nil {
 		return nil, ErrNotFound
 	}
-	b, err := os.ReadFile(filepath.Join(d.Root, clean))
+	b, err := os.ReadFile(target)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, ErrNotFound
 	}
@@ -207,10 +255,12 @@ func (g *GCSBlobStore) accessToken(ctx context.Context) (string, error) {
 		return envTok, nil
 	}
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	if g.cachedToken != "" && time.Now().Add(60*time.Second).Before(g.tokenExpiry) {
-		return g.cachedToken, nil
+		tok := g.cachedToken
+		g.mu.Unlock()
+		return tok, nil
 	}
+	g.mu.Unlock()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.tokenURL(), nil)
 	if err != nil {
@@ -222,7 +272,10 @@ func (g *GCSBlobStore) accessToken(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("metadata token fetch failed: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 16384))
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 16384))
+	if readErr != nil {
+		return "", fmt.Errorf("read metadata token response: %w", readErr)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("metadata server HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
@@ -230,10 +283,16 @@ func (g *GCSBlobStore) accessToken(ctx context.Context) (string, error) {
 		AccessToken string `json:"access_token"`
 		ExpiresIn   int    `json:"expires_in"`
 	}
-	if err := json.Unmarshal(raw, &parsed); err != nil || parsed.AccessToken == "" {
+	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return "", fmt.Errorf("invalid metadata token payload: %w", err)
 	}
+	if strings.TrimSpace(parsed.AccessToken) == "" {
+		return "", errors.New("metadata token payload missing access_token")
+	}
+	expiry := time.Now().Add(time.Duration(parsed.ExpiresIn) * time.Second)
+	g.mu.Lock()
 	g.cachedToken = parsed.AccessToken
-	g.tokenExpiry = time.Now().Add(time.Duration(parsed.ExpiresIn) * time.Second)
-	return g.cachedToken, nil
+	g.tokenExpiry = expiry
+	g.mu.Unlock()
+	return parsed.AccessToken, nil
 }
