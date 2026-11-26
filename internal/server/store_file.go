@@ -171,6 +171,12 @@ func (f *FileStore) GetDrop(ctx context.Context, idOrShortID string) (contract.D
 	return f.mem.GetDrop(ctx, idOrShortID)
 }
 
+func (f *FileStore) GetPriorDrop(ctx context.Context, dropIDOrShortID string, recipe string, topic string) (*contract.DropRecord, error) {
+	f.ioMu.RLock()
+	defer f.ioMu.RUnlock()
+	return f.mem.GetPriorDrop(ctx, dropIDOrShortID, recipe, topic)
+}
+
 func (f *FileStore) ListDrops(ctx context.Context, topic string, recipe string, limit int) ([]contract.DropRecord, error) {
 	f.ioMu.RLock()
 	defer f.ioMu.RUnlock()
@@ -319,6 +325,21 @@ func (f *FileStore) FailTask(ctx context.Context, taskID string, host string, tr
 		return contract.Task{}, contract.DomainBreaker{}, false, perr
 	}
 	return task, brk, newly, nil
+}
+
+func (f *FileStore) UpdateFailedTaskNote(ctx context.Context, taskID string, errMsg string) error {
+	f.ioMu.Lock()
+	defer f.ioMu.Unlock()
+
+	prev := f.mem.exportSnapshot()
+	if err := f.mem.UpdateFailedTaskNote(ctx, taskID, errMsg); err != nil {
+		return err
+	}
+	if perr := f.persistLocked(); perr != nil {
+		f.mem.importSnapshot(prev)
+		return perr
+	}
+	return nil
 }
 
 func (f *FileStore) SetTaskProposal(ctx context.Context, taskID string, proposalID string) error {

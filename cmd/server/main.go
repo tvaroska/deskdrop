@@ -25,10 +25,21 @@ const defaultWriteTimeout = 180 * time.Second
 
 type serverRuntime struct {
 	httpSrv      *http.Server
+	svc          *server.Service
 	store        server.Store
 	storeBackend string
 	blobBackend  string
 	healerActive bool
+}
+
+func (rt *serverRuntime) Close() error {
+	if rt.svc != nil {
+		_ = rt.svc.Close()
+	}
+	if rt.store != nil {
+		return rt.store.Close()
+	}
+	return nil
 }
 
 func buildServerRuntime(getenv func(string) string, loadLocalTerms func() []string) (*serverRuntime, error) {
@@ -149,6 +160,7 @@ func buildServerRuntime(getenv func(string) string, loadLocalTerms func() []stri
 	}
 	return &serverRuntime{
 		httpSrv:      httpSrv,
+		svc:          svc,
 		store:        store,
 		storeBackend: storeBackend,
 		blobBackend:  blobBackend,
@@ -187,7 +199,10 @@ func main() {
 	}()
 
 	<-ctx.Done()
-	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = rt.httpSrv.Shutdown(shutCtx)
+	if rt.svc != nil {
+		_ = rt.svc.Shutdown(shutCtx)
+	}
 }

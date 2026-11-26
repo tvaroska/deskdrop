@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -55,16 +54,9 @@ const (
 	mbIconQuestion = 0x00000020
 	mbTopMost      = 0x00040000
 	idYes          = 6
+	idTimeout      = 32000
 
 	swHide = 0
-
-	menuIDConnectChrome = 1001
-	menuIDSyncNow       = 1003
-	menuIDToggleGate    = 1004
-	menuIDUpdate        = 1005
-	menuIDQuit          = 1009
-	menuIDProfileBase   = 2000
-	maxMenuProfiles     = 32
 )
 
 var (
@@ -91,6 +83,7 @@ var (
 	procShowWindow          = user32.NewProc("ShowWindow")
 	procFindWindowW         = user32.NewProc("FindWindowW")
 	procMessageBoxW         = user32.NewProc("MessageBoxW")
+	procMessageBoxTimeoutW  = user32.NewProc("MessageBoxTimeoutW")
 
 	procShellNotifyIconW = shell32.NewProc("Shell_NotifyIconW")
 	procGetModuleHandleW = kernel32.NewProc("GetModuleHandleW")
@@ -151,52 +144,68 @@ type winMsg struct {
 	Pt      point
 }
 
-type trayAction struct {
-	cmdID   int
-	profile cdp.BrowserProfile
-}
-
 type trayApp struct {
-	cfgPath  string
-	cdpURL   string
-	interval time.Duration
-	pool     *cdp.SessionPool
+	coord *trayCoordinator
 
 	hwnd      uintptr
 	iconRed   uintptr
 	iconGreen uintptr
 	iconAmber uintptr
 
-	notifyMu        sync.Mutex
-	mu              sync.Mutex
-	browserStat     string
-	lastAction      string
-	selectedProfile string
-	fallbackGate    string
-	busy            bool
-	connected       bool
-
-	actionCh chan trayAction
-	stopCh   chan struct{}
+	notifyMu sync.Mutex
 }
 
 var activeTray *trayApp
 
 func defaultShowsTrayOnNoArgs() bool { return true }
 
-// confirmFallbackPlan opens a native Windows confirmation prompt for --fallback-gate=tray.
+// confirmFallbackPlan opens a native Windows confirmation prompt for --fallback-gate=tray with bounded auto-decline timeout.
 func confirmFallbackPlan(plan contract.FallbackPlan) (bool, error) {
-	var b strings.Builder
-	fmt.Fprintf(&b, "DeskDrop requests %d bounded fallback action(s) on %s.\n\nURL: %s\nReason: %s\n\nActions:\n",
-		len(plan.Actions), plan.AllowedDomain, plan.TargetURL, plan.Reason)
-	for i, a := range plan.Actions {
-		fmt.Fprintf(&b, "%d. %s (selector=%q, delta_y=%d, wait_ms=%d)\n", i+1, a.Action, a.Selector, a.DeltaY, a.WaitMs)
+	return confirmFallbackPlanWithTimeout(context.Background(), defaultFallbackPromptTimeout, plan)
+}
+
+func confirmFallbackPlanWithTimeout(ctx context.Context, timeout time.Duration, plan contract.FallbackPlan) (bool, error) {
+	if timeout <= 0 {
+		timeout = defaultFallbackPromptTimeout
 	}
-	b.WriteString("\nOpen a temporary scratch tab, run these safe actions, and close it immediately?")
-	titlePtr, _ := syscall.UTF16PtrFromString("DeskDrop — Approve Tier-2 Fallback")
-	bodyPtr, _ := syscall.UTF16PtrFromString(b.String())
-	ret, _, _ := procMessageBoxW.Call(0, uintptr(unsafe.Pointer(bodyPtr)), uintptr(unsafe.Pointer(titlePtr)), mbYesNo|mbIconQuestion|mbTopMost)
-	return ret == idYes, nil
+	guardTimeout := timeout
+	hasNativeTimeout := procMessageBoxTimeoutW.Find() == nil
+	if hasNativeTimeout {
+		// Let Win32 MessageBoxTimeoutW close the dialog first so promptMu stays held until the modal dismisses;
+		// keep a +5s outer guard only as a safety net while still honoring ctx cancellation on tray exit.
+		guardTimeout = timeout + 5*time.Second
+	}
+	return awaitFallbackApproval(ctx, guardTimeout, func(p contract.FallbackPlan) (bool, error) {
+		var b strings.Builder
+		fmt.Fprintf(&b, "DeskDrop requests %d bounded fallback action(s) on %s.\n\nURL: %s\nReason: %s\n\nActions:\n",
+			len(p.Actions), p.AllowedDomain, p.TargetURL, p.Reason)
+		for i, a := range p.Actions {
+			fmt.Fprintf(&b, "%d. %s (selector=%q, delta_y=%d, wait_ms=%d)\n", i+1, a.Action, a.Selector, a.DeltaY, a.WaitMs)
+		}
+		b.WriteString("\nOpen a temporary scratch tab, run these safe actions, and close it immediately?")
+		titlePtr, _ := syscall.UTF16PtrFromString("DeskDrop — Approve Tier-2 Fallback")
+		bodyPtr, _ := syscall.UTF16PtrFromString(b.String())
+		defer runtime.KeepAlive(titlePtr)
+		defer runtime.KeepAlive(bodyPtr)
+
+		ms := timeout.Milliseconds()
+		if ms < 1 {
+			ms = 1
+		}
+		if ms > 3_600_000 {
+			ms = 3_600_000
+		}
+		flags := uintptr(mbYesNo | mbIconQuestion | mbTopMost)
+		if hasNativeTimeout {
+			ret, _, _ := procMessageBoxTimeoutW.Call(0, uintptr(unsafe.Pointer(bodyPtr)), uintptr(unsafe.Pointer(titlePtr)), flags, 0, uintptr(ms))
+			if ret == idTimeout {
+				return false, fmt.Errorf("approval prompt timed out after %s", timeout)
+			}
+			return ret == idYes, nil
+		}
+		ret, _, _ := procMessageBoxW.Call(0, uintptr(unsafe.Pointer(bodyPtr)), uintptr(unsafe.Pointer(titlePtr)), flags)
+		return ret == idYes, nil
+	}, plan)
 }
 
 func runPlatformTray(cfgPath string, cdpURL string, interval time.Duration, fallbackGate string, keepConsole bool) error {
@@ -220,20 +229,23 @@ func runPlatformTray(cfgPath string, cdpURL string, interval time.Duration, fall
 		gate = initCfg.NormalizedFallbackGate()
 	}
 
+	pool := cdp.NewSessionPool()
+	defer pool.Close()
+
+	coord := newTrayCoordinator(cfgPath, cdpURL, interval, gate, initSel, pool)
 	app := &trayApp{
-		cfgPath:         cfgPath,
-		cdpURL:          cdpURL,
-		interval:        interval,
-		pool:            cdp.NewSessionPool(),
-		browserStat:     "Checking Chrome...",
-		lastAction:      "Idle (ready)",
-		selectedProfile: initSel,
-		fallbackGate:    gate,
-		actionCh:        make(chan trayAction, 8),
-		stopCh:          make(chan struct{}),
+		coord: coord,
 	}
+	coord.onRefreshUI = func() {
+		if app.hwnd != 0 {
+			procPostMessageW.Call(app.hwnd, wmTrayRefresh, 0, 0)
+		}
+	}
+	coord.onTryConnect = app.tryConnectOnce
+	coord.onRefreshStatus = app.refreshStatus
+	coord.onSelectProfile = app.doStartChromeProfile
+	coord.onSelfUpdate = app.doSelfUpdate
 	activeTray = app
-	defer app.pool.Close()
 
 	hInst, _, _ := procGetModuleHandleW.Call(0)
 	app.iconGreen = createBadgeIcon(hInst, 0x48, 0xF2, 0x92)
@@ -270,7 +282,11 @@ func runPlatformTray(cfgPath string, cdpURL string, interval time.Duration, fall
 	app.addTrayIcon()
 	defer app.removeTrayIcon()
 
-	go app.workerLoop()
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		coord.workerLoop()
+	}()
 
 	var m winMsg
 	for {
@@ -282,7 +298,8 @@ func runPlatformTray(cfgPath string, cdpURL string, interval time.Duration, fall
 		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))
 	}
 
-	close(app.stopCh)
+	close(coord.stopCh)
+	<-workerDone
 	return nil
 }
 
@@ -318,21 +335,19 @@ func trayWndProc(hwnd uintptr, msg uint32, wParam uintptr, lParam uintptr) uintp
 }
 
 func (a *trayApp) currentIcon() uintptr {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.busy {
+	_, _, _, _, busy, connected := a.coord.snapshotState()
+	if busy {
 		return a.iconAmber
 	}
-	if a.connected {
+	if connected {
 		return a.iconGreen
 	}
 	return a.iconRed
 }
 
 func (a *trayApp) currentTooltip() string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	tip := fmt.Sprintf("DeskDrop %s [%s]\n%s\n%s", version, a.fallbackGate, a.browserStat, a.lastAction)
+	bStat, lAct, _, gate, _, _ := a.coord.snapshotState()
+	tip := fmt.Sprintf("DeskDrop %s [%s]\n%s\n%s", version, gate, bStat, lAct)
 	if len(tip) > 120 {
 		tip = tip[:120]
 	}
@@ -389,27 +404,23 @@ func (a *trayApp) showPopupMenu() {
 	}
 	defer procDestroyMenu.Call(hMenu)
 
-	cfg, _ := loadConfig(a.cfgPath)
+	cfg, _ := loadConfig(a.coord.cfgPath)
 	profiles := cdp.ListBrowserProfiles(cfg.Browser, cfg.UserDataDir)
 	if len(profiles) > maxMenuProfiles {
 		profiles = profiles[:maxMenuProfiles]
 	}
 
-	a.mu.Lock()
-	bStat := a.browserStat
-	lAct := a.lastAction
-	selProf := a.selectedProfile
-	gate := a.fallbackGate
-	busy := a.busy
-	a.mu.Unlock()
+	bStat, lAct, selProf, gate, _, _ := a.coord.snapshotState()
+	syncBusy := a.coord.hasActiveWork()
 
 	appendMenuText(hMenu, mfString|mfGrayed, 0, fmt.Sprintf("DeskDrop %s — %s", version, bStat))
 	appendMenuText(hMenu, mfString|mfGrayed, 0, fmt.Sprintf("Last: %s", lAct))
 	procAppendMenuW.Call(hMenu, mfSeparator, 0, 0)
 
 	flags := uint32(mfString)
-	if busy {
-		flags |= mfGrayed
+	updateFlags := uint32(mfString)
+	if syncBusy {
+		updateFlags |= mfGrayed
 	}
 
 	hProfMenu, _, _ := procCreatePopupMenu.Call()
@@ -431,7 +442,7 @@ func (a *trayApp) showPopupMenu() {
 	appendMenuText(hMenu, flags, menuIDConnectChrome, "Connect to Open Chrome")
 	appendMenuText(hMenu, flags, menuIDSyncNow, "Sync Queue Now")
 	appendMenuText(hMenu, flags, menuIDToggleGate, fmt.Sprintf("Fallback Gate: %s (Toggle)", strings.ToUpper(gate)))
-	appendMenuText(hMenu, flags, menuIDUpdate, "Update DeskDrop")
+	appendMenuText(hMenu, updateFlags, menuIDUpdate, "Update DeskDrop")
 	procAppendMenuW.Call(hMenu, mfSeparator, 0, 0)
 	appendMenuText(hMenu, mfString, menuIDQuit, "Exit")
 
@@ -444,12 +455,12 @@ func (a *trayApp) showPopupMenu() {
 	switch {
 	case cmdID >= menuIDProfileBase && cmdID < menuIDProfileBase+len(profiles):
 		select {
-		case a.actionCh <- trayAction{cmdID: menuIDProfileBase, profile: profiles[cmdID-menuIDProfileBase]}:
+		case a.coord.actionCh <- trayAction{cmdID: menuIDProfileBase, profile: profiles[cmdID-menuIDProfileBase]}:
 		default:
 		}
 	case cmdID == menuIDConnectChrome || cmdID == menuIDSyncNow || cmdID == menuIDToggleGate || cmdID == menuIDUpdate:
 		select {
-		case a.actionCh <- trayAction{cmdID: cmdID}:
+		case a.coord.actionCh <- trayAction{cmdID: cmdID}:
 		default:
 		}
 	case cmdID == menuIDQuit:
@@ -462,59 +473,15 @@ func appendMenuText(hMenu uintptr, flags uint32, id uintptr, label string) {
 	procAppendMenuW.Call(hMenu, uintptr(flags), id, uintptr(unsafe.Pointer(ptr)))
 }
 
-func (a *trayApp) workerLoop() {
-	// Single-attempt startup dial; background loop stays quiet until user clicks Connect.
-	a.tryConnectOnce(false)
-	a.runSyncCycle(false)
-
-	syncTicker := time.NewTicker(a.interval)
-	defer syncTicker.Stop()
-	probeTicker := time.NewTicker(6 * time.Second)
-	defer probeTicker.Stop()
-
-	for {
-		select {
-		case <-a.stopCh:
-			return
-		case act := <-a.actionCh:
-			switch act.cmdID {
-			case menuIDProfileBase:
-				a.doStartChromeProfile(act.profile)
-			case menuIDConnectChrome:
-				a.pool.ResetApprovalLatch()
-				a.tryConnectOnce(true)
-			case menuIDSyncNow:
-				a.runSyncCycle(true)
-			case menuIDToggleGate:
-				a.mu.Lock()
-				if a.fallbackGate == "tray" {
-					a.fallbackGate = "auto"
-				} else {
-					a.fallbackGate = "tray"
-				}
-				next := a.fallbackGate
-				a.mu.Unlock()
-				a.setBusy(false, "Fallback gate: "+next)
-			case menuIDUpdate:
-				a.doSelfUpdate(true)
-			}
-		case <-syncTicker.C:
-			a.runSyncCycle(false)
-		case <-probeTicker.C:
-			a.refreshStatus()
-		}
-	}
-}
-
 func (a *trayApp) tryConnectOnce(notifyOnSuccess bool) {
-	cfg, _ := loadConfig(a.cfgPath)
-	if a.cdpURL != "" {
-		cfg.CDPURL = a.cdpURL
+	cfg, _ := loadConfig(a.coord.cfgPath)
+	if a.coord.cdpURL != "" {
+		cfg.CDPURL = a.coord.cdpURL
 	}
 	if cfg.NormalizedDriver() == "uia" {
 		a.refreshStatus()
 		if notifyOnSuccess {
-			a.setBusy(false, "Ready (Windows UIA mode)")
+			a.coord.setBusy(false, "Ready (Windows UIA mode)")
 			a.updateTrayIcon("DeskDrop", "Running in Windows UIA mode.", niifInfo)
 		}
 		return
@@ -522,11 +489,11 @@ func (a *trayApp) tryConnectOnce(notifyOnSuccess bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 
-	c, err := a.pool.Acquire(ctx, cfg.CDPURL, cfg.UserDataDir)
+	c, err := a.coord.pool.Acquire(ctx, cfg.CDPURL, cfg.UserDataDir)
 	if err != nil {
 		a.refreshStatus()
 		if notifyOnSuccess {
-			a.setBusy(false, "Connect failed: "+err.Error())
+			a.coord.setBusy(false, "Connect failed: "+err.Error())
 			a.updateTrayIcon("DeskDrop", "Could not connect to Chrome: "+err.Error(), niifError)
 		}
 		return
@@ -534,15 +501,15 @@ func (a *trayApp) tryConnectOnce(notifyOnSuccess bool) {
 	c.SetPreferredSession(cfg.Browser, cfg.UserDataDir, cfg.PreferredChromeSession())
 	a.refreshStatus()
 	if notifyOnSuccess {
-		a.setBusy(false, "Connected to Chrome (persistent session)")
+		a.coord.setBusy(false, "Connected to Chrome (persistent session)")
 		a.updateTrayIcon("DeskDrop", "Connected to Chrome.", niifInfo)
 	}
 }
 
 func (a *trayApp) refreshStatus() {
-	cfg, cfgErr := loadConfig(a.cfgPath)
-	if a.cdpURL != "" {
-		cfg.CDPURL = a.cdpURL
+	cfg, cfgErr := loadConfig(a.coord.cfgPath)
+	if a.coord.cdpURL != "" {
+		cfg.CDPURL = a.coord.cdpURL
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
@@ -554,7 +521,7 @@ func (a *trayApp) refreshStatus() {
 	if cfgErr != nil {
 		label = "Config error: " + cfgErr.Error()
 	} else if cfg.NormalizedDriver() == "uia" {
-		drv := newTargetDriver("uia", a.pool, cfg)
+		drv := newTargetDriver("uia", a.coord.pool, cfg)
 		st := drv.ProbeStatus(ctx)
 		_ = drv.Close()
 		conn = st.Connected
@@ -563,13 +530,13 @@ func (a *trayApp) refreshStatus() {
 			label = st.Label
 		}
 	} else {
-		conn, label = a.pool.ProbeQuiet(ctx, cfg.CDPURL)
+		conn, label = a.coord.pool.ProbeQuiet(ctx, cfg.CDPURL)
 	}
-	a.mu.Lock()
-	changed := (a.connected != conn || a.browserStat != label)
-	a.connected = conn
-	a.browserStat = label
-	a.mu.Unlock()
+	a.coord.mu.Lock()
+	changed := (a.coord.connected != conn || a.coord.browserStat != label)
+	a.coord.connected = conn
+	a.coord.browserStat = label
+	a.coord.mu.Unlock()
 
 	if changed {
 		procPostMessageW.Call(a.hwnd, wmTrayRefresh, 0, 0)
@@ -582,109 +549,49 @@ func (a *trayApp) refreshStatus() {
 func (a *trayApp) sendBackgroundHeartbeat(cfg contract.Config) {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	a.mu.Lock()
-	busy := a.busy
-	lastAct := a.lastAction
-	cfg.FallbackGate = a.fallbackGate
-	a.mu.Unlock()
+	_, lastAct, _, gate, busy, _ := a.coord.snapshotState()
+	cfg.FallbackGate = gate
 
 	svcClient := bus.NewDesktopClient(cfg)
 	svcClient.ClientVersion = version
 	if svcClient.ValidateAuth() != nil {
 		return
 	}
-	drv := newTargetDriver(cfg.NormalizedDriver(), a.pool, cfg)
+	drv := newTargetDriver(cfg.NormalizedDriver(), a.coord.pool, cfg)
 	defer drv.Close()
 	ws := collectWorkerStatus(ctx, drv, cfg, cfg.From, busy, lastAct, "")
 	_ = svcClient.ReportWorkerStatus(ctx, ws)
 }
 
-func (a *trayApp) setBusy(busy bool, action string) {
-	a.mu.Lock()
-	a.busy = busy
-	if action != "" {
-		a.lastAction = action
-	}
-	a.mu.Unlock()
-	procPostMessageW.Call(a.hwnd, wmTrayRefresh, 0, 0)
-}
-
 func (a *trayApp) doStartChromeProfile(prof cdp.BrowserProfile) {
-	a.mu.Lock()
-	a.selectedProfile = prof.DirName
-	a.mu.Unlock()
+	a.coord.mu.Lock()
+	a.coord.selectedProfile = prof.DirName
+	a.coord.mu.Unlock()
 	sessionVal := prof.Name
 	if strings.TrimSpace(sessionVal) == "" || prof.IsDedicated {
 		sessionVal = prof.DirName
 	}
-	_ = saveConfigChromeSession(a.cfgPath, sessionVal)
-	a.setBusy(true, fmt.Sprintf("Selecting Chrome session (%s)...", prof.DisplayName))
-	cfg, _ := loadConfig(a.cfgPath)
+	_ = saveConfigChromeSession(a.coord.cfgPath, sessionVal)
+	a.coord.setBusy(true, fmt.Sprintf("Selecting Chrome session (%s)...", prof.DisplayName))
+	cfg, _ := loadConfig(a.coord.cfgPath)
 	if _, err := cdp.LaunchBrowserProfile(cfg.Browser, prof, ""); err != nil {
-		a.setBusy(false, "Start Chrome failed: "+err.Error())
+		a.coord.setBusy(false, "Start Chrome failed: "+err.Error())
 		return
 	}
 	time.Sleep(1200 * time.Millisecond)
-	a.pool.ResetApprovalLatch()
+	a.coord.pool.ResetApprovalLatch()
 	a.tryConnectOnce(false)
-	a.setBusy(false, fmt.Sprintf("Session: %s", prof.DisplayName))
-}
-
-func (a *trayApp) runSyncCycle(manual bool) {
-	cfg, err := loadConfig(a.cfgPath)
-	if err != nil {
-		a.setBusy(false, "Config error: "+err.Error())
-		return
-	}
-	if cfg.ServiceURL == "" || cfg.ServiceToken == "" {
-		return
-	}
-	if a.cdpURL != "" {
-		cfg.CDPURL = a.cdpURL
-	}
-	a.mu.Lock()
-	cfg.FallbackGate = a.fallbackGate
-	a.mu.Unlock()
-
-	svcClient := bus.NewDesktopClient(cfg)
-	svcClient.ClientVersion = version
-	if svcClient.ValidateAuth() != nil {
-		return
-	}
-	if manual {
-		a.setBusy(true, "Checking relay queue...")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-
-	drv := newTargetDriver(cfg.NormalizedDriver(), a.pool, cfg)
-	defer drv.Close()
-	approver := makeFallbackApprover(cfg.NormalizedFallbackGate())
-	drained, updated, derr := runTraySyncStep(ctx, drv, cfg, svcClient, resolveHostLabel(cfg), approver, func(_ string) bool {
-		return a.doSelfUpdate(false)
-	})
-	if updated {
-		return
-	}
-	if errors.Is(derr, errRelayRestarting) {
-		a.setBusy(false, "Relay restarting")
-		return
-	}
-	a.refreshStatus()
-	stamp := time.Now().Format("15:04:05")
-	if derr != nil {
-		a.setBusy(false, fmt.Sprintf("Sync err (%s): %v", stamp, derr))
-		return
-	}
-	if drained > 0 {
-		a.setBusy(false, fmt.Sprintf("Synced %d task(s) at %s", drained, stamp))
-	} else if manual {
-		a.setBusy(false, fmt.Sprintf("Queue empty (%s)", stamp))
-	}
+	a.coord.setBusy(false, fmt.Sprintf("Session: %s", prof.DisplayName))
 }
 
 func (a *trayApp) doSelfUpdate(manual bool) bool {
-	cfg, err := loadConfig(a.cfgPath)
+	if a.coord.hasActiveFallback() {
+		if manual {
+			a.updateTrayIcon("DeskDrop Busy", "Finish or decline the open Tier-2 fallback prompt before updating.", niifError)
+		}
+		return false
+	}
+	cfg, err := loadConfig(a.coord.cfgPath)
 	if err != nil {
 		return false
 	}
@@ -693,19 +600,19 @@ func (a *trayApp) doSelfUpdate(manual bool) bool {
 	if svcClient.ValidateAuth() != nil {
 		return false
 	}
-	a.setBusy(true, "Updating DeskDrop...")
+	a.coord.setBusy(true, "Updating DeskDrop...")
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	newVer, uerr := performSelfUpdate(ctx, svcClient)
 	if uerr != nil {
-		a.setBusy(false, "Update failed: "+uerr.Error())
+		a.coord.setBusy(false, "Update failed: "+uerr.Error())
 		if manual {
 			a.updateTrayIcon("DeskDrop Update Failed", uerr.Error(), niifError)
 		}
 		return false
 	}
 	if serr := spawnDetachedSelf(os.Args[1:]); serr != nil {
-		a.setBusy(false, "Update restart failed: "+serr.Error())
+		a.coord.setBusy(false, "Update restart failed: "+serr.Error())
 		a.updateTrayIcon("DeskDrop Update Restart Failed", serr.Error(), niifError)
 		return false
 	}

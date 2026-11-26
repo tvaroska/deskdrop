@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tvaroska/deskdrop/internal/bus"
@@ -20,6 +21,23 @@ import (
 	"github.com/tvaroska/deskdrop/internal/driver"
 	"github.com/tvaroska/deskdrop/internal/driver/uia"
 )
+
+const (
+	defaultTaskHeartbeatInterval = 30 * time.Second
+	defaultFallbackPromptTimeout = 3 * time.Minute
+	defaultFallbackStepTimeout   = 60 * time.Second
+)
+
+// FallbackDispatcher schedules a claimed Tier-2 fallback_task off the main drain loop (used by tray mode).
+type FallbackDispatcher func(task contract.Task, resolvedRecipe *contract.Recipe) bool
+
+type fallbackExecOptions struct {
+	HeartbeatInterval time.Duration
+	PromptTimeout     time.Duration
+	StepTimeout       time.Duration
+	WrapPrompt        func(fn func())
+	WrapDriverExec    func(fn func())
+}
 
 var makeTargetDriver = newTargetDriver
 
@@ -116,6 +134,21 @@ func drainQueue(
 	hasCap bool,
 	approver FallbackApprover,
 ) (int, error) {
+	return drainQueueWithDispatcher(ctx, drv, cfg, svcClient, hostLabel, remaining, hasCap, approver, nil, nil)
+}
+
+func drainQueueWithDispatcher(
+	ctx context.Context,
+	drv driver.TargetDriver,
+	cfg contract.Config,
+	svcClient *bus.DesktopClient,
+	hostLabel string,
+	remaining int,
+	hasCap bool,
+	approver FallbackApprover,
+	dispatchFallback FallbackDispatcher,
+	wrapDriverExec func(fn func()),
+) (int, error) {
 	ws := collectWorkerStatus(ctx, drv, cfg, hostLabel, false, "sync", "")
 	_ = svcClient.ReportWorkerStatus(ctx, ws)
 
@@ -145,7 +178,12 @@ func drainQueue(
 		fmt.Printf("Claimed task %s (kind=%s, recipe=%s, attempt=%d/%d)\n", task.ID, task.Kind, task.Recipe, task.Attempt, task.MaxAttempts)
 
 		if task.Kind == contract.TaskKindFallback {
-			execFallbackTask(ctx, drv, cfg, svcClient, hostLabel, task, claimResp.ResolvedRecipe, approver)
+			if dispatchFallback != nil && dispatchFallback(task, claimResp.ResolvedRecipe) {
+				continue
+			}
+			execFallbackTaskWithOptions(ctx, drv, cfg, svcClient, hostLabel, task, claimResp.ResolvedRecipe, approver, fallbackExecOptions{
+				WrapDriverExec: wrapDriverExec,
+			})
 			continue
 		}
 
@@ -159,7 +197,7 @@ func drainQueue(
 			}, nil)
 			continue
 		}
-		execExtractTask(ctx, drv, cfg, svcClient, hostLabel, task, *claimResp.ResolvedRecipe)
+		execExtractTaskWithWrap(ctx, drv, cfg, svcClient, hostLabel, task, *claimResp.ResolvedRecipe, wrapDriverExec)
 	}
 	if count == 0 && !ws.BrowserConnected {
 		return 0, errors.New(ws.BrowserStatus)
@@ -175,6 +213,19 @@ func execExtractTask(
 	hostLabel string,
 	task contract.Task,
 	recipe contract.Recipe,
+) {
+	execExtractTaskWithWrap(parentCtx, drv, cfg, svcClient, hostLabel, task, recipe, nil)
+}
+
+func execExtractTaskWithWrap(
+	parentCtx context.Context,
+	drv driver.TargetDriver,
+	cfg contract.Config,
+	svcClient *bus.DesktopClient,
+	hostLabel string,
+	task contract.Task,
+	recipe contract.Recipe,
+	wrapDriverExec func(fn func()),
 ) {
 	stepCtx, cancel := context.WithTimeout(parentCtx, 120*time.Second)
 	defer cancel()
@@ -199,7 +250,18 @@ func execExtractTask(
 	}
 
 	for _, step := range recipe.Steps {
-		res, stepErr := execDrv.ExecuteStep(stepCtx, step)
+		var (
+			res     contract.StepResult
+			stepErr error
+		)
+		runStep := func() {
+			res, stepErr = execDrv.ExecuteStep(stepCtx, step)
+		}
+		if wrapDriverExec != nil {
+			wrapDriverExec(runStep)
+		} else {
+			runStep()
+		}
 		if stepErr != nil {
 			cancel()
 			<-hbDone
@@ -259,6 +321,49 @@ func execFallbackTask(
 	resolvedRecipe *contract.Recipe,
 	approver FallbackApprover,
 ) {
+	execFallbackTaskWithOptions(parentCtx, drv, cfg, svcClient, hostLabel, task, resolvedRecipe, approver, fallbackExecOptions{})
+}
+
+type approvalOutcome struct {
+	ok  bool
+	err error
+}
+
+func awaitFallbackApproval(parentCtx context.Context, promptTimeout time.Duration, approver FallbackApprover, plan contract.FallbackPlan) (bool, error) {
+	if promptTimeout <= 0 {
+		promptTimeout = defaultFallbackPromptTimeout
+	}
+	pctx, cancel := context.WithTimeout(parentCtx, promptTimeout)
+	defer cancel()
+
+	resCh := make(chan approvalOutcome, 1)
+	go func() {
+		ok, err := approver(plan)
+		resCh <- approvalOutcome{ok: ok, err: err}
+	}()
+
+	select {
+	case out := <-resCh:
+		return out.ok, out.err
+	case <-pctx.Done():
+		if parentCtx.Err() != nil {
+			return false, parentCtx.Err()
+		}
+		return false, fmt.Errorf("approval prompt timed out after %s", promptTimeout)
+	}
+}
+
+func execFallbackTaskWithOptions(
+	parentCtx context.Context,
+	drv driver.TargetDriver,
+	cfg contract.Config,
+	svcClient *bus.DesktopClient,
+	hostLabel string,
+	task contract.Task,
+	resolvedRecipe *contract.Recipe,
+	approver FallbackApprover,
+	opts fallbackExecOptions,
+) {
 	if task.FallbackPlan == nil {
 		_, _, _ = svcClient.FailTask(parentCtx, task.ID, contract.FailReportMetadata{
 			From:      hostLabel,
@@ -285,11 +390,51 @@ func execFallbackTask(
 		return
 	}
 
-	if approver == nil {
-		approver = makeFallbackApprover(cfg.NormalizedFallbackGate())
+	// Start task lease heartbeat BEFORE blocking on human prompt approval so DefaultLease (90s)
+	// never expires a MaxAttempts=1 fallback_task into dead_letter while awaiting confirmation.
+	hbInterval := opts.HeartbeatInterval
+	if hbInterval <= 0 {
+		hbInterval = defaultTaskHeartbeatInterval
 	}
-	ok, aerr := approver(plan)
+	hbCtx, cancelHB := context.WithCancel(parentCtx)
+	hbDone := startTaskHeartbeatInterval(hbCtx, svcClient, task.ID, hostLabel, hbInterval)
+	var stopOnce sync.Once
+	stopHB := func() {
+		stopOnce.Do(func() {
+			cancelHB()
+			<-hbDone
+		})
+	}
+	defer stopHB()
+
+	promptTimeout := opts.PromptTimeout
+	if promptTimeout <= 0 {
+		promptTimeout = defaultFallbackPromptTimeout
+	}
+
+	var (
+		ok   bool
+		aerr error
+	)
+	runPrompt := func() {
+		if approver != nil {
+			ok, aerr = awaitFallbackApproval(parentCtx, promptTimeout, approver, plan)
+		} else if strings.EqualFold(cfg.NormalizedFallbackGate(), "tray") {
+			ok, aerr = confirmFallbackPlanWithTimeout(parentCtx, promptTimeout, plan)
+		} else {
+			ok = true
+		}
+	}
+	if opts.WrapPrompt != nil {
+		opts.WrapPrompt(runPrompt)
+	} else {
+		runPrompt()
+	}
+
 	if aerr != nil || !ok {
+		if parentCtx.Err() != nil {
+			return
+		}
 		reason := "fallback declined by desktop fallback-gate=tray"
 		if aerr != nil {
 			reason += ": " + aerr.Error()
@@ -305,9 +450,10 @@ func execFallbackTask(
 		return
 	}
 
-	stepCtx, cancel := context.WithTimeout(parentCtx, 60*time.Second)
-	defer cancel()
-	hbDone := startTaskHeartbeat(stepCtx, svcClient, task.ID, hostLabel)
+	stepTimeout := opts.StepTimeout
+	if stepTimeout <= 0 {
+		stepTimeout = defaultFallbackStepTimeout
+	}
 
 	var step contract.Step
 	if resolvedRecipe != nil && len(resolvedRecipe.Steps) > 0 {
@@ -322,9 +468,20 @@ func execFallbackTask(
 		step = contract.Step{ID: plan.StepID, URL: plan.TargetURL}
 	}
 
-	fbRes, ferr := drv.ExecuteFallback(stepCtx, step, plan)
-	cancel()
-	<-hbDone
+	var (
+		fbRes driver.FallbackExecResult
+		ferr  error
+	)
+	runFallback := func() {
+		stepCtx, stepCancel := context.WithTimeout(parentCtx, stepTimeout)
+		defer stepCancel()
+		fbRes, ferr = drv.ExecuteFallback(stepCtx, step, plan)
+	}
+	if opts.WrapDriverExec != nil {
+		opts.WrapDriverExec(runFallback)
+	} else {
+		runFallback()
+	}
 
 	if ferr != nil {
 		_, _, _ = svcClient.FailTask(parentCtx, task.ID, contract.FailReportMetadata{
@@ -385,14 +542,25 @@ func execFallbackTask(
 		fmt.Fprintf(os.Stderr, "Fallback task %s upload failed: %v\n", task.ID, serr)
 		return
 	}
+	if dropID == "" && propID == "" {
+		fmt.Printf("Submitted fallback snapshot for %s (async healing queued)\n", task.ID)
+		return
+	}
 	fmt.Printf("Submitted fallback snapshot for %s (drop=%s, proposal=%s)\n", task.ID, dropID, propID)
 }
 
 func startTaskHeartbeat(ctx context.Context, svcClient *bus.DesktopClient, taskID string, hostLabel string) <-chan struct{} {
+	return startTaskHeartbeatInterval(ctx, svcClient, taskID, hostLabel, defaultTaskHeartbeatInterval)
+}
+
+func startTaskHeartbeatInterval(ctx context.Context, svcClient *bus.DesktopClient, taskID string, hostLabel string, interval time.Duration) <-chan struct{} {
+	if interval <= 0 {
+		interval = defaultTaskHeartbeatInterval
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -419,6 +587,20 @@ func runTraySyncStep(
 	approver FallbackApprover,
 	onNewerVersion func(remoteVer string) bool,
 ) (drained int, updated bool, err error) {
+	return runTraySyncStepWithDispatcher(ctx, drv, cfg, svcClient, hostLabel, approver, onNewerVersion, nil, nil)
+}
+
+func runTraySyncStepWithDispatcher(
+	ctx context.Context,
+	drv driver.TargetDriver,
+	cfg contract.Config,
+	svcClient *bus.DesktopClient,
+	hostLabel string,
+	approver FallbackApprover,
+	onNewerVersion func(remoteVer string) bool,
+	dispatchFallback FallbackDispatcher,
+	wrapDriverExec func(fn func()),
+) (drained int, updated bool, err error) {
 	remoteStatus, serr := svcClient.GetDesktopStatus(ctx)
 	if serr != nil {
 		if bus.IsRelayTransientError(serr) {
@@ -430,7 +612,7 @@ func runTraySyncStep(
 		}
 	}
 
-	drained, derr := drainQueue(ctx, drv, cfg, svcClient, hostLabel, 0, false, approver)
+	drained, derr := drainQueueWithDispatcher(ctx, drv, cfg, svcClient, hostLabel, 0, false, approver, dispatchFallback, wrapDriverExec)
 	return drained, false, derr
 }
 

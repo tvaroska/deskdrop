@@ -5,7 +5,9 @@ invariants:
   - "eval_js is disallowed in Recipe schemas (strict unknown-field rejection)"
   - "Happy-path extraction emits zero screenshots, zero HTML dumps, zero AXTree dumps, and zero LLM tokens"
   - "Unapproved recipes or ad-hoc URLs outside RECIPES_URI return HTTP 403"
-  - "Declarative pagination executes at most 20 pages, remains on the step's allowlisted domain, and halts when Next is disabled or yields zero new items/rows"
+  - "Declarative pagination (mode=click or mode=scroll with scroll_delta_y in 1..5000) executes at most 20 pages, remains on the step's allowlisted domain, and halts when Next is disabled, items.limit is reached, or advancing yields zero new items/rows"
+  - "SELECTOR_DRIFT healing runs asynchronously on a bounded, detached server worker queue deduplicated by (task_id, diagnostic_id) so 30s client HTTP timeouts never cancel Vertex AI healing mid-flight"
+  - "Drop item diffing (/v1/drops/{id}/diff) guards top-N chronological windows against false removals by classifying an absent baseline item as removed only when above the oldest surviving dedupe_by ID in the current window or when len(items) < limit"
   - "Exception-route and UIA AXNode trees redact password and editable input values to [REDACTED] and flag unlabelled <canvas>/WebGL blind spots"
   - "Login, /sorry/, CAPTCHA, and challenge redirects fail closed into AUTH_EXPIRED (paused_auth domain circuit breaker) without automated bypass attempts"
   - "Tier-2 fallback tasks execute at most 3 safe actions (scroll, wait, click) on the allowlisted domain"
@@ -45,6 +47,14 @@ state_machines:
         ensures:
           - "scrubbed diagnostic zip persisted"
           - "exception healer invoked only when allow_computer_use_fallback == true"
+      - from: failed_diagnostic
+        to: succeeded
+        action: complete_task_async_healer
+        requires:
+          - "async exception healer produced a verified FallbackReport"
+        ensures:
+          - "drop record persisted atomically"
+          - "parent extraction task completed when completing a Tier-2 fallback_task"
       - from: claimed
         to: dead_letter
         action: fail_task_transient_exhausted

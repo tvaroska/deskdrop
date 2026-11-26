@@ -22,9 +22,12 @@ func (c *Client) runPaginationLoop(
 	initial contract.StepResult,
 	maxText int,
 ) (contract.StepResult, error) {
-	pag := step.Pagination
-	if pag == nil {
+	if step.Pagination == nil {
 		return initial, nil
+	}
+	pag, err := contract.ValidatePaginationRule(step.ID, step.Pagination)
+	if err != nil {
+		return initial, err
 	}
 	acc := initial
 	acc.PagesVisited = 1
@@ -45,19 +48,35 @@ func (c *Client) runPaginationLoop(
 		return acc, errors.New("pagination requires a valid HTTP/HTTPS base domain")
 	}
 
+	mode := pag.NormalizedMode()
+	scrollDeltaY := pag.EffectiveScrollDeltaY()
+	if mode == contract.PaginationModeScroll && scrollDeltaY > contract.MaxPaginationScrollDelta {
+		return acc, fmt.Errorf("pagination scroll_delta_y %d exceeds maximum %d", scrollDeltaY, contract.MaxPaginationScrollDelta)
+	}
 	clickNextExpr := buildClickNextIfEnabledJS(pag.NextSelector)
+	scrollExpr := fmt.Sprintf("(() => { window.scrollBy(0, %d); return true; })()", scrollDeltaY)
 	extractExpr := buildDeclarativeExtractJS(step, maxText)
 
 	for pageIdx := 2; pageIdx <= pag.MaxPages; pageIdx++ {
 		if _, err := c.verifyAllowedSessionURL(sctx, sessionID, step, "", allowedDomains, "pagination"); err != nil {
 			return acc, err
 		}
-		var clickRes nextClickState
-		if err := c.EvalJSON(sctx, sessionID, clickNextExpr, &clickRes); err != nil {
-			return acc, fmt.Errorf("pagination click %q on page %d failed: %w", pag.NextSelector, pageIdx, err)
-		}
-		if !clickRes.Clicked {
-			break
+		if mode == contract.PaginationModeScroll {
+			var scrolled bool
+			if err := c.EvalJSON(sctx, sessionID, scrollExpr, &scrolled); err != nil {
+				return acc, fmt.Errorf("pagination scroll (%dpx) on page %d failed: %w", scrollDeltaY, pageIdx, err)
+			}
+			if !scrolled {
+				break
+			}
+		} else {
+			var clickRes nextClickState
+			if err := c.EvalJSON(sctx, sessionID, clickNextExpr, &clickRes); err != nil {
+				return acc, fmt.Errorf("pagination click %q on page %d failed: %w", pag.NextSelector, pageIdx, err)
+			}
+			if !clickRes.Clicked {
+				break
+			}
 		}
 
 		waitMs := pag.EffectiveWaitMs()

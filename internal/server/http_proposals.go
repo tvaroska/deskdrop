@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/tvaroska/deskdrop/internal/contract"
 )
@@ -142,13 +143,25 @@ func (s *Service) handleSubmitError(w http.ResponseWriter, r *http.Request) {
 		alertSent = true
 	}
 
-	var proposalID string
-	var fallbackDropID string
+	healQueued := false
 	if triage.Code == contract.ErrorCodeSelectorDrift && triage.Action == contract.TriageDiagnosticEscalation && s.healer != nil && zdata.DOMHTML != "" && meta.Recipe != "" {
 		if rcp, ok, _ := s.catalog.Get(r.Context(), meta.Recipe); ok && rcp.AllowsComputerUseFallback() {
-			outcome := s.runDriftHealer(r.Context(), contract.Task{Recipe: rcp.Name, NotifyTo: to, Domain: triage.Domain}, rcp, meta.StepID, meta.LandedURL, meta.Error, diagID, zdata.DOMHTML, zdata.AXTreeText, zdata.ScreenshotPNG, false)
-			proposalID = outcome.ProposalID
-			fallbackDropID = outcome.DropID
+			queued, deduped := s.enqueueDriftHeal(driftHealJob{
+				Task:          contract.Task{Recipe: rcp.Name, NotifyTo: to, Domain: triage.Domain},
+				Recipe:        rcp,
+				StepID:        meta.StepID,
+				LandedURL:     meta.LandedURL,
+				ErrMsg:        meta.Error,
+				DiagID:        diagID,
+				DOMHTML:       zdata.DOMHTML,
+				AXTreeText:    zdata.AXTreeText,
+				ScreenshotPNG: zdata.ScreenshotPNG,
+				AllowTier2:    false,
+			})
+			healQueued = queued || deduped
+			if !queued && !deduped {
+				logServerError("DRIFT_HEALER", fmt.Sprintf("recipe=%q diag=%q err=%q", rcp.Name, diagID, "healer queue full"))
+			}
 		}
 	}
 
@@ -157,8 +170,9 @@ func (s *Service) handleSubmitError(w http.ResponseWriter, r *http.Request) {
 		"triage":           triage,
 		"diagnostic_id":    diagID,
 		"alert_sent":       alertSent,
-		"proposal_id":      proposalID,
-		"fallback_drop_id": fallbackDropID,
+		"healing_queued":   healQueued,
+		"proposal_id":      "",
+		"fallback_drop_id": "",
 	})
 }
 
@@ -257,14 +271,26 @@ func (s *Service) handleFailTask(w http.ResponseWriter, r *http.Request) {
 		s.emitTriageBusAlert(r.Context(), host, notify, meta.Topic, triage, meta.Error, diagID, id)
 	}
 
-	var healOut driftHealSummary
+	healQueued := false
 	if triage.Code == contract.ErrorCodeSelectorDrift && triage.Action == contract.TriageDiagnosticEscalation && s.healer != nil && zdata.DOMHTML != "" {
 		rcp, rerr := s.catalog.ValidateAndResolveTask(r.Context(), task.Recipe, task.CustomRecipe, task.Vars)
 		if rerr == nil && rcp.AllowsComputerUseFallback() {
 			allowTier2 := task.Kind != contract.TaskKindFallback
-			healOut = s.runDriftHealer(r.Context(), updated, rcp, meta.StepID, meta.LandedURL, meta.Error, diagID, zdata.DOMHTML, zdata.AXTreeText, zdata.ScreenshotPNG, allowTier2)
-			if refreshed, gerr := s.store.GetTask(r.Context(), id); gerr == nil {
-				updated = refreshed
+			queued, deduped := s.enqueueDriftHeal(driftHealJob{
+				Task:          updated,
+				Recipe:        rcp,
+				StepID:        meta.StepID,
+				LandedURL:     meta.LandedURL,
+				ErrMsg:        meta.Error,
+				DiagID:        diagID,
+				DOMHTML:       zdata.DOMHTML,
+				AXTreeText:    zdata.AXTreeText,
+				ScreenshotPNG: zdata.ScreenshotPNG,
+				AllowTier2:    allowTier2,
+			})
+			healQueued = queued || deduped
+			if !queued && !deduped {
+				logServerError("DRIFT_HEALER", fmt.Sprintf("recipe=%q task=%q diag=%q err=%q", rcp.Name, id, diagID, "healer queue full"))
 			}
 		}
 	}
@@ -274,14 +300,16 @@ func (s *Service) handleFailTask(w http.ResponseWriter, r *http.Request) {
 		"task":             updated,
 		"triage":           triage,
 		"diagnostic_id":    diagID,
-		"proposal_id":      healOut.ProposalID,
-		"fallback_task_id": healOut.FallbackTaskID,
-		"fallback_drop_id": healOut.DropID,
+		"healing_queued":   healQueued,
+		"proposal_id":      "",
+		"fallback_task_id": "",
+		"fallback_drop_id": "",
 	})
 }
 
 // handleFallbackResult ingests fresh scrubbed dom.html + screenshot.png returned by a Tier-2
-// bounded fallback task and triggers Tier-1 offline extraction + verified proposal drafting.
+// bounded fallback task, closes the claimed lease immediately to failed_diagnostic so background
+// healing cannot race with lease expiry, and dispatches Tier-1 offline extraction + proposal drafting asynchronously.
 func (s *Service) handleFallbackResult(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	task, err := s.store.GetTask(r.Context(), id)
@@ -340,47 +368,177 @@ func (s *Service) handleFallbackResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var healOut driftHealSummary
-	if s.healer != nil {
+	host := meta.From
+	if host == "" {
+		host = task.ClaimedBy
+	}
+
+	canHeal := false
+	var resolvedRcp contract.Recipe
+	failReason := "fallback snapshot did not produce a verified drop"
+	if s.healer == nil {
+		failReason = "exception healer is disabled; fallback snapshot archived for manual triage"
+	} else {
 		rcp, rerr := s.catalog.ValidateAndResolveTask(r.Context(), task.Recipe, task.CustomRecipe, task.Vars)
-		if rerr == nil && rcp.AllowsComputerUseFallback() {
-			healOut = s.runDriftHealer(r.Context(), task, rcp, meta.StepID, meta.LandedURL, meta.Error, diagID, zdata.DOMHTML, zdata.AXTreeText, zdata.ScreenshotPNG, false)
-		} else if rerr != nil {
+		if rerr != nil {
 			logServerError("FALLBACK_RESULT", fmt.Sprintf("task=%s resolve recipe %q failed: %v", id, task.Recipe, rerr))
+			failReason = "fallback snapshot recipe resolution failed: " + rerr.Error()
+		} else if !rcp.AllowsComputerUseFallback() {
+			failReason = "computer_use_fallback disabled by recipe"
+		} else {
+			resolvedRcp = rcp
+			canHeal = true
+			failReason = "tier-2 fallback snapshot pending offline healing"
 		}
 	}
 
-	// Ensure unhealed fallback tasks never remain stuck in claimed state until lease expiry.
-	updated, _ := s.store.GetTask(r.Context(), id)
-	if updated.Status == contract.TaskStatusClaimed {
-		host := meta.From
-		if host == "" {
-			host = task.ClaimedBy
-		}
-		failReason := "fallback snapshot did not produce a verified drop"
-		if healOut.HealErr != "" {
-			failReason = "healer error on fallback snapshot: " + healOut.HealErr
-		} else if s.healer == nil {
-			failReason = "exception healer is disabled; fallback snapshot archived for manual triage"
-		}
-		closed, _, _, ferr := s.store.FailTask(r.Context(), id, host, triage, failReason, diagID)
-		if errors.Is(ferr, ErrConflict) {
-			writeAPIError(w, http.StatusConflict, "TASK_NOT_CLAIMED", "task is no longer in claimed state", nil)
-			return
-		}
-		if ferr != nil {
-			writeAPIError(w, http.StatusInternalServerError, "STORE_ERROR", ferr.Error(), nil)
-			return
-		}
-		updated = closed
+	// Transition out of claimed immediately (clearing LeaseUntil) BEFORE async healing starts
+	// so lease sweeps cannot dead-letter the task while Vertex AI healing is running.
+	updated, _, _, ferr := s.store.FailTask(r.Context(), id, host, triage, failReason, diagID)
+	if errors.Is(ferr, ErrConflict) {
+		writeAPIError(w, http.StatusConflict, "TASK_NOT_CLAIMED", "task is no longer in claimed state", nil)
+		return
 	}
+	if ferr != nil {
+		writeAPIError(w, http.StatusInternalServerError, "STORE_ERROR", ferr.Error(), nil)
+		return
+	}
+
+	healQueued := false
+	if canHeal {
+		queued, deduped := s.enqueueDriftHeal(driftHealJob{
+			Task:             updated,
+			Recipe:           resolvedRcp,
+			StepID:           meta.StepID,
+			LandedURL:        meta.LandedURL,
+			ErrMsg:           meta.Error,
+			DiagID:           diagID,
+			DOMHTML:          zdata.DOMHTML,
+			AXTreeText:       zdata.AXTreeText,
+			ScreenshotPNG:    zdata.ScreenshotPNG,
+			AllowTier2:       false,
+			IsFallbackResult: true,
+		})
+		healQueued = queued || deduped
+		if !queued && !deduped {
+			qReason := "healer queue full; fallback snapshot archived for manual triage"
+			logServerError("DRIFT_HEALER", fmt.Sprintf("recipe=%q task=%q diag=%q err=%q", resolvedRcp.Name, id, diagID, qReason))
+			_ = s.store.UpdateFailedTaskNote(r.Context(), id, qReason)
+			if refreshed, gerr := s.store.GetTask(r.Context(), id); gerr == nil {
+				updated = refreshed
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":               true,
 		"task":             updated,
 		"diagnostic_id":    diagID,
-		"proposal_id":      healOut.ProposalID,
-		"fallback_drop_id": healOut.DropID,
+		"healing_queued":   healQueued,
+		"proposal_id":      "",
+		"fallback_drop_id": "",
 	})
+}
+
+type driftHealJob struct {
+	Task             contract.Task
+	Recipe           contract.Recipe
+	StepID           string
+	LandedURL        string
+	ErrMsg           string
+	DiagID           string
+	DOMHTML          string
+	AXTreeText       string
+	ScreenshotPNG    []byte
+	AllowTier2       bool
+	IsFallbackResult bool
+}
+
+func (s *Service) enqueueDriftHeal(job driftHealJob) (queued bool, deduplicated bool) {
+	dedupeKey := strings.TrimSpace(job.Task.ID) + "|" + strings.TrimSpace(job.DiagID)
+	taskID := strings.TrimSpace(job.Task.ID)
+
+	s.healMu.Lock()
+	defer s.healMu.Unlock()
+
+	if s.healer == nil || s.healClosed {
+		return false, false
+	}
+	if dedupeKey != "|" && s.healSeen[dedupeKey] {
+		return false, true
+	}
+	if taskID != "" && s.healActiveTasks[taskID] {
+		return false, true
+	}
+
+	select {
+	case s.healQueue <- job:
+		if dedupeKey != "|" {
+			s.healSeen[dedupeKey] = true
+			s.healOrder = append(s.healOrder, dedupeKey)
+			if len(s.healOrder) > maxRememberedHealKeys {
+				evict := s.healOrder[0]
+				s.healOrder = s.healOrder[1:]
+				delete(s.healSeen, evict)
+			}
+		}
+		if taskID != "" {
+			s.healActiveTasks[taskID] = true
+		}
+		if s.pendingHeals == 0 {
+			s.healIdleCh = make(chan struct{})
+		}
+		s.pendingHeals++
+		return true, false
+	default:
+		return false, false
+	}
+}
+
+func (s *Service) driftHealWorker() {
+	defer s.healWG.Done()
+	for job := range s.healQueue {
+		s.executeDriftHealJob(job)
+
+		s.healMu.Lock()
+		if taskID := strings.TrimSpace(job.Task.ID); taskID != "" {
+			delete(s.healActiveTasks, taskID)
+		}
+		s.pendingHeals--
+		if s.pendingHeals == 0 && s.healIdleCh != nil {
+			close(s.healIdleCh)
+			s.healIdleCh = nil
+		}
+		s.healMu.Unlock()
+	}
+}
+
+func (s *Service) executeDriftHealJob(job driftHealJob) {
+	hCtx, cancel := context.WithTimeout(s.bgCtx, s.cfg.HealerTimeout)
+	defer cancel()
+
+	out := s.runDriftHealer(
+		hCtx,
+		job.Task,
+		job.Recipe,
+		job.StepID,
+		job.LandedURL,
+		job.ErrMsg,
+		job.DiagID,
+		job.DOMHTML,
+		job.AXTreeText,
+		job.ScreenshotPNG,
+		job.AllowTier2,
+	)
+	if job.IsFallbackResult && out.DropID == "" && job.Task.ID != "" {
+		failReason := "fallback snapshot did not produce a verified drop"
+		if out.HealErr != "" {
+			failReason = "healer error on fallback snapshot: " + out.HealErr
+		}
+		storeCtx, storeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = s.store.UpdateFailedTaskNote(storeCtx, job.Task.ID, failReason)
+		storeCancel()
+	}
 }
 
 type driftHealSummary struct {
@@ -452,6 +610,9 @@ func (s *Service) runDriftHealer(
 			if task.ParentTaskID != "" {
 				_, _ = s.store.CompleteTask(ctx, task.ParentTaskID, rec.ID)
 			}
+		} else {
+			out.HealErr = "drop ingest failed: " + ierr.Error()
+			logServerError("DRIFT_HEALER", fmt.Sprintf("recipe=%q task=%q diag=%q err=%q", rcp.Name, task.ID, diagID, out.HealErr))
 		}
 	} else if res.FallbackPlan != nil && allowTier2 {
 		allowed := contract.InferRecipeDomains(rcp)

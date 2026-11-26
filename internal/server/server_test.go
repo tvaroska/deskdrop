@@ -151,6 +151,7 @@ func TestDriftHealerProposalRequiresHumanApprovalBeforeWriteBack(t *testing.T) {
 		DesktopClientToken: "desk-tok",
 		AgentBusToken:      "agent-tok",
 	}, store, NewMemoryBlobStore(), cat, healer)
+	defer svc.Close()
 
 	// Enqueue & claim task.
 	enqReq := httptest.NewRequest(http.MethodPost, "/v1/tasks", strings.NewReader(`{"recipe":"status-board"}`))
@@ -190,12 +191,19 @@ func TestDriftHealerProposalRequiresHumanApprovalBeforeWriteBack(t *testing.T) {
 	}
 
 	var failResp struct {
-		ProposalID     string `json:"proposal_id"`
-		FallbackDropID string `json:"fallback_drop_id"`
+		HealingQueued bool `json:"healing_queued"`
 	}
 	_ = json.Unmarshal(failW.Body.Bytes(), &failResp)
-	if failResp.ProposalID == "" || failResp.FallbackDropID == "" {
-		t.Fatalf("expected proposal_id and fallback_drop_id, got %+v", failResp)
+	if !failResp.HealingQueued {
+		t.Fatalf("expected healing_queued=true on SELECTOR_DRIFT fail response: %s", failW.Body.String())
+	}
+	if err := svc.WaitHealerIdle(context.Background()); err != nil {
+		t.Fatalf("WaitHealerIdle failed: %v", err)
+	}
+
+	healedTask, err := store.GetTask(context.Background(), enqResp.Task.ID)
+	if err != nil || healedTask.ProposalID == "" || healedTask.DropID == "" || healedTask.Status != contract.TaskStatusSucceeded {
+		t.Fatalf("expected async healer to set ProposalID, DropID, and succeeded status, got %+v err=%v", healedTask, err)
 	}
 
 	// Verify RECIPES_URI has NOT been mutated before human approval!
@@ -205,7 +213,7 @@ func TestDriftHealerProposalRequiresHumanApprovalBeforeWriteBack(t *testing.T) {
 	}
 
 	// Approve proposal -> writes back atomically to RECIPES_URI!
-	appReq := httptest.NewRequest(http.MethodPost, "/v1/proposals/"+failResp.ProposalID+"/approve", strings.NewReader(`{"reviewed_by":"operator"}`))
+	appReq := httptest.NewRequest(http.MethodPost, "/v1/proposals/"+healedTask.ProposalID+"/approve", strings.NewReader(`{"reviewed_by":"operator"}`))
 	appReq.Header.Set("Authorization", "Bearer agent-tok")
 	appW := httptest.NewRecorder()
 	svc.ServeHTTP(appW, appReq)
@@ -990,6 +998,7 @@ func TestS12S13HealerErrorLoggingFallbackCloseAndExactStatusCounts(t *testing.T)
 		AgentBusToken:      "agent-tok",
 		AdminToken:         "admin-tok",
 	}, store, NewMemoryBlobStore(), cat, failingHealer)
+	defer svc.Close()
 
 	makeDOMZip := func() []byte {
 		var zb bytes.Buffer
@@ -1016,6 +1025,9 @@ func TestS12S13HealerErrorLoggingFallbackCloseAndExactStatusCounts(t *testing.T)
 	svc.ServeHTTP(w1, req1)
 	if w1.Code != http.StatusOK {
 		t.Fatalf("fail task with failing healer = %d (%s)", w1.Code, w1.Body.String())
+	}
+	if err := svc.WaitHealerIdle(ctx); err != nil {
+		t.Fatal(err)
 	}
 	if !strings.Contains(errBuf.String(), "DRIFT_HEALER") || !strings.Contains(errBuf.String(), "vertex 429 quota exceeded") {
 		t.Fatalf("expected healer error logged to stderr, got %q", errBuf.String())
@@ -1047,6 +1059,9 @@ func TestS12S13HealerErrorLoggingFallbackCloseAndExactStatusCounts(t *testing.T)
 	if w2.Code != http.StatusOK {
 		t.Fatalf("fallback-result = %d (%s)", w2.Code, w2.Body.String())
 	}
+	if err := svc.WaitHealerIdle(ctx); err != nil {
+		t.Fatal(err)
+	}
 	fbAfter, _ := store.GetTask(ctx, fbTask.ID)
 	if fbAfter.Status != contract.TaskStatusFailedDiagnostic || !strings.Contains(fbAfter.LastError, "vertex 429 quota exceeded") {
 		t.Fatalf("fallback task after healer error = (%q, %q), want failed_diagnostic with healer error", fbAfter.Status, fbAfter.LastError)
@@ -1077,5 +1092,253 @@ func TestS12S13HealerErrorLoggingFallbackCloseAndExactStatusCounts(t *testing.T)
 	}
 	if statusResp.Summary.FailedDiagnosticTasks != 2 {
 		t.Fatalf("/v1/status failed_diagnostic_tasks = %d, want 2", statusResp.Summary.FailedDiagnosticTasks)
+	}
+}
+
+func TestM61AsyncDriftHealerSurvivesCancelledRequestDeduplicatesAndDrains(t *testing.T) {
+	ctx := context.Background()
+	baseRecipe := contract.Recipe{
+		Name:  "youtube-overview",
+		Topic: "creator",
+		Steps: []contract.Step{{
+			ID:     "s1",
+			URL:    "https://studio.example.com/analytics",
+			Fields: map[string]contract.FieldRule{"views": {Selector: ".old-views", Parse: "number"}},
+			Expect: contract.Expectation{RequiredFields: []string{"views"}},
+		}},
+	}
+	healedRecipe := baseRecipe
+	healedRecipe.Steps = []contract.Step{{
+		ID:     "s1",
+		URL:    "https://studio.example.com/analytics",
+		Fields: map[string]contract.FieldRule{"views": {Selector: ".new-views", Parse: "number"}},
+		Expect: contract.Expectation{RequiredFields: []string{"views"}},
+	}}
+
+	var (
+		healerCalls     atomic.Int32
+		healerStartedCh = make(chan struct{}, 4)
+		releaseHealerCh = make(chan struct{})
+		sawCancelledCtx atomic.Bool
+	)
+	slowHealer := &stubHealer{
+		fn: func(hctx context.Context, req HealRequest) (HealResult, error) {
+			healerCalls.Add(1)
+			healerStartedCh <- struct{}{}
+			<-releaseHealerCh
+			if hctx.Err() != nil {
+				sawCancelledCtx.Store(true)
+				return HealResult{}, hctx.Err()
+			}
+			return HealResult{
+				FallbackPlan: &contract.FallbackPlan{
+					AllowedDomain: "studio.example.com",
+					TargetURL:     "https://studio.example.com/analytics",
+					StepID:        "s1",
+					Reason:        "Click Shorts tab",
+					Actions:       []contract.FallbackAction{{Action: "click", Selector: "button.shorts"}},
+				},
+				Proposal: &contract.RecipePatchProposal{
+					RecipeName:     req.Recipe.Name,
+					ProposedRecipe: healedRecipe,
+					Verified:       true,
+					Iterations:     1,
+				},
+			}, nil
+		},
+	}
+
+	store := NewMemoryStore()
+	svc := NewService(ServerConfig{
+		Version:            "v1.5.0",
+		DesktopClientToken: "desk-tok",
+		AgentBusToken:      "agent-tok",
+		HealerTimeout:      5 * time.Second,
+		HealerConcurrency:  1,
+		HealerQueueSize:    8,
+	}, store, NewMemoryBlobStore(), recipes.NewStaticCatalog(baseRecipe), slowHealer)
+	defer svc.Close()
+
+	enq, _, _ := store.EnqueueTask(ctx, contract.EnqueueTaskRequest{Recipe: "youtube-overview", Domain: "studio.example.com"})
+	_, _ = store.ClaimNextTask(ctx, "win-pc", 90*time.Second, nil)
+
+	var zb bytes.Buffer
+	zw := zip.NewWriter(&zb)
+	wh, _ := zw.Create("dom.html")
+	_, _ = wh.Write([]byte(`<html><body><div class="new-views">1200</div></body></html>`))
+	_ = zw.Close()
+
+	var mp bytes.Buffer
+	mw := multipart.NewWriter(&mp)
+	_ = mw.WriteField("payload_json", `{"from":"win-pc","step_id":"s1","landed_url":"https://studio.example.com/analytics","error":"step \"s1\" missing required field \"views\""}`)
+	fw, _ := mw.CreateFormFile("bundle", "debug.zip")
+	_, _ = fw.Write(zb.Bytes())
+	_ = mw.Close()
+
+	// Cancel r.Context() IMMEDIATELY after /fail returns (simulating DesktopClient's 30s HTTP timeout).
+	reqCtx, cancelReq := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/tasks/"+enq.ID+"/fail", &mp).WithContext(reqCtx)
+	req.Header.Set("Authorization", "Bearer desk-tok")
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+
+	startedAt := time.Now()
+	w := httptest.NewRecorder()
+	svc.ServeHTTP(w, req)
+	elapsed := time.Since(startedAt)
+	cancelReq() // HTTP request context is now dead while slowHealer is still blocked!
+
+	if w.Code != http.StatusOK || elapsed > 500*time.Millisecond {
+		t.Fatalf("/fail status=%d elapsed=%s, want 200 immediately (<500ms)", w.Code, elapsed)
+	}
+	var failOut struct {
+		DiagnosticID  string `json:"diagnostic_id"`
+		HealingQueued bool   `json:"healing_queued"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &failOut)
+	if !failOut.HealingQueued || failOut.DiagnosticID == "" {
+		t.Fatalf("expected healing_queued=true and diagnostic_id, got %+v", failOut)
+	}
+
+	// Wait until background worker enters HealDrift, then test (task.ID, diagID) deduplication.
+	<-healerStartedCh
+	queuedDup, deduped := svc.enqueueDriftHeal(driftHealJob{
+		Task:    contract.Task{ID: enq.ID},
+		Recipe:  baseRecipe,
+		DiagID:  failOut.DiagnosticID,
+		DOMHTML: "<html></html>",
+	})
+	if queuedDup || !deduped {
+		t.Fatalf("duplicate (task.ID, diagID) enqueue = (queued=%v, deduped=%v), want (false, true)", queuedDup, deduped)
+	}
+
+	// Release slow healer after r.Context() was already cancelled; Shutdown drains cleanly.
+	close(releaseHealerCh)
+	shutCtx, shutCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer shutCancel()
+	if err := svc.Shutdown(shutCtx); err != nil {
+		t.Fatalf("Shutdown drain failed: %v", err)
+	}
+	if sawCancelledCtx.Load() {
+		t.Fatal("HealDrift context was cancelled by HTTP r.Context()!")
+	}
+	if healerCalls.Load() != 1 {
+		t.Fatalf("healerCalls = %d, want 1 (deduplicated)", healerCalls.Load())
+	}
+
+	afterTask, _ := store.GetTask(ctx, enq.ID)
+	if afterTask.ProposalID == "" {
+		t.Fatalf("expected ProposalID persisted after detached heal, got %+v", afterTask)
+	}
+	pendingTasks, _ := store.ListTasks(ctx, "pending", 10)
+	if len(pendingTasks) != 1 || pendingTasks[0].Kind != contract.TaskKindFallback || pendingTasks[0].ParentTaskID != enq.ID {
+		t.Fatalf("expected Tier-2 fallback_task enqueued asynchronously, got %+v", pendingTasks)
+	}
+}
+
+func TestM72HandleDiffDropEndpointAndQueryOverrides(t *testing.T) {
+	cat := recipes.NewStaticCatalog(contract.Recipe{
+		Name:  "bookmarks-feed",
+		Topic: "bookmarks",
+		Steps: []contract.Step{{
+			ID:  "list",
+			URL: "https://bookmarks.example.com/list",
+			Items: &contract.ItemRule{
+				Container: "article",
+				DedupeBy:  "id",
+				Limit:     4,
+				Fields:    map[string]contract.FieldRule{"id": {Selector: "a"}},
+			},
+		}},
+	})
+	store := NewMemoryStore()
+	svc := NewService(ServerConfig{
+		Version:            "v1.5.0",
+		DesktopClientToken: "desk-tok",
+		AgentBusToken:      "agent-tok",
+	}, store, NewMemoryBlobStore(), cat, nil)
+	defer svc.Close()
+
+	saveDrop := func(recipe, topic string, ids ...string) contract.DropRecord {
+		items := make([]map[string]any, 0, len(ids))
+		for _, id := range ids {
+			items = append(items, map[string]any{"id": id})
+		}
+		rec, _, err := store.SaveDrop(context.Background(), contract.SubmitDropRequest{
+			From: "win-pc",
+			To:   "agent",
+			Report: contract.DropReport{
+				SchemaVersion: "2.0",
+				Recipe:        recipe,
+				Topic:         topic,
+				Steps:         []contract.StepResult{{StepID: "list", URL: "https://bookmarks.example.com/list", Items: items}},
+			},
+		}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rec
+	}
+
+	d1 := saveDrop("bookmarks-feed", "bookmarks", "b4", "b3", "b2", "b1")
+	_ = saveDrop("other-recipe", "other-topic", "x1")
+	// b3 was unbookmarked; b5 & b6 added at top -> top-4 window is [b6, b5, b4, b2] (b1 shifted past #4).
+	d2 := saveDrop("bookmarks-feed", "bookmarks", "b6", "b5", "b4", "b2")
+	d3 := saveDrop("bookmarks-feed", "bookmarks", "b7", "b6", "b5", "b4")
+
+	// 1. Desktop token rejected (403 ScopeAgent).
+	forbReq := httptest.NewRequest(http.MethodGet, "/v1/drops/"+d2.ID+"/diff", nil)
+	forbReq.Header.Set("Authorization", "Bearer desk-tok")
+	forbW := httptest.NewRecorder()
+	svc.ServeHTTP(forbW, forbReq)
+	if forbW.Code != http.StatusForbidden {
+		t.Fatalf("desk-tok GET /diff = %d, want 403", forbW.Code)
+	}
+
+	// 2. Historical drop d2 diffs against its own predecessor d1 (NOT newer d3!), catching b3 removal while ignoring shifted b1.
+	for _, prefix := range []string{"/v1", "/desktop/v1"} {
+		req := httptest.NewRequest(http.MethodGet, prefix+"/drops/"+d2.ID+"/diff", nil)
+		req.Header.Set("Authorization", "Bearer agent-tok")
+		w := httptest.NewRecorder()
+		svc.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s/drops/%s/diff = %d (%s)", prefix, d2.ID, w.Code, w.Body.String())
+		}
+		var diff contract.DropDiff
+		if err := json.Unmarshal(w.Body.Bytes(), &diff); err != nil {
+			t.Fatal(err)
+		}
+		if !diff.HasBaseline || diff.BaselineDropID != d1.ID {
+			t.Fatalf("baseline = %q (has=%v), want %q", diff.BaselineDropID, diff.HasBaseline, d1.ID)
+		}
+		if diff.AddedCount != 2 || diff.RemovedCount != 1 || diff.Removed[0]["id"] != "b3" || diff.WindowShiftedCount != 1 {
+			t.Fatalf("unexpected d2 diff: %+v", diff)
+		}
+	}
+
+	// 3. First drop d1 has HasBaseline=false; invalid limit returns 422; missing drop returns 404.
+	reqFirst := httptest.NewRequest(http.MethodGet, "/v1/drops/"+d1.ShortID+"/diff", nil)
+	reqFirst.Header.Set("Authorization", "Bearer agent-tok")
+	wFirst := httptest.NewRecorder()
+	svc.ServeHTTP(wFirst, reqFirst)
+	var firstDiff contract.DropDiff
+	_ = json.Unmarshal(wFirst.Body.Bytes(), &firstDiff)
+	if wFirst.Code != http.StatusOK || firstDiff.HasBaseline {
+		t.Fatalf("first drop diff = %d %+v, want 200 HasBaseline=false", wFirst.Code, firstDiff)
+	}
+
+	reqBadLim := httptest.NewRequest(http.MethodGet, "/v1/drops/"+d3.ID+"/diff?limit=0", nil)
+	reqBadLim.Header.Set("Authorization", "Bearer agent-tok")
+	wBadLim := httptest.NewRecorder()
+	svc.ServeHTTP(wBadLim, reqBadLim)
+	if wBadLim.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("limit=0 = %d, want 422", wBadLim.Code)
+	}
+
+	reqMissing := httptest.NewRequest(http.MethodGet, "/v1/drops/drop_missing/diff", nil)
+	reqMissing.Header.Set("Authorization", "Bearer agent-tok")
+	wMissing := httptest.NewRecorder()
+	svc.ServeHTTP(wMissing, reqMissing)
+	if wMissing.Code != http.StatusNotFound {
+		t.Fatalf("missing drop = %d, want 404", wMissing.Code)
 	}
 }

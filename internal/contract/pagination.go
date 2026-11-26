@@ -7,12 +7,16 @@ import (
 )
 
 const (
-	DefaultPaginationMaxPages = 3
-	MaxPaginationPages        = 20
-	DefaultPaginationWaitMs   = 600
-	MaxPaginationWaitMs       = 10_000
-	MaxMergedTableRows        = 500
-	maxMergedTables           = 10
+	PaginationModeClick          = "click"
+	PaginationModeScroll         = "scroll"
+	DefaultPaginationMaxPages    = 3
+	MaxPaginationPages           = 20
+	DefaultPaginationWaitMs      = 600
+	MaxPaginationWaitMs          = 10_000
+	DefaultPaginationScrollDelta = 900
+	MaxPaginationScrollDelta     = 5_000
+	MaxMergedTableRows           = 500
+	maxMergedTables              = 10
 )
 
 // IntPtr returns a pointer to v (useful for explicit PaginationRule.WaitMs values such as 0).
@@ -20,13 +24,31 @@ func IntPtr(v int) *int {
 	return &v
 }
 
-// PaginationRule configures bounded declarative multi-page extraction ("Next page" loop) within a Step.
+// PaginationRule configures bounded declarative multi-page extraction ("click" Next control or "scroll" feed) within a Step.
 type PaginationRule struct {
-	NextSelector string `json:"next_selector"`
+	Mode         string `json:"mode,omitempty"`
+	NextSelector string `json:"next_selector,omitempty"`
+	ScrollDeltaY int    `json:"scroll_delta_y,omitempty"`
 	MaxPages     int    `json:"max_pages,omitempty"`
 	WaitMs       *int   `json:"wait_ms,omitempty"`
 	WaitSelector string `json:"wait_selector,omitempty"`
 	StopOnNoNew  *bool  `json:"stop_on_no_new,omitempty"`
+}
+
+// NormalizedMode returns "scroll" when explicitly configured, defaulting to "click".
+func (p PaginationRule) NormalizedMode() string {
+	if strings.EqualFold(strings.TrimSpace(p.Mode), PaginationModeScroll) {
+		return PaginationModeScroll
+	}
+	return PaginationModeClick
+}
+
+// EffectiveScrollDeltaY returns the configured scroll_delta_y in pixels or DefaultPaginationScrollDelta when unset.
+func (p PaginationRule) EffectiveScrollDeltaY() int {
+	if p.ScrollDeltaY <= 0 {
+		return DefaultPaginationScrollDelta
+	}
+	return p.ScrollDeltaY
 }
 
 // EffectiveWaitMs returns the configured wait_ms (allowing explicit 0) or DefaultPaginationWaitMs when omitted.
@@ -37,7 +59,7 @@ func (p PaginationRule) EffectiveWaitMs() int {
 	return *p.WaitMs
 }
 
-// StopWhenNoNew defaults to true so pagination stops immediately when clicking Next produces zero new items/rows.
+// StopWhenNoNew defaults to true so pagination stops immediately when advancing produces zero new items/rows.
 func (p PaginationRule) StopWhenNoNew() bool {
 	if p.StopOnNoNew == nil {
 		return true
@@ -45,16 +67,45 @@ func (p PaginationRule) StopWhenNoNew() bool {
 	return *p.StopOnNoNew
 }
 
+// ValidatePaginationRule resolves defaults and enforces bounds on p without variable substitution.
+func ValidatePaginationRule(stepID string, in *PaginationRule) (*PaginationRule, error) {
+	return resolvePaginationRule(stepID, in, func(s string) string { return s })
+}
+
 func resolvePaginationRule(stepID string, in *PaginationRule, sub func(string) string) (*PaginationRule, error) {
 	if in == nil {
 		return nil, nil
 	}
 	p := *in
+	mode := strings.ToLower(strings.TrimSpace(sub(p.Mode)))
+	if mode == "" {
+		mode = PaginationModeClick
+	}
 	p.NextSelector = strings.TrimSpace(sub(p.NextSelector))
 	p.WaitSelector = strings.TrimSpace(sub(p.WaitSelector))
-	if p.NextSelector == "" {
-		return nil, fmt.Errorf("step %q pagination.next_selector is required", stepID)
+
+	switch mode {
+	case PaginationModeClick:
+		if p.NextSelector == "" {
+			return nil, fmt.Errorf("step %q pagination.next_selector is required", stepID)
+		}
+		if p.ScrollDeltaY != 0 {
+			return nil, fmt.Errorf("step %q pagination.scroll_delta_y requires mode %q", stepID, PaginationModeScroll)
+		}
+	case PaginationModeScroll:
+		if p.NextSelector != "" {
+			return nil, fmt.Errorf("step %q pagination.next_selector must be empty when mode is %q", stepID, PaginationModeScroll)
+		}
+		if p.ScrollDeltaY == 0 {
+			p.ScrollDeltaY = DefaultPaginationScrollDelta
+		}
+		if p.ScrollDeltaY < 1 || p.ScrollDeltaY > MaxPaginationScrollDelta {
+			return nil, fmt.Errorf("step %q pagination.scroll_delta_y must be within 1..%d, got %d", stepID, MaxPaginationScrollDelta, p.ScrollDeltaY)
+		}
+	default:
+		return nil, fmt.Errorf("step %q pagination.mode %q is invalid (expected %q or %q)", stepID, mode, PaginationModeClick, PaginationModeScroll)
 	}
+	p.Mode = mode
 	if p.MaxPages == 0 {
 		p.MaxPages = DefaultPaginationMaxPages
 	}
@@ -201,7 +252,7 @@ func MergePaginatedStepResult(acc StepResult, next StepResult, itemRule *ItemRul
 
 func itemFingerprint(row map[string]any, dedupeField string) string {
 	if dedupeField != "" {
-		if v, ok := row[dedupeField]; ok {
+		if v, ok := row[dedupeField]; ok && v != nil {
 			if s := strings.TrimSpace(fmt.Sprint(v)); s != "" {
 				return "k:" + s
 			}

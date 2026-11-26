@@ -245,6 +245,9 @@ func TestPortableRepoHygieneAndLinks(t *testing.T) {
 		regexp.MustCompile("gemini-" + `4\.0-(pro|carbon|flash)`),
 		regexp.MustCompile("sites-" + "470716"),
 		regexp.MustCompile("1076807" + "043236"),
+		regexp.MustCompile("services-" + "gke"),
+		regexp.MustCompile("DESKTOP-" + "454J6R8"),
+		regexp.MustCompile("session=" + "Boris"),
 	}
 	mdLinkRe := regexp.MustCompile(`\[[^\]]+\]\(([^)\s]+)\)`)
 

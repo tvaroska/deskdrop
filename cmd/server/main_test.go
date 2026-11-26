@@ -91,7 +91,7 @@ func TestBuildServerRuntimeValidationAndWiring(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GCS runtime build failed: %v", err)
 	}
-	defer rtGCS.store.Close()
+	defer rtGCS.Close()
 	if rtGCS.httpSrv.WriteTimeout != 180*time.Second || rtGCS.blobBackend != "gcs" || rtGCS.healerActive {
 		t.Fatalf("unexpected GCS runtime: timeout=%s blob=%s healer=%v", rtGCS.httpSrv.WriteTimeout, rtGCS.blobBackend, rtGCS.healerActive)
 	}
@@ -115,7 +115,7 @@ func TestBuildServerRuntimeValidationAndWiring(t *testing.T) {
 	if err != nil {
 		t.Fatalf("file runtime build failed: %v", err)
 	}
-	defer rtFile.store.Close()
+	defer rtFile.Close()
 	if rtFile.httpSrv.WriteTimeout != 240*time.Second || rtFile.storeBackend != "file" || rtFile.healerActive {
 		t.Fatalf("unexpected file runtime: timeout=%s store=%s healer=%v", rtFile.httpSrv.WriteTimeout, rtFile.storeBackend, rtFile.healerActive)
 	}

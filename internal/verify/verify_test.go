@@ -286,6 +286,58 @@ func TestVerifyRecipeOnHTMLPagesPaginationAndDisabledStop(t *testing.T) {
 	}
 }
 
+func TestM71VerifyRecipeOnHTMLPagesScrollModeVirtualizedFeed(t *testing.T) {
+	// Virtualized scroll snapshots carry NO "Next page" button and recycle earlier DOM cards.
+	viewports := []string{
+		`<!doctype html><html><body>
+			<article class="bm"><a class="id">bm-1</a></article>
+			<article class="bm"><a class="id">bm-2</a></article>
+		</body></html>`,
+		`<!doctype html><html><body>
+			<article class="bm"><a class="id">bm-2</a></article>
+			<article class="bm"><a class="id">bm-3</a></article>
+			<article class="bm"><a class="id">bm-4</a></article>
+		</body></html>`,
+		`<!doctype html><html><body>
+			<article class="bm"><a class="id">bm-3</a></article>
+			<article class="bm"><a class="id">bm-4</a></article>
+		</body></html>`,
+		`<!doctype html><html><body>
+			<article class="bm"><a class="id">bm-5</a></article>
+		</body></html>`,
+	}
+
+	recipe := contract.Recipe{
+		Name:  "scroll-bookmarks",
+		Topic: "bookmarks",
+		Steps: []contract.Step{{
+			ID:  "feed",
+			URL: "https://bookmarks.example.com/list",
+			Items: &contract.ItemRule{
+				Container: "article.bm",
+				DedupeBy:  "id",
+				Limit:     10,
+				Fields:    map[string]contract.FieldRule{"id": {Selector: "a.id"}},
+			},
+			Pagination: &contract.PaginationRule{
+				Mode:         "scroll",
+				ScrollDeltaY: 1000,
+				MaxPages:     5,
+			},
+			Expect: contract.Expectation{MinItems: 4},
+		}},
+	}
+
+	out, err := VerifyRecipeOnHTMLPages(recipe, nil, "feed", viewports, "https://bookmarks.example.com/list")
+	if err != nil || !out.Passed {
+		t.Fatalf("VerifyRecipeOnHTMLPages(scroll) failed: passed=%v err=%v outErr=%s", out.Passed, err, out.Error)
+	}
+	// Viewport 3 yielded 0 new items -> StopWhenNoNew stops at page 3 before viewport 4.
+	if out.StepResult.PagesVisited != 3 || out.ItemCount != 4 {
+		t.Fatalf("PagesVisited=%d ItemCount=%d, want 3 and 4", out.StepResult.PagesVisited, out.ItemCount)
+	}
+}
+
 func TestGoogleScholarProfileRecipeOnScrubbedHTMLAndSorryBlock(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "examples", "recipes", "google-scholar-profile.json"))
 	if err != nil {

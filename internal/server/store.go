@@ -38,6 +38,7 @@ type Store interface {
 	// Structured drops (/v1/drops)
 	SaveDrop(ctx context.Context, req contract.SubmitDropRequest, idempotencyKey string) (contract.DropRecord, bool, error)
 	GetDrop(ctx context.Context, idOrShortID string) (contract.DropRecord, error)
+	GetPriorDrop(ctx context.Context, dropIDOrShortID string, recipe string, topic string) (*contract.DropRecord, error)
 	ListDrops(ctx context.Context, topic string, recipe string, limit int) ([]contract.DropRecord, error)
 
 	// Diagnostic bundles & per-domain auth circuit breakers
@@ -55,6 +56,7 @@ type Store interface {
 	HeartbeatTask(ctx context.Context, taskID string, host string, lease time.Duration) (contract.Task, error)
 	CompleteTask(ctx context.Context, taskID string, dropID string) (contract.Task, error)
 	FailTask(ctx context.Context, taskID string, host string, triage contract.ErrorTriage, errMsg string, diagID string) (contract.Task, contract.DomainBreaker, bool, error)
+	UpdateFailedTaskNote(ctx context.Context, taskID string, errMsg string) error
 	SetTaskProposal(ctx context.Context, taskID string, proposalID string) error
 	GetTask(ctx context.Context, taskID string) (contract.Task, error)
 	ListTasks(ctx context.Context, statusFilter string, limit int) ([]contract.Task, error)

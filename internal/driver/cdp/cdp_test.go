@@ -717,6 +717,137 @@ func TestS8MatchesTabPatternAndMultiProfileDriftPreservation(t *testing.T) {
 	}
 }
 
+func TestM71ScrollPaginationLoopsUntilLimitOrNoNewAndGuardsDomain(t *testing.T) {
+	var (
+		mu          sync.Mutex
+		scrollCalls []string
+		curViewport = 1
+		curURL      = "https://bookmarks.example.com/list"
+	)
+
+	srv := newMockCDPServer(t, func(method string, params map[string]any) (any, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch method {
+		case "Target.getTargets":
+			return map[string]any{"targetInfos": []TargetInfo{}}, nil
+		case "Target.createTarget":
+			return map[string]any{"targetId": "scratch-scroll"}, nil
+		case "Target.attachToTarget":
+			return map[string]any{"sessionId": "sess-scroll"}, nil
+		case "Target.closeTarget":
+			return map[string]any{"success": true}, nil
+		case "Runtime.evaluate":
+			expr, _ := params["expression"].(string)
+			switch {
+			case expr == "document.readyState":
+				return map[string]any{"result": map[string]any{"type": "string", "value": "complete"}}, nil
+			case strings.Contains(expr, "location.href || ''"):
+				return map[string]any{"result": map[string]any{"type": "string", "value": curURL}}, nil
+			case strings.Contains(expr, "window.scrollBy"):
+				scrollCalls = append(scrollCalls, expr)
+				if curViewport < 3 {
+					curViewport++
+				}
+				return map[string]any{"result": map[string]any{"type": "boolean", "value": true}}, nil
+			case strings.Contains(expr, "evalItemRule"):
+				var items []map[string]any
+				switch curViewport {
+				case 1:
+					items = []map[string]any{{"id": "bm-1"}, {"id": "bm-2"}}
+				case 2:
+					// Virtualized feed recycled bm-1 out of DOM and rendered bm-2..bm-4.
+					items = []map[string]any{{"id": "bm-2"}, {"id": "bm-3"}, {"id": "bm-4"}}
+				default:
+					// Recycled bm-2..bm-3 and rendered bm-4..bm-5; subsequent scrolls return same items.
+					items = []map[string]any{{"id": "bm-4"}, {"id": "bm-5"}}
+				}
+				return map[string]any{
+					"result": map[string]any{
+						"type": "object",
+						"value": map[string]any{
+							"title": "Bookmarks",
+							"url":   curURL,
+							"items": items,
+						},
+					},
+				}, nil
+			default:
+				return map[string]any{"result": map[string]any{"type": "boolean", "value": true}}, nil
+			}
+		default:
+			return map[string]any{}, nil
+		}
+	})
+	defer srv.Close()
+
+	client, err := Connect(context.Background(), "ws://"+strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.settleDelay = time.Millisecond
+	defer client.Close()
+
+	// 1. Virtualized scroll deduplicates across viewports and stops on added == 0 (page 4).
+	step := contract.Step{
+		ID:  "bookmarks",
+		URL: "https://bookmarks.example.com/list",
+		Items: &contract.ItemRule{
+			Container: "article.bookmark",
+			DedupeBy:  "id",
+			Limit:     10,
+			Fields:    map[string]contract.FieldRule{"id": {Selector: "a"}},
+		},
+		Pagination: &contract.PaginationRule{
+			Mode:         contract.PaginationModeScroll,
+			ScrollDeltaY: 1200,
+			MaxPages:     6,
+			WaitMs:       contract.IntPtr(1),
+		},
+	}
+	res, err := client.ExecuteStep(context.Background(), step)
+	if err != nil {
+		t.Fatalf("ExecuteStep(scroll) failed: %v", err)
+	}
+	if len(res.Items) != 5 || res.PagesVisited != 4 {
+		t.Fatalf("scroll result: items=%d pagesVisited=%d, want 5 items and 4 pages", len(res.Items), res.PagesVisited)
+	}
+	mu.Lock()
+	gotScrolls := len(scrollCalls)
+	firstExpr := scrollCalls[0]
+	curViewport = 1
+	scrollCalls = nil
+	mu.Unlock()
+	if gotScrolls != 3 || !strings.Contains(firstExpr, "window.scrollBy(0, 1200)") {
+		t.Fatalf("scroll calls = %d (%q), want 3 calls with delta 1200", gotScrolls, firstExpr)
+	}
+
+	// 2. Stops immediately once Items.Limit is reached (page 2 reaches 4 items).
+	stepLimited := step
+	stepLimited.Items = &contract.ItemRule{
+		Container: "article.bookmark",
+		DedupeBy:  "id",
+		Limit:     4,
+		Fields:    map[string]contract.FieldRule{"id": {Selector: "a"}},
+	}
+	resLim, err := client.ExecuteStep(context.Background(), stepLimited)
+	if err != nil {
+		t.Fatalf("ExecuteStep(scroll limit=4) failed: %v", err)
+	}
+	if len(resLim.Items) != 4 || resLim.PagesVisited != 2 {
+		t.Fatalf("limited scroll result: items=%d pagesVisited=%d, want 4 items and 2 pages", len(resLim.Items), resLim.PagesVisited)
+	}
+
+	// 3. Off-domain navigation aborts scroll loop fail-closed.
+	mu.Lock()
+	curViewport = 1
+	curURL = "https://evil.invalid/phish"
+	mu.Unlock()
+	if _, err := client.ExecuteStep(context.Background(), step); err == nil {
+		t.Fatal("expected scroll pagination to fail closed on off-domain URL")
+	}
+}
+
 func newMockCDPServer(t *testing.T, handler func(method string, params map[string]any) (any, error)) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

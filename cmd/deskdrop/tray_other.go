@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -54,4 +55,12 @@ func confirmFallbackPlan(plan contract.FallbackPlan) (bool, error) {
 	}
 	ans := strings.ToLower(strings.TrimSpace(line))
 	return ans == "y" || ans == "yes", nil
+}
+
+func confirmFallbackPlanWithTimeout(ctx context.Context, timeout time.Duration, plan contract.FallbackPlan) (bool, error) {
+	fi, err := os.Stdin.Stat()
+	if err != nil || (fi.Mode()&os.ModeCharDevice) == 0 {
+		return false, nil
+	}
+	return awaitFallbackApproval(ctx, timeout, confirmFallbackPlan, plan)
 }

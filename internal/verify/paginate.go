@@ -54,9 +54,11 @@ func VerifyRecipeOnHTMLPages(recipe contract.Recipe, vars map[string]string, ste
 			if target.Items != nil && target.Items.Limit > 0 && len(acc.Items) >= target.Items.Limit {
 				break
 			}
-			prevDoc, perr := html.Parse(strings.NewReader(htmlPages[pageIdx-2]))
-			if perr != nil || !isNextControlEnabledInHTML(prevDoc, pag.NextSelector) {
-				break
+			if pag.NormalizedMode() != contract.PaginationModeScroll {
+				prevDoc, perr := html.Parse(strings.NewReader(htmlPages[pageIdx-2]))
+				if perr != nil || !isNextControlEnabledInHTML(prevDoc, pag.NextSelector) {
+					break
+				}
 			}
 			pageRes, eerr := ExtractStepFromHTML(*target, htmlPages[pageIdx-1], landedURL)
 			if eerr != nil {

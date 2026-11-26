@@ -780,3 +780,162 @@ func TestT3AirGapAllBuiltinRulesHermeticHomeAndContractSuite(t *testing.T) {
 		t.Fatalf("unexpected semantic item views: %+v", semRes.Items)
 	}
 }
+
+func TestM71ScrollPaginationContractValidation(t *testing.T) {
+	// Default scroll_delta_y (900) and omitted next_selector succeed in scroll mode.
+	rcpDefault, err := ResolveRecipe(Recipe{
+		Name:  "scroll-feed",
+		Topic: "bookmarks",
+		Steps: []Step{{
+			ID:  "feed",
+			URL: "https://example.com/bookmarks",
+			Pagination: &PaginationRule{
+				Mode:     "scroll",
+				MaxPages: 6,
+			},
+		}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("ResolveRecipe(scroll default) failed: %v", err)
+	}
+	pag := rcpDefault.Steps[0].Pagination
+	if pag.NormalizedMode() != PaginationModeScroll || pag.EffectiveScrollDeltaY() != DefaultPaginationScrollDelta {
+		t.Fatalf("resolved scroll pagination = %+v, want mode=scroll delta=%d", pag, DefaultPaginationScrollDelta)
+	}
+
+	// Explicit scroll_delta_y within 1..5000 succeeds.
+	rcpCustom, err := ResolveRecipe(Recipe{
+		Name:  "scroll-custom",
+		Topic: "bookmarks",
+		Steps: []Step{{
+			ID:  "feed",
+			URL: "https://example.com/bookmarks",
+			Pagination: &PaginationRule{
+				Mode:         "SCROLL",
+				ScrollDeltaY: 1400,
+				MaxPages:     5,
+				WaitMs:       IntPtr(250),
+			},
+		}},
+	}, nil)
+	if err != nil || rcpCustom.Steps[0].Pagination.EffectiveScrollDeltaY() != 1400 {
+		t.Fatalf("ResolveRecipe(scroll 1400) = (%+v, %v)", rcpCustom, err)
+	}
+
+	badRules := []*PaginationRule{
+		{Mode: "diagonal", NextSelector: "a.next"},
+		{Mode: "scroll", ScrollDeltaY: -10},
+		{Mode: "scroll", ScrollDeltaY: MaxPaginationScrollDelta + 1},
+		{Mode: "scroll", NextSelector: "button.next", ScrollDeltaY: 800},
+		{Mode: "click", NextSelector: "button.next", ScrollDeltaY: 800},
+		{Mode: "click", NextSelector: ""},
+	}
+	for i, br := range badRules {
+		_, err := ResolveRecipe(Recipe{
+			Name:  "bad-pag",
+			Topic: "t",
+			Steps: []Step{{ID: "s1", URL: "https://example.com", Pagination: br}},
+		}, nil)
+		if err == nil {
+			t.Errorf("badRules[%d] (%+v) unexpectedly passed ResolveRecipe", i, br)
+		}
+	}
+}
+
+func TestM72DiffStepItemsAndComputeDropDiffWindowShiftGuard(t *testing.T) {
+	rcp := &Recipe{
+		Name:  "bookmarks-feed",
+		Topic: "bookmarks",
+		Steps: []Step{{
+			ID:  "list",
+			URL: "https://example.com/bookmarks",
+			Items: &ItemRule{
+				Container: "article",
+				DedupeBy:  "id",
+				Limit:     5,
+				Fields:    map[string]FieldRule{"id": {Selector: "a"}},
+			},
+		}},
+	}
+
+	makeDrop := func(id string, ids ...string) DropRecord {
+		items := make([]map[string]any, 0, len(ids))
+		for _, k := range ids {
+			items = append(items, map[string]any{"id": k})
+		}
+		return DropRecord{
+			ID: id,
+			Report: DropReport{
+				SchemaVersion: "2.0",
+				Recipe:        "bookmarks-feed",
+				Topic:         "bookmarks",
+				Steps:         []StepResult{{StepID: "list", URL: "https://example.com/bookmarks", Items: items}},
+			},
+		}
+	}
+
+	d1 := makeDrop("drop_1", "b5", "b4", "b3", "b2", "b1")
+
+	// 1. First drop without baseline: HasBaseline=false, Added=5, Removed=0.
+	firstDiff := ComputeDropDiff(d1, nil, rcp, "", 0)
+	if firstDiff.HasBaseline || firstDiff.AddedCount != 5 || firstDiff.RemovedCount != 0 {
+		t.Fatalf("firstDiff = %+v, want HasBaseline=false Added=5 Removed=0", firstDiff)
+	}
+
+	// 2. Top-5 window shift: 2 new items push b2 and b1 past #5 -> 0 false removals, 2 shifted out.
+	d2 := makeDrop("drop_2", "b7", "b6", "b5", "b4", "b3")
+	shiftDiff := ComputeDropDiff(d2, &d1, rcp, "", 0)
+	if !shiftDiff.HasBaseline || shiftDiff.BaselineDropID != "drop_1" {
+		t.Fatalf("shiftDiff baseline = %+v", shiftDiff)
+	}
+	if shiftDiff.AddedCount != 2 || shiftDiff.RemovedCount != 0 || shiftDiff.UnchangedCount != 3 || shiftDiff.WindowShiftedCount != 2 {
+		t.Fatalf("shiftDiff counts = added:%d removed:%d unchanged:%d shifted:%d, want 2/0/3/2",
+			shiftDiff.AddedCount, shiftDiff.RemovedCount, shiftDiff.UnchangedCount, shiftDiff.WindowShiftedCount)
+	}
+
+	// 3. Genuine unbookmark inside window + simultaneous tail shift:
+	// b5 (top) was unbookmarked, b7 & b6 added at top -> window is [b7, b6, b4, b3, b2].
+	// b5 (above b2) MUST be Removed; b1 (below b2) MUST be WindowShifted, not Removed!
+	d3 := makeDrop("drop_3", "b7", "b6", "b4", "b3", "b2")
+	mixedDiff := ComputeDropDiff(d3, &d1, rcp, "", 0)
+	if mixedDiff.AddedCount != 2 || mixedDiff.RemovedCount != 1 || mixedDiff.Removed[0]["id"] != "b5" || mixedDiff.WindowShiftedCount != 1 {
+		t.Fatalf("mixedDiff = %+v, want added=2 removed=[b5] shifted=1", mixedDiff)
+	}
+
+	// 4. Full top-5 window turnover (5+ new items displace entire window): 0 false removals, 5 shifted.
+	d4 := makeDrop("drop_4", "b12", "b11", "b10", "b9", "b8")
+	turnoverDiff := ComputeDropDiff(d4, &d1, rcp, "", 0)
+	if turnoverDiff.AddedCount != 5 || turnoverDiff.RemovedCount != 0 || turnoverDiff.WindowShiftedCount != 5 {
+		t.Fatalf("turnoverDiff = %+v, want added=5 removed=0 shifted=5", turnoverDiff)
+	}
+
+	// 5. Short feed (len(curr) < limit=5): tail item removal IS classified as Removed.
+	shortPrev := makeDrop("drop_s1", "b3", "b2", "b1")
+	shortCurr := makeDrop("drop_s2", "b3", "b2")
+	shortDiff := ComputeDropDiff(shortCurr, &shortPrev, rcp, "", 0)
+	if shortDiff.RemovedCount != 1 || shortDiff.Removed[0]["id"] != "b1" || shortDiff.WindowShiftedCount != 0 {
+		t.Fatalf("shortDiff = %+v, want removed=[b1] shifted=0", shortDiff)
+	}
+
+	// 6. Null dedupe_by values fall back per-row instead of colliding as "k:<nil>", and omitted baseline steps surface in Removed.
+	nullDiff := DiffStepItems(
+		[]map[string]any{{"id": nil, "title": "A"}, {"id": nil, "title": "B"}},
+		nil,
+		"id",
+		5,
+	)
+	if len(nullDiff.Added) != 2 {
+		t.Fatalf("null dedupe_by collapsed distinct rows: got %d added, want 2", len(nullDiff.Added))
+	}
+
+	multiPrev := d1
+	multiPrev.Report.Steps = append(multiPrev.Report.Steps, StepResult{
+		StepID: "pinned",
+		URL:    "https://example.com/pinned",
+		Items:  []map[string]any{{"id": "p1"}},
+	})
+	omittedStepDiff := ComputeDropDiff(d1, &multiPrev, rcp, "id", 5)
+	if omittedStepDiff.RemovedCount != 1 || omittedStepDiff.Removed[0]["id"] != "p1" {
+		t.Fatalf("omitted baseline step diff = %+v, want removed=[p1]", omittedStepDiff)
+	}
+}

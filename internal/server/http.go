@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tvaroska/deskdrop/internal/contract"
@@ -23,6 +25,11 @@ const (
 	ScopeDesktop Scope = 1
 	ScopeAgent   Scope = 2
 	ScopeAdmin   Scope = 3
+
+	defaultHealerTimeout     = 120 * time.Second
+	defaultHealerQueueSize   = 32
+	defaultHealerConcurrency = 2
+	maxRememberedHealKeys    = 512
 )
 
 // ServerConfig configures the deskdrop HTTP relay and control plane.
@@ -36,6 +43,9 @@ type ServerConfig struct {
 	ReleaseDir         string
 	ForbiddenTerms     []string
 	DefaultLease       time.Duration
+	HealerTimeout      time.Duration
+	HealerQueueSize    int
+	HealerConcurrency  int
 }
 
 // Service implements HTTP handlers for both /v1/* and /desktop/v1/* (wire-compatible cutover).
@@ -47,6 +57,18 @@ type Service struct {
 	healer     ExceptionHealer
 	httpClient *http.Client
 	mux        *http.ServeMux
+
+	bgCtx           context.Context
+	bgCancel        context.CancelFunc
+	healMu          sync.Mutex
+	healQueue       chan driftHealJob
+	healSeen        map[string]bool
+	healOrder       []string
+	healActiveTasks map[string]bool
+	pendingHeals    int
+	healIdleCh      chan struct{}
+	healClosed      bool
+	healWG          sync.WaitGroup
 }
 
 // NewService constructs a Service wired to Store, BlobStore, Catalog, and optional ExceptionHealer.
@@ -57,23 +79,97 @@ func NewService(cfg ServerConfig, store Store, blobs BlobStore, catalog recipes.
 	if cfg.DefaultLease <= 0 {
 		cfg.DefaultLease = 90 * time.Second
 	}
+	if cfg.HealerTimeout <= 0 {
+		cfg.HealerTimeout = defaultHealerTimeout
+	}
+	if cfg.HealerQueueSize <= 0 {
+		cfg.HealerQueueSize = defaultHealerQueueSize
+	}
+	if cfg.HealerConcurrency <= 0 {
+		cfg.HealerConcurrency = defaultHealerConcurrency
+	}
 	if blobs == nil {
 		blobs = NewMemoryBlobStore()
 	}
 	if catalog == nil {
 		catalog = recipes.NewStaticCatalog()
 	}
+	bgCtx, bgCancel := context.WithCancel(context.Background())
 	s := &Service{
-		cfg:        cfg,
-		store:      store,
-		blobs:      blobs,
-		catalog:    catalog,
-		healer:     healer,
-		httpClient: &http.Client{Timeout: 8 * time.Second},
-		mux:        http.NewServeMux(),
+		cfg:             cfg,
+		store:           store,
+		blobs:           blobs,
+		catalog:         catalog,
+		healer:          healer,
+		httpClient:      &http.Client{Timeout: 8 * time.Second},
+		mux:             http.NewServeMux(),
+		bgCtx:           bgCtx,
+		bgCancel:        bgCancel,
+		healQueue:       make(chan driftHealJob, cfg.HealerQueueSize),
+		healSeen:        make(map[string]bool),
+		healActiveTasks: make(map[string]bool),
 	}
 	s.registerRoutes()
+	if healer != nil {
+		for i := 0; i < cfg.HealerConcurrency; i++ {
+			s.healWG.Add(1)
+			go s.driftHealWorker()
+		}
+	}
 	return s
+}
+
+// WaitHealerIdle blocks until all queued and in-flight asynchronous drift-healing jobs complete or ctx expires.
+func (s *Service) WaitHealerIdle(ctx context.Context) error {
+	for {
+		s.healMu.Lock()
+		if s.pendingHeals == 0 {
+			s.healMu.Unlock()
+			return nil
+		}
+		ch := s.healIdleCh
+		s.healMu.Unlock()
+		if ch == nil {
+			return nil
+		}
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// Shutdown stops accepting new async drift-healing jobs and drains in-flight jobs until ctx expires.
+func (s *Service) Shutdown(ctx context.Context) error {
+	s.healMu.Lock()
+	if !s.healClosed {
+		s.healClosed = true
+		close(s.healQueue)
+	}
+	s.healMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		s.healWG.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		s.bgCancel()
+		return nil
+	case <-ctx.Done():
+		s.bgCancel()
+		return ctx.Err()
+	}
+}
+
+// Close shuts down background service workers with a bounded 5s drain window.
+func (s *Service) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return s.Shutdown(ctx)
 }
 
 type requestMetaWriter struct {
@@ -127,6 +223,7 @@ func (s *Service) registerRoutes() {
 	// Agent & control-plane scope
 	s.handleDual("GET", "/drops", s.withScope(ScopeAgent, s.handleListDrops))
 	s.handleDual("GET", "/drops/{id}", s.withScope(ScopeAgent, s.handleGetDrop))
+	s.handleDual("GET", "/drops/{id}/diff", s.withScope(ScopeAgent, s.handleDiffDrop))
 	s.handleDual("POST", "/tasks", s.withScope(ScopeAgent, s.handleEnqueueTask))
 	s.handleDual("GET", "/tasks", s.withScope(ScopeAgent, s.handleListTasks))
 	s.handleDual("GET", "/tasks/{id}", s.withScope(ScopeAgent, s.handleGetTask))
@@ -400,6 +497,61 @@ func (s *Service) handleGetDrop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, rec)
+}
+
+func (s *Service) handleDiffDrop(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	curr, err := s.store.GetDrop(ctx, r.PathValue("id"))
+	if errors.Is(err, ErrNotFound) {
+		writeAPIError(w, http.StatusNotFound, "NOT_FOUND", "drop not found", nil)
+		return
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "STORE_ERROR", err.Error(), nil)
+		return
+	}
+
+	limitOverride := 0
+	if rawLimit := strings.TrimSpace(r.URL.Query().Get("limit")); rawLimit != "" {
+		n, perr := strconv.Atoi(rawLimit)
+		if perr != nil || n < 1 || n > 500 {
+			writeAPIError(w, http.StatusUnprocessableEntity, string(contract.ErrorCodeContractInvalid), "limit must be an integer within 1..500", nil)
+			return
+		}
+		limitOverride = n
+	}
+
+	var prev *contract.DropRecord
+	if against := strings.TrimSpace(r.URL.Query().Get("against")); against != "" {
+		base, berr := s.store.GetDrop(ctx, against)
+		if errors.Is(berr, ErrNotFound) {
+			writeAPIError(w, http.StatusNotFound, "NOT_FOUND", "baseline drop not found", nil)
+			return
+		}
+		if berr != nil {
+			writeAPIError(w, http.StatusInternalServerError, "STORE_ERROR", berr.Error(), nil)
+			return
+		}
+		prev = &base
+	} else {
+		p, perr := s.store.GetPriorDrop(ctx, curr.ID, curr.Report.Recipe, curr.Report.Topic)
+		if perr != nil {
+			writeAPIError(w, http.StatusInternalServerError, "STORE_ERROR", perr.Error(), nil)
+			return
+		}
+		prev = p
+	}
+
+	var rcpPtr *contract.Recipe
+	if s.catalog != nil && strings.TrimSpace(curr.Report.Recipe) != "" {
+		if rcp, ok, _ := s.catalog.Get(ctx, curr.Report.Recipe); ok {
+			rcpPtr = &rcp
+		}
+	}
+
+	dedupeOverride := strings.TrimSpace(r.URL.Query().Get("dedupe_by"))
+	diff := contract.ComputeDropDiff(curr, prev, rcpPtr, dedupeOverride, limitOverride)
+	writeJSON(w, http.StatusOK, diff)
 }
 
 func (s *Service) handleEnqueueTask(w http.ResponseWriter, r *http.Request) {

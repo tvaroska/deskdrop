@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: DeskDrop Control Plane API
-  version: 1.4.0
+  version: 1.5.0
   description: >-
     Wire-compatible relay API exposed identically under /v1/* and /desktop/v1/*.
     Backed by an atomic JSON FileStore and hot-reloadable RECIPES_URI catalog.
@@ -66,9 +66,10 @@ components:
             $ref: "#/components/schemas/FieldRule"
     PaginationRule:
       type: object
-      required: [next_selector]
       properties:
-        next_selector: { type: string }
+        mode: { type: string, enum: [click, scroll], default: click }
+        next_selector: { type: string, description: "Required when mode is click; must be omitted when mode is scroll." }
+        scroll_delta_y: { type: integer, minimum: 1, maximum: 5000, default: 900, description: "Vertical scroll delta in pixels when mode is scroll." }
         max_pages: { type: integer, minimum: 1, maximum: 20, default: 3 }
         wait_ms: { type: integer, minimum: 0, maximum: 10000, default: 600 }
         wait_selector: { type: string }
@@ -192,6 +193,35 @@ components:
         idempotency_key: { type: string }
         report: { $ref: "#/components/schemas/DropReport" }
         received_at_utc: { type: string }
+    StepItemDiff:
+      type: object
+      required: [step_id, window_truncated, added, removed, unchanged_count, window_shifted_count]
+      properties:
+        step_id: { type: string }
+        dedupe_by: { type: string }
+        limit: { type: integer }
+        window_truncated: { type: boolean }
+        added: { type: array, items: { type: object, additionalProperties: true } }
+        removed: { type: array, items: { type: object, additionalProperties: true } }
+        unchanged_count: { type: integer }
+        window_shifted_count: { type: integer }
+    DropDiff:
+      type: object
+      required: [ok, drop_id, has_baseline, recipe, topic, added, removed, added_count, removed_count, unchanged_count, window_shifted_count, steps]
+      properties:
+        ok: { type: boolean }
+        drop_id: { type: string }
+        baseline_drop_id: { type: string }
+        has_baseline: { type: boolean }
+        recipe: { type: string }
+        topic: { type: string }
+        added: { type: array, items: { type: object, additionalProperties: true } }
+        removed: { type: array, items: { type: object, additionalProperties: true } }
+        added_count: { type: integer }
+        removed_count: { type: integer }
+        unchanged_count: { type: integer }
+        window_shifted_count: { type: integer }
+        steps: { type: array, items: { $ref: "#/components/schemas/StepItemDiff" } }
     FallbackAction:
       type: object
       required: [action]
@@ -503,6 +533,7 @@ paths:
                 bundle: { type: string, format: binary }
       responses:
         "201": { description: Triaged and persisted }
+        "400": { description: Invalid JSON or multipart request }
         "422": { description: Validation, zip bounds, or air-gap violation }
   /v1/tasks:
     post:
@@ -629,6 +660,7 @@ paths:
                 bundle: { type: string, format: binary }
       responses:
         "200": { description: Triaged }
+        "400": { description: Invalid JSON or multipart request }
         "404": { description: Task not found }
         "409": { description: Task not claimed or owner mismatch }
         "422": { description: Validation, zip bounds, or air-gap violation }
@@ -649,10 +681,13 @@ paths:
               type: object
               required: [payload_json, bundle]
               properties:
-                payload_json: { type: string }
+                payload_json:
+                  type: string
+                  description: JSON metadata matching FailReportMetadata with optional error field
                 bundle: { type: string, format: binary }
       responses:
         "200": { description: Processed }
+        "400": { description: Invalid JSON or multipart request }
         "404": { description: Task not found }
         "409": { description: Task not claimed }
         "422": { description: Invalid fallback task, bundle, or air-gap violation }
@@ -708,6 +743,35 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/DropRecord" }
         "404": { description: Drop not found }
+  /v1/drops/{id}/diff:
+    get:
+      summary: Deterministically diff a DropRecord's items against its prior drop for (recipe, topic) with top-N window-shift guard
+      security: [{ agentAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: against
+          schema: { type: string }
+          description: Optional explicit baseline drop ID or short ID (defaults to immediately preceding drop for same recipe and topic).
+        - in: query
+          name: dedupe_by
+          schema: { type: string }
+          description: Optional item key override (defaults to recipe step items.dedupe_by or canonical JSON).
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500 }
+          description: Optional top-N window limit override (defaults to recipe step items.limit or 50).
+      responses:
+        "200":
+          description: Deterministic item diff
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DropDiff" }
+        "404": { description: Drop or baseline drop not found }
+        "422": { description: Invalid query parameter }
   /v1/diagnostics:
     get:
       summary: List stored failure diagnostic bundle metadata

@@ -527,3 +527,300 @@ func TestS11S13T7ConfigCommentsAtomicSaveAndCLINegativePaths(t *testing.T) {
 		t.Fatalf("cmdRecipes X-DeskDrop-Version = %q, want %q", v, version)
 	}
 }
+
+func TestM62FallbackTaskHeartbeatsBeforeSlowApprovalAndAutoDeclinesOnTimeout(t *testing.T) {
+	var (
+		heartbeatsBeforeApprove atomic.Int32
+		heartbeatCh             = make(chan struct{}, 16)
+		completed               atomic.Bool
+		failedCode              atomic.Value
+		failedMsg               atomic.Value
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			select {
+			case heartbeatCh <- struct{}{}:
+			default:
+			}
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case strings.HasSuffix(r.URL.Path, "/complete"):
+			completed.Store(true)
+			_, _ = w.Write([]byte(`{"ok":true,"drop_id":"drop_hb","short_id":"hb1","message_id":"msg_hb"}`))
+		case strings.HasSuffix(r.URL.Path, "/fail"):
+			var meta contract.FailReportMetadata
+			_ = json.NewDecoder(r.Body).Decode(&meta)
+			failedCode.Store(string(meta.ErrorCode))
+			failedMsg.Store(meta.Error)
+			_, _ = w.Write([]byte(`{"ok":true,"triage":{"code":"FALLBACK_DECLINED","action":"diagnostic_escalation"}}`))
+		default:
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}
+	}))
+	defer srv.Close()
+
+	cfg := contract.Config{From: "win-pc", ServiceURL: srv.URL, ServiceToken: "desk-tok", FallbackGate: "tray"}
+	client := bus.NewDesktopClient(cfg)
+	client.RetryBaseDelay = time.Millisecond
+
+	drv := &fakeDriver{
+		fbRes: driver.FallbackExecResult{
+			StepResult: contract.StepResult{StepID: "s1", URL: "https://status.example.com", Fields: map[string]any{"status": "OK"}},
+			ActionsRun: 1,
+		},
+	}
+	rcp := &contract.Recipe{
+		Name:  "status-board",
+		Topic: "ops",
+		Steps: []contract.Step{{
+			ID:     "s1",
+			URL:    "https://status.example.com",
+			Expect: contract.Expectation{RequiredFields: []string{"status"}},
+		}},
+	}
+	task := contract.Task{
+		ID:     "task_slow_prompt",
+		Kind:   contract.TaskKindFallback,
+		Recipe: "status-board",
+		Domain: "status.example.com",
+		FallbackPlan: &contract.FallbackPlan{
+			AllowedDomain: "status.example.com",
+			TargetURL:     "https://status.example.com",
+			StepID:        "s1",
+			Reason:        "Click tab",
+			Actions:       []contract.FallbackAction{{Action: "click", Selector: "button.tab"}},
+		},
+	}
+
+	// 1. Slow human approval receives >=2 lease heartbeats BEFORE returning true, then completes cleanly.
+	execFallbackTaskWithOptions(
+		context.Background(),
+		drv,
+		cfg,
+		client,
+		"win-pc",
+		task,
+		rcp,
+		func(_ contract.FallbackPlan) (bool, error) {
+			for i := 0; i < 2; i++ {
+				select {
+				case <-heartbeatCh:
+					heartbeatsBeforeApprove.Add(1)
+				case <-time.After(2 * time.Second):
+					return false, errors.New("timed out waiting for pre-approval heartbeat")
+				}
+			}
+			return true, nil
+		},
+		fallbackExecOptions{
+			HeartbeatInterval: 15 * time.Millisecond,
+			PromptTimeout:     2 * time.Second,
+			StepTimeout:       2 * time.Second,
+		},
+	)
+	if heartbeatsBeforeApprove.Load() < 2 || !completed.Load() || drv.fallbackRuns != 1 {
+		t.Fatalf("pre-approval heartbeats=%d completed=%v runs=%d, want >=2, true, 1",
+			heartbeatsBeforeApprove.Load(), completed.Load(), drv.fallbackRuns)
+	}
+
+	// 2. Unattended prompt auto-declines on PromptTimeout without hanging or running driver actions.
+	blockForever := make(chan struct{})
+	defer close(blockForever)
+	execFallbackTaskWithOptions(
+		context.Background(),
+		drv,
+		cfg,
+		client,
+		"win-pc",
+		task,
+		rcp,
+		func(_ contract.FallbackPlan) (bool, error) {
+			<-blockForever
+			return true, nil
+		},
+		fallbackExecOptions{
+			HeartbeatInterval: 15 * time.Millisecond,
+			PromptTimeout:     45 * time.Millisecond,
+			StepTimeout:       time.Second,
+		},
+	)
+	if drv.fallbackRuns != 1 {
+		t.Fatalf("timed-out prompt must not run ExecuteFallback: runs=%d", drv.fallbackRuns)
+	}
+	gotCode, _ := failedCode.Load().(string)
+	gotMsg, _ := failedMsg.Load().(string)
+	if gotCode != string(contract.ErrorCodeFallbackDeclined) || !strings.Contains(gotMsg, "timed out") {
+		t.Fatalf("timeout fail = (%q, %q), want FALLBACK_DECLINED with timed out reason", gotCode, gotMsg)
+	}
+}
+
+func TestM63TrayCoordinatorNonBlockingFallbackKeepsTickersAndActionsResponsive(t *testing.T) {
+	var (
+		claimedOnce   atomic.Bool
+		statusChecks  atomic.Int32
+		taskHBs       atomic.Int32
+		completedTask = make(chan struct{}, 1)
+		promptEntered = make(chan struct{}, 1)
+		releasePrompt = make(chan bool, 1)
+	)
+
+	rcp := contract.Recipe{
+		Name:  "status-board",
+		Topic: "ops",
+		Steps: []contract.Step{{
+			ID:     "s1",
+			URL:    "https://status.example.com",
+			Expect: contract.Expectation{RequiredFields: []string{"status"}},
+		}},
+	}
+	fbTask := contract.Task{
+		ID:          "task_tray_fb",
+		Kind:        contract.TaskKindFallback,
+		Recipe:      "status-board",
+		Domain:      "status.example.com",
+		Attempt:     1,
+		MaxAttempts: 1,
+		FallbackPlan: &contract.FallbackPlan{
+			AllowedDomain: "status.example.com",
+			TargetURL:     "https://status.example.com",
+			StepID:        "s1",
+			Reason:        "Open tab",
+			Actions:       []contract.FallbackAction{{Action: "wait", WaitMs: 10}},
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/status":
+			statusChecks.Add(1)
+			_, _ = w.Write([]byte(`{"ok":true,"server_version":"v1.4.3"}`))
+		case r.URL.Path == "/v1/tasks/claim":
+			if claimedOnce.CompareAndSwap(false, true) {
+				_ = json.NewEncoder(w).Encode(contract.ClaimTaskResponse{
+					Task:           &fbTask,
+					ResolvedRecipe: &rcp,
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(contract.ClaimTaskResponse{})
+		case strings.HasSuffix(r.URL.Path, "/heartbeat") && strings.Contains(r.URL.Path, "/tasks/"):
+			taskHBs.Add(1)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case strings.HasSuffix(r.URL.Path, "/complete"):
+			select {
+			case completedTask <- struct{}{}:
+			default:
+			}
+			_, _ = w.Write([]byte(`{"ok":true,"drop_id":"drop_tray","short_id":"tr1","message_id":"msg_tr"}`))
+		default:
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}
+	}))
+	defer srv.Close()
+
+	drv := &fakeDriver{
+		name: "cdp",
+		fbRes: driver.FallbackExecResult{
+			StepResult: contract.StepResult{StepID: "s1", URL: "https://status.example.com", Fields: map[string]any{"status": "OK"}},
+			ActionsRun: 1,
+		},
+	}
+
+	coord := newTrayCoordinator("", "", 25*time.Millisecond, "tray", "", nil)
+	coord.probeInterval = 20 * time.Millisecond
+	coord.hbInterval = 15 * time.Millisecond
+	coord.promptTimeout = 2 * time.Second
+	coord.retryBaseDelay = time.Millisecond
+	coord.loadCfgFn = func(_ string) (contract.Config, error) {
+		return contract.Config{
+			From:         "win-pc",
+			ServiceURL:   srv.URL,
+			ServiceToken: "desk-tok",
+			FallbackGate: "tray",
+		}, nil
+	}
+	coord.makeDriverFn = func(_ string, _ *cdp.SessionPool, _ contract.Config) driver.TargetDriver {
+		return drv
+	}
+	coord.approverFactory = func(_ string) FallbackApprover {
+		return func(_ contract.FallbackPlan) (bool, error) {
+			select {
+			case promptEntered <- struct{}{}:
+			default:
+			}
+			ok := <-releasePrompt
+			return ok, nil
+		}
+	}
+
+	var probeTicks atomic.Int32
+	coord.onRefreshStatus = func() {
+		probeTicks.Add(1)
+	}
+
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		coord.workerLoop()
+	}()
+
+	// Wait until the Tier-2 confirmation prompt is actively blocking on its background goroutine.
+	select {
+	case <-promptEntered:
+	case <-time.After(2 * time.Second):
+		close(coord.stopCh)
+		<-loopDone
+		t.Fatal("timed out waiting for async Tier-2 confirmation prompt to start")
+	}
+
+	probesAtPromptStart := probeTicks.Load()
+	statusAtPromptStart := statusChecks.Load()
+
+	// Dispatch menuIDToggleGate over actionCh while the prompt is open — must apply immediately without blocking!
+	coord.actionCh <- trayAction{cmdID: menuIDToggleGate}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_, _, _, gate, _, _ := coord.snapshotState()
+		if gate == "auto" &&
+			probeTicks.Load() >= probesAtPromptStart+2 &&
+			statusChecks.Load() >= statusAtPromptStart+1 &&
+			taskHBs.Load() >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	_, _, _, gateNow, busyNow, _ := coord.snapshotState()
+	if gateNow != "auto" {
+		t.Fatalf("actionCh blocked while Tier-2 prompt open: gate=%q, want auto", gateNow)
+	}
+	if !busyNow {
+		t.Fatal("expected tray busy=true while Tier-2 fallback prompt is active")
+	}
+	if probeTicks.Load() < probesAtPromptStart+2 {
+		t.Fatalf("probeTicker froze while Tier-2 prompt open: before=%d after=%d", probesAtPromptStart, probeTicks.Load())
+	}
+	if statusChecks.Load() < statusAtPromptStart+1 {
+		t.Fatalf("syncTicker froze while Tier-2 prompt open: before=%d after=%d", statusAtPromptStart, statusChecks.Load())
+	}
+	if taskHBs.Load() < 1 {
+		t.Fatalf("expected >=1 task lease heartbeat while Tier-2 prompt open, got %d", taskHBs.Load())
+	}
+
+	// Approve the open prompt and confirm completion + clean shutdown.
+	releasePrompt <- true
+	select {
+	case <-completedTask:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for approved async Tier-2 fallback to complete")
+	}
+
+	close(coord.stopCh)
+	select {
+	case <-loopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("workerLoop hung on stopCh close")
+	}
+}

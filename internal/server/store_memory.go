@@ -144,15 +144,93 @@ func cloneMessages(in []contract.BusMessage) []contract.BusMessage {
 	return out
 }
 
+func cloneTask(t contract.Task) contract.Task {
+	if t.Vars != nil {
+		t.Vars = cloneStringMap(t.Vars)
+	}
+	if t.FallbackPlan != nil {
+		fp := *t.FallbackPlan
+		fp.Actions = slices.Clone(fp.Actions)
+		t.FallbackPlan = &fp
+	}
+	if t.CustomRecipe != nil {
+		rcp := cloneRecipe(*t.CustomRecipe)
+		t.CustomRecipe = &rcp
+	}
+	t.Attempts = slices.Clone(t.Attempts)
+	return t
+}
+
+func cloneRecipe(r contract.Recipe) contract.Recipe {
+	if r.AllowComputerUseFallback != nil {
+		v := *r.AllowComputerUseFallback
+		r.AllowComputerUseFallback = &v
+	}
+	r.AllowedDomains = slices.Clone(r.AllowedDomains)
+	if r.Defaults != nil {
+		r.Defaults = cloneStringMap(r.Defaults)
+	}
+	if r.Steps != nil {
+		steps := make([]contract.Step, len(r.Steps))
+		for i, s := range r.Steps {
+			if s.Selectors != nil {
+				s.Selectors = cloneStringMap(s.Selectors)
+			}
+			if s.Fields != nil {
+				fields := make(map[string]contract.FieldRule, len(s.Fields))
+				for k, v := range s.Fields {
+					fields[k] = v
+				}
+				s.Fields = fields
+			}
+			if s.Items != nil {
+				it := *s.Items
+				if it.Fields != nil {
+					fields := make(map[string]contract.FieldRule, len(it.Fields))
+					for k, v := range it.Fields {
+						fields[k] = v
+					}
+					it.Fields = fields
+				}
+				s.Items = &it
+			}
+			if s.Pagination != nil {
+				pg := *s.Pagination
+				if pg.WaitMs != nil {
+					w := *pg.WaitMs
+					pg.WaitMs = &w
+				}
+				if pg.StopOnNoNew != nil {
+					st := *pg.StopOnNoNew
+					pg.StopOnNoNew = &st
+				}
+				s.Pagination = &pg
+			}
+			if s.IncludeTables != nil {
+				v := *s.IncludeTables
+				s.IncludeTables = &v
+			}
+			if s.IncludeCards != nil {
+				v := *s.IncludeCards
+				s.IncludeCards = &v
+			}
+			s.Expect.NotURLContains = slices.Clone(s.Expect.NotURLContains)
+			s.Expect.MustContainText = slices.Clone(s.Expect.MustContainText)
+			s.Expect.RequiredFields = slices.Clone(s.Expect.RequiredFields)
+			steps[i] = s
+		}
+		r.Steps = steps
+	}
+	return r
+}
+
 func cloneTasks(in []contract.Task) []contract.Task {
 	if len(in) == 0 {
 		return nil
 	}
 	out := make([]contract.Task, len(in))
 	for i, t := range in {
-		t.Vars = cloneStringMap(t.Vars)
-		t.Attempts = slices.Clone(t.Attempts)
-		out[i] = t
+		out[i] = cloneTask(t)
 	}
 	return out
 }
@@ -372,6 +450,39 @@ func (m *MemoryStore) GetDrop(_ context.Context, idOrShortID string) (contract.D
 	return contract.DropRecord{}, ErrNotFound
 }
 
+func (m *MemoryStore) GetPriorDrop(_ context.Context, dropIDOrShortID string, recipe string, topic string) (*contract.DropRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	needle := strings.TrimSpace(dropIDOrShortID)
+	targetIdx := -1
+	for i := len(m.drops) - 1; i >= 0; i-- {
+		if m.drops[i].ID == needle || m.drops[i].ShortID == needle {
+			targetIdx = i
+			break
+		}
+	}
+	if targetIdx == -1 {
+		return nil, ErrNotFound
+	}
+	rcp := strings.TrimSpace(recipe)
+	if rcp == "" {
+		rcp = m.drops[targetIdx].Report.Recipe
+	}
+	tpc := strings.TrimSpace(topic)
+	if tpc == "" {
+		tpc = m.drops[targetIdx].Report.Topic
+	}
+	for i := targetIdx - 1; i >= 0; i-- {
+		d := m.drops[i]
+		if strings.EqualFold(d.Report.Recipe, rcp) && strings.EqualFold(d.Report.Topic, tpc) {
+			cp := d
+			return &cp, nil
+		}
+	}
+	return nil, nil
+}
+
 func (m *MemoryStore) ListDrops(_ context.Context, topic string, recipe string, limit int) ([]contract.DropRecord, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -481,7 +592,7 @@ func (m *MemoryStore) EnqueueTask(_ context.Context, req contract.EnqueueTaskReq
 	if dedupe != "" {
 		for _, t := range m.tasks {
 			if t.DedupeKey == dedupe && (t.Status == contract.TaskStatusPending || t.Status == contract.TaskStatusClaimed) {
-				return t, true, nil
+				return cloneTask(t), true, nil
 			}
 		}
 	}
@@ -523,9 +634,10 @@ func (m *MemoryStore) EnqueueTask(_ context.Context, req contract.EnqueueTaskReq
 		CreatedAtUTC: now,
 		UpdatedAtUTC: now,
 	}
-	m.tasks = append(m.tasks, task)
+	stored := cloneTask(task)
+	m.tasks = append(m.tasks, stored)
 	m.pruneTasksLocked()
-	return task, false, nil
+	return cloneTask(stored), false, nil
 }
 
 func (m *MemoryStore) pruneTasksLocked() {
@@ -599,7 +711,7 @@ func (m *MemoryStore) ClaimNextTask(_ context.Context, host string, lease time.D
 	t.ClaimedBy = strings.TrimSpace(host)
 	t.LeaseUntil = formatISO(now.Add(lease))
 	t.UpdatedAtUTC = nowStr
-	cp := *t
+	cp := cloneTask(*t)
 	return &cp, nil
 }
 
@@ -623,7 +735,7 @@ func (m *MemoryStore) HeartbeatTask(_ context.Context, taskID string, host strin
 			if reqHost != "" {
 				t.ClaimedBy = reqHost
 			}
-			return *t, nil
+			return cloneTask(*t), nil
 		}
 	}
 	return contract.Task{}, ErrNotFound
@@ -637,7 +749,7 @@ func (m *MemoryStore) CompleteTask(_ context.Context, taskID string, dropID stri
 		t := &m.tasks[i]
 		if t.ID == taskID {
 			if t.Status == contract.TaskStatusSucceeded && t.DropID == dropID {
-				return *t, nil
+				return cloneTask(*t), nil
 			}
 			if t.Status != contract.TaskStatusClaimed && t.Status != contract.TaskStatusFailedDiagnostic {
 				return contract.Task{}, ErrConflict
@@ -645,11 +757,13 @@ func (m *MemoryStore) CompleteTask(_ context.Context, taskID string, dropID stri
 			t.Status = contract.TaskStatusSucceeded
 			t.DropID = dropID
 			t.LeaseUntil = ""
+			t.LastError = ""
+			t.LastCode = ""
 			t.UpdatedAtUTC = nowISO()
 			if t.Domain != "" {
 				delete(m.breakers, t.Domain)
 			}
-			return *t, nil
+			return cloneTask(*t), nil
 		}
 	}
 	return contract.Task{}, ErrNotFound
@@ -742,7 +856,26 @@ func (m *MemoryStore) FailTask(_ context.Context, taskID string, host string, tr
 		}
 	}
 
-	return *t, breaker, newlyAlerted, nil
+	return cloneTask(*t), breaker, newlyAlerted, nil
+}
+
+func (m *MemoryStore) UpdateFailedTaskNote(_ context.Context, taskID string, errMsg string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.tasks {
+		if m.tasks[i].ID == taskID {
+			if m.tasks[i].Status != contract.TaskStatusFailedDiagnostic {
+				return nil
+			}
+			m.tasks[i].LastError = errMsg
+			m.tasks[i].UpdatedAtUTC = nowISO()
+			if n := len(m.tasks[i].Attempts); n > 0 {
+				m.tasks[i].Attempts[n-1].Error = errMsg
+			}
+			return nil
+		}
+	}
+	return ErrNotFound
 }
 
 func (m *MemoryStore) SetTaskProposal(_ context.Context, taskID string, proposalID string) error {
@@ -764,7 +897,7 @@ func (m *MemoryStore) GetTask(_ context.Context, taskID string) (contract.Task, 
 	m.sweepExpiredLeasesLocked(time.Now().UTC())
 	for _, t := range m.tasks {
 		if t.ID == taskID {
-			return t, nil
+			return cloneTask(t), nil
 		}
 	}
 	return contract.Task{}, ErrNotFound
@@ -784,7 +917,7 @@ func (m *MemoryStore) ListTasks(_ context.Context, statusFilter string, limit in
 		if statusFilter != "" && statusFilter != "all" && string(t.Status) != statusFilter {
 			continue
 		}
-		out = append(out, t)
+		out = append(out, cloneTask(t))
 	}
 	return out, nil
 }

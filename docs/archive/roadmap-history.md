@@ -31,7 +31,7 @@ Close the CI production-mode parity and state-evolution gaps identified in the 2
 
 *Archived from [`../roadmap.md`](../roadmap.md) on 2026-11-26.*
 
-- [x] **M2.3 (Live Windows PC verification of `FieldRule.fallback_regex` on `linkedin-analytics` — verified `2026-11-26T15:31:12Z`):** Queued task `task_693aebb2f234b7de` completed on `win-pc` (`v1.4.3`, `session=Boris`) producing `drop_fc52c88259bb7737` (`followers: 2219`) with non-zero per-item `impressions` (`521`, `289`, `322`, `274`, `488`) and `reactions` (`1`, `2`, `5`, `5`, `6`), confirming [`internal/driver/cdp/js_runtime.go`](../../internal/driver/cdp/js_runtime.go), [`internal/verify/verify.go`](../../internal/verify/verify.go), and [`internal/contract/semantic_eval.go`](../../internal/contract/semantic_eval.go) `A-7` parity live against LinkedIn `recent-activity`.
+- [x] **M2.3 (Live Windows PC verification of `FieldRule.fallback_regex` on `linkedin-analytics` — verified `2026-11-26T15:31:12Z`):** Queued task `task_693aebb2f234b7de` completed on the Windows tray worker (`v1.4.3`, `Chrome connected`) producing `drop_fc52c88259bb7737` (`followers: 2219`) with non-zero per-item `impressions` (`521`, `289`, `322`, `274`, `488`) and `reactions` (`1`, `2`, `5`, `5`, `6`), confirming [`internal/driver/cdp/js_runtime.go`](../../internal/driver/cdp/js_runtime.go), [`internal/verify/verify.go`](../../internal/verify/verify.go), and [`internal/contract/semantic_eval.go`](../../internal/contract/semantic_eval.go) `A-7` parity live against LinkedIn `recent-activity`.
 
 ### Review findings track — 2026-11-25 (`M2` security/runtime `P0`–`P1` + `P3` hygiene)
 
@@ -39,7 +39,7 @@ Close the CI production-mode parity and state-evolution gaps identified in the 2
 
 - [x] **A-1 (P0):** Fix domain allowlist and domain-pivot bypasses across `ResolveRecipe`, `InferRecipeDomains`, `ValidateAndResolveTask`, and `healer.go` — `internal/contract/desktop.go:160-231`, `internal/contract/types.go:253-355`, `internal/recipes/catalog.go:302-354`, `internal/healer/healer.go:263-284`. *(Shipped in `v1.4.0`–`v1.4.3`.)*
 - [x] **A-2 (P0):** Fix `SaveRecipe` path traversal, unpinned `ProposedRecipe.Name`, silent reload-fail catalog wipe, and cache poisoning — `internal/recipes/catalog.go:357-414`, `internal/healer/healer.go:257-306`. *(Shipped in `v1.4.0`–`v1.4.3`.)*
-- [x] **S-1 (P0):** Verify SHA-256 on self-update and fail closed on truncated HTTP reads — `cmd/deskdrop/sync.go:405-445`, `internal/bus/service.go:518-530`, `cmd/deskdrop/tray_windows.go:653-679`. *(Shipped in `v1.4.0`–`v1.4.3`; `win-pc` auto-updated to `v1.4.3`.)*
+- [x] **S-1 (P0):** Verify SHA-256 on self-update and fail closed on truncated HTTP reads — `cmd/deskdrop/sync.go:405-445`, `internal/bus/service.go:518-530`, `cmd/deskdrop/tray_windows.go:653-679`. *(Shipped in `v1.4.0`–`v1.4.3`; Windows tray auto-updated to `v1.4.3`.)*
 - [x] **S-2 (P0):** Fail closed on proposal approval (`!exists`, name mismatch, empty resolved domains, and `SaveRecipe`-before-`ReviewProposal` TOCTOU) — `internal/server/http_proposals.go:421-506`. *(Shipped in `v1.4.0`–`v1.4.3`.)*
 - [x] **A-3 (P1):** Replace regex `ScrubHTML` with a stdlib HTML scanner to close redaction bypasses and UTF-8 truncation bugs — `internal/contract/scrub.go:10-38`. *(Shipped in `v1.4.0`–`v1.4.3`.)*
 - [x] **A-4 (P1):** Redact `StaticText` children of sensitive `AXNode` inputs, fix `ParentID`-only drops, and drop dead canvas helper — `internal/contract/axtree.go:63-95,175-328`, `internal/contract/semantic_eval.go:28-53`. *(Shipped in `v1.4.0`–`v1.4.3`.)*
