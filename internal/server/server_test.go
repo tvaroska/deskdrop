@@ -594,9 +594,9 @@ func TestS3DiagnosticZipBoundsDuplicatesAndAirGap(t *testing.T) {
 func TestS4FileStoreRollbackIdempPruningTaskProtectionAndTransitionGuards(t *testing.T) {
 	ctx := context.Background()
 
-	// 1. FileStore rollback on persist failure (read-only directory).
-	dir := t.TempDir()
-	statePath := filepath.Join(dir, "state.json")
+	// 1. FileStore rollback on persist failure (works identically under non-root and uid=0 CI containers).
+	stateDir := filepath.Join(t.TempDir(), "state-dir")
+	statePath := filepath.Join(stateDir, "state.json")
 	fs, err := OpenFileStore(statePath)
 	if err != nil {
 		t.Fatal(err)
@@ -604,17 +604,16 @@ func TestS4FileStoreRollbackIdempPruningTaskProtectionAndTransitionGuards(t *tes
 	if _, _, err := fs.PostMessage(ctx, contract.PostMessageRequest{From: "a", Body: "seed"}, "k0"); err != nil {
 		t.Fatal(err)
 	}
-	// Make directory read-only so atomic temp file creation fails.
-	if err := os.Chmod(dir, 0o500); err != nil {
+	// Remove stateDir so atomic temp-file creation fails with ENOENT even when running as root.
+	if err := os.RemoveAll(stateDir); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = os.Chmod(dir, 0o755) }()
 
 	if _, _, err := fs.PostMessage(ctx, contract.PostMessageRequest{From: "a", Body: "must-rollback"}, "k1"); err == nil {
-		t.Fatal("expected PostMessage to fail in read-only directory")
+		t.Fatal("expected PostMessage to fail when state directory is missing")
 	}
-	// Restore permissions: retrying with same idempotency key k1 must create (not deduplicate a rolled-back entry).
-	if err := os.Chmod(dir, 0o755); err != nil {
+	// Restore directory: retrying with same idempotency key k1 must create (not deduplicate a rolled-back entry).
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	_, created, err := fs.PostMessage(ctx, contract.PostMessageRequest{From: "a", Body: "must-rollback"}, "k1")

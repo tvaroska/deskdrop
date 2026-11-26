@@ -275,7 +275,7 @@ steps:
 
 substitutions:
   _REGION: "us-central1"
-  _VERSION: "v1.4.0"
+  _VERSION: "v1.4.1"
   _TAG: ""
   _PUSH: "auto"
 
