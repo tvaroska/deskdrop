@@ -333,21 +333,18 @@ func (c *ReloadableCatalog) ValidateAndResolveTask(ctx context.Context, recipeNa
 
 	if custom != nil {
 		// Every resolved step URL/domain on a custom recipe must belong to an approved catalog domain.
-		stepDomains := contract.InferRecipeDomains(resolved)
-		if len(approvedDomains) == 0 || len(stepDomains) == 0 {
-			return contract.Recipe{}, fmt.Errorf("%w: ad-hoc custom recipe %q has no approved catalog domain", ErrUnapprovedUseCase, resolved.Name)
+		if err := contract.ValidateRecipeDomains(resolved, approvedDomains, nil); err != nil {
+			return contract.Recipe{}, fmt.Errorf("%w: %v", ErrUnapprovedUseCase, err)
 		}
-		for _, dom := range stepDomains {
-			matched := false
-			for _, allowed := range approvedDomains {
-				if contract.DomainsMatch(dom, allowed) {
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				return contract.Recipe{}, fmt.Errorf("%w: target domain %q is not allowlisted in RECIPES_URI", ErrUnapprovedUseCase, dom)
-			}
+	} else {
+		// Even for registered catalog recipes, post-resolution step domains must remain inside
+		// the base recipe's own approved domains so variable injection cannot pivot hosts.
+		baseDomains := contract.InferRecipeDomains(base)
+		if len(baseDomains) == 0 {
+			baseDomains = approvedDomains
+		}
+		if err := contract.ValidateRecipeDomains(resolved, baseDomains, nil); err != nil {
+			return contract.Recipe{}, fmt.Errorf("%w: %v", ErrUnapprovedUseCase, err)
 		}
 	}
 	return resolved, nil
@@ -355,8 +352,8 @@ func (c *ReloadableCatalog) ValidateAndResolveTask(ctx context.Context, recipeNa
 
 // SaveRecipe atomically updates or inserts a human-approved Recipe back into RECIPES_URI.
 func (c *ReloadableCatalog) SaveRecipe(ctx context.Context, recipe contract.Recipe) error {
-	if strings.TrimSpace(recipe.Name) == "" {
-		return errors.New("recipe.name is required")
+	if err := contract.ValidateRecipeName(recipe.Name); err != nil {
+		return err
 	}
 	if len(recipe.Steps) == 0 {
 		return errors.New("recipe must define at least 1 step")
@@ -366,41 +363,70 @@ func (c *ReloadableCatalog) SaveRecipe(ctx context.Context, recipe contract.Reci
 	defer c.mu.Unlock()
 
 	if c.URI != "" && !c.hasLoaded {
-		_ = c.reloadLocked(ctx, true)
+		if err := c.reloadLocked(ctx, true); err != nil {
+			return fmt.Errorf("reload recipes before save: %w", err)
+		}
 	}
 	key := strings.ToLower(strings.TrimSpace(recipe.Name))
-	c.recipes[key] = recipe
+	next := make(map[string]contract.Recipe, len(c.recipes)+1)
+	for k, v := range c.recipes {
+		next[k] = v
+	}
+	next[key] = recipe
 
 	uri := strings.TrimSpace(c.URI)
 	if uri == "" {
+		c.recipes = next
 		c.hasLoaded = true
 		return nil
 	}
 	if strings.HasPrefix(uri, "gs://") {
-		return c.saveGCSLocked(ctx, uri)
+		if err := c.saveGCSLocked(ctx, uri, next); err != nil {
+			return err
+		}
+		c.recipes = next
+		c.hasLoaded = true
+		return nil
 	}
-	return c.saveLocalLocked(uri, recipe)
+	if err := c.saveLocalLocked(uri, recipe, next); err != nil {
+		return err
+	}
+	c.recipes = next
+	c.hasLoaded = true
+	return nil
 }
 
-func (c *ReloadableCatalog) saveLocalLocked(path string, updated contract.Recipe) error {
+func (c *ReloadableCatalog) saveLocalLocked(path string, updated contract.Recipe, next map[string]contract.Recipe) error {
 	info, statErr := os.Stat(path)
 	if statErr == nil && info.IsDir() {
+		absDir, err := filepath.Abs(path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(absDir, updated.Name+".json")
+		absTarget, err := filepath.Abs(target)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(absDir, absTarget)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.Dir(rel) != "." {
+			return fmt.Errorf("recipe path %q escapes recipes directory", updated.Name)
+		}
 		raw, err := json.MarshalIndent(updated, "", "  ")
 		if err != nil {
 			return err
 		}
 		raw = append(raw, '\n')
-		target := filepath.Join(path, updated.Name+".json")
-		if err := atomicWriteFile(target, raw, 0o600); err != nil {
+		if err := atomicWriteFile(absTarget, raw, 0o600); err != nil {
 			return err
 		}
-		if fi, err := os.Stat(target); err == nil {
+		if fi, err := os.Stat(absTarget); err == nil {
 			c.lastModTime = fi.ModTime()
 		}
 		return nil
 	}
 
-	bundleBytes, err := c.marshalBundleLocked()
+	bundleBytes, err := marshalBundleMap(next)
 	if err != nil {
 		return err
 	}
@@ -413,7 +439,7 @@ func (c *ReloadableCatalog) saveLocalLocked(path string, updated contract.Recipe
 	return nil
 }
 
-func (c *ReloadableCatalog) saveGCSLocked(ctx context.Context, uri string) error {
+func (c *ReloadableCatalog) saveGCSLocked(ctx context.Context, uri string, next map[string]contract.Recipe) error {
 	bucket, obj, err := parseGCSURI(uri)
 	if err != nil {
 		return err
@@ -422,7 +448,7 @@ func (c *ReloadableCatalog) saveGCSLocked(ctx context.Context, uri string) error
 	if err != nil {
 		return err
 	}
-	bundleBytes, err := c.marshalBundleLocked()
+	bundleBytes, err := marshalBundleMap(next)
 	if err != nil {
 		return err
 	}
@@ -456,9 +482,9 @@ func (c *ReloadableCatalog) saveGCSLocked(ctx context.Context, uri string) error
 	return nil
 }
 
-func (c *ReloadableCatalog) marshalBundleLocked() ([]byte, error) {
-	list := make([]contract.Recipe, 0, len(c.recipes))
-	for _, r := range c.recipes {
+func marshalBundleMap(items map[string]contract.Recipe) ([]byte, error) {
+	list := make([]contract.Recipe, 0, len(items))
+	for _, r := range items {
 		list = append(list, r)
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })

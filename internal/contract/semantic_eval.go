@@ -437,7 +437,7 @@ func semNodeText(n *semNode) string {
 			return
 		}
 		nextParent := parentName
-		if cur.name != "" && cur.role != "document" && cur.role != "rootwebarea" && cur.role != "webarea" {
+		if cur.name != "" && cur.name != "[REDACTED]" && cur.role != "document" && cur.role != "rootwebarea" && cur.role != "webarea" {
 			if !strings.EqualFold(cur.name, parentName) {
 				chunks = append(chunks, cur.name)
 			}
@@ -567,18 +567,21 @@ const (
 )
 
 type semAttrCheck struct {
-	name  string
-	op    semAttrOp
-	value string
+	name            string
+	op              semAttrOp
+	value           string
+	caseInsensitive bool
 }
 
 type semSimpleSelector struct {
-	role       string
-	autoID     string
-	classes    []string
-	attrs      []semAttrCheck
-	firstChild bool
-	nthChild   int
+	role         string
+	autoID       string
+	classes      []string
+	attrs        []semAttrCheck
+	firstChild   bool
+	lastChild    bool
+	nthChild     int
+	notSelectors [][]semPart
 }
 
 type semPart struct {
@@ -650,7 +653,7 @@ func closestSem(n *semNode, rawSelector string) *semNode {
 	return nil
 }
 
-func matchSemChain(n *semNode, scopeRoot *semNode, parts []semPart, idx int) bool {
+func matchSemChain(n *semNode, _ *semNode, parts []semPart, idx int) bool {
 	if n == nil || n.role == "document" {
 		return false
 	}
@@ -661,13 +664,13 @@ func matchSemChain(n *semNode, scopeRoot *semNode, parts []semPart, idx int) boo
 		return true
 	}
 	if parts[idx].childOnly {
-		if n.parent == nil || n.parent == scopeRoot || n.parent.role == "document" {
+		if n.parent == nil || n.parent.role == "document" {
 			return false
 		}
-		return matchSemChain(n.parent, scopeRoot, parts, idx-1)
+		return matchSemChain(n.parent, nil, parts, idx-1)
 	}
-	for anc := n.parent; anc != nil && anc != scopeRoot && anc.role != "document"; anc = anc.parent {
-		if matchSemChain(anc, scopeRoot, parts, idx-1) {
+	for anc := n.parent; anc != nil && anc.role != "document"; anc = anc.parent {
+		if matchSemChain(anc, nil, parts, idx-1) {
 			return true
 		}
 	}
@@ -707,22 +710,27 @@ func matchSemSimple(n *semNode, s semSimpleSelector) bool {
 			}
 			continue
 		}
+		gotVal, wantVal := val, ac.value
+		if ac.caseInsensitive {
+			gotVal = strings.ToLower(gotVal)
+			wantVal = strings.ToLower(wantVal)
+		}
 		switch ac.op {
 		case semAttrExists:
 		case semAttrEquals:
-			if val != ac.value {
+			if gotVal != wantVal {
 				return false
 			}
 		case semAttrContains:
-			if !strings.Contains(val, ac.value) {
+			if !strings.Contains(gotVal, wantVal) {
 				return false
 			}
 		case semAttrPrefix:
-			if !strings.HasPrefix(val, ac.value) {
+			if !strings.HasPrefix(gotVal, wantVal) {
 				return false
 			}
 		case semAttrSuffix:
-			if !strings.HasSuffix(val, ac.value) {
+			if !strings.HasSuffix(gotVal, wantVal) {
 				return false
 			}
 		}
@@ -730,10 +738,25 @@ func matchSemSimple(n *semNode, s semSimpleSelector) bool {
 	if s.firstChild && semChildIndex(n) != 1 {
 		return false
 	}
+	if s.lastChild && !semIsLastChild(n) {
+		return false
+	}
 	if s.nthChild > 0 && semChildIndex(n) != s.nthChild {
 		return false
 	}
+	for _, neg := range s.notSelectors {
+		if len(neg) > 0 && matchSemChain(n, nil, neg, len(neg)-1) {
+			return false
+		}
+	}
 	return true
+}
+
+func semIsLastChild(n *semNode) bool {
+	if n == nil || n.parent == nil || len(n.parent.children) == 0 {
+		return false
+	}
+	return n.parent.children[len(n.parent.children)-1] == n
 }
 
 func semRolesMatch(nodeRole string, wantRole string) bool {
@@ -892,8 +915,18 @@ func parseSemSimple(tok string) semSimpleSelector {
 			i++
 			start := i
 			inParen := 0
+			inQ := byte(0)
 			for i < len(tok) {
-				if tok[i] == '(' {
+				if inQ != 0 {
+					if tok[i] == inQ {
+						inQ = 0
+					}
+					i++
+					continue
+				}
+				if tok[i] == '\'' || tok[i] == '"' {
+					inQ = tok[i]
+				} else if tok[i] == '(' {
 					inParen++
 				} else if tok[i] == ')' && inParen > 0 {
 					inParen--
@@ -902,13 +935,24 @@ func parseSemSimple(tok string) semSimpleSelector {
 				}
 				i++
 			}
-			pseudo := strings.ToLower(strings.TrimSpace(tok[start:i]))
-			if pseudo == "first-child" {
+			rawPseudo := strings.TrimSpace(tok[start:i])
+			pseudo := strings.ToLower(rawPseudo)
+			switch {
+			case pseudo == "first-child":
 				ss.firstChild = true
-			} else if strings.HasPrefix(pseudo, "nth-child(") && strings.HasSuffix(pseudo, ")") {
+			case pseudo == "last-child":
+				ss.lastChild = true
+			case strings.HasPrefix(pseudo, "nth-child(") && strings.HasSuffix(pseudo, ")"):
 				numStr := strings.TrimSpace(pseudo[len("nth-child(") : len(pseudo)-1])
 				if n, err := strconv.Atoi(numStr); err == nil && n > 0 {
 					ss.nthChild = n
+				}
+			case strings.HasPrefix(pseudo, "not(") && strings.HasSuffix(rawPseudo, ")"):
+				inner := strings.TrimSpace(rawPseudo[4 : len(rawPseudo)-1])
+				for _, g := range splitSemTopLevel(inner, ',') {
+					if cs := parseSemComplex(g); len(cs) > 0 {
+						ss.notSelectors = append(ss.notSelectors, cs)
+					}
 				}
 			}
 		default:
@@ -930,15 +974,69 @@ func parseSemAttrExpr(expr string) (semAttrCheck, bool) {
 	if expr == "" {
 		return semAttrCheck{}, false
 	}
-	for _, op := range []semAttrOp{semAttrContains, semAttrPrefix, semAttrSuffix, semAttrEquals} {
-		idx := strings.Index(expr, string(op))
-		if idx > 0 {
-			name := strings.TrimSpace(expr[:idx])
-			val := strings.Trim(strings.TrimSpace(expr[idx+len(op):]), `"'`)
-			return semAttrCheck{name: name, op: op, value: val}, true
+	inQ := byte(0)
+	for i := 0; i < len(expr); i++ {
+		c := expr[i]
+		if inQ != 0 {
+			if c == inQ {
+				inQ = 0
+			}
+			continue
+		}
+		if c == '"' || c == '\'' {
+			inQ = c
+			continue
+		}
+		if c == '=' && i > 0 {
+			op := semAttrEquals
+			nameEnd := i
+			if i >= 2 {
+				switch expr[i-1] {
+				case '*':
+					op = semAttrContains
+					nameEnd = i - 1
+				case '^':
+					op = semAttrPrefix
+					nameEnd = i - 1
+				case '$':
+					op = semAttrSuffix
+					nameEnd = i - 1
+				}
+			}
+			name := strings.TrimSpace(expr[:nameEnd])
+			if name == "" {
+				return semAttrCheck{}, false
+			}
+			val, ci := parseCSSAttrValueAndFlag(expr[i+1:])
+			return semAttrCheck{name: name, op: op, value: val, caseInsensitive: ci}, true
 		}
 	}
 	return semAttrCheck{name: strings.TrimSpace(expr), op: semAttrExists}, true
+}
+
+func parseCSSAttrValueAndFlag(raw string) (val string, caseInsensitive bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", false
+	}
+	if s[0] == '"' || s[0] == '\'' {
+		q := s[0]
+		end := strings.IndexByte(s[1:], q)
+		if end >= 0 {
+			val = s[1 : 1+end]
+			rest := strings.TrimSpace(s[2+end:])
+			return val, strings.EqualFold(rest, "i")
+		}
+		return strings.Trim(s, `"'`), false
+	}
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return "", false
+	}
+	if len(fields) >= 2 && strings.EqualFold(fields[len(fields)-1], "i") {
+		return strings.Join(fields[:len(fields)-1], " "), true
+	}
+	return s, false
 }
 
 func splitSemTopLevel(s string, sep byte) []string {
@@ -988,18 +1086,21 @@ func applySemRegex(text string, pattern string, group int) string {
 	if len(m) == 0 {
 		return ""
 	}
-	idx := group
-	if idx <= 0 {
-		if len(m) > 1 {
-			idx = 1
-		} else {
-			idx = 0
+	if group > 0 {
+		if group >= len(m) {
+			return ""
+		}
+		return m[group]
+	}
+	if len(m) == 1 {
+		return m[0]
+	}
+	for i := 1; i < len(m); i++ {
+		if m[i] != "" {
+			return m[i]
 		}
 	}
-	if idx >= len(m) {
-		return ""
-	}
-	return m[idx]
+	return ""
 }
 
 func truncateSemRunes(s string, max int) string {

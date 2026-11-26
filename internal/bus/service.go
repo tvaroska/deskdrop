@@ -10,13 +10,48 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/tvaroska/deskdrop/internal/contract"
 )
+
+// HTTPStatusError represents a non-2xx HTTP response returned by the relay.
+type HTTPStatusError struct {
+	Prefix     string
+	StatusCode int
+	Body       string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("%s HTTP %d: %s", e.Prefix, e.StatusCode, e.Body)
+}
+
+// IsRelayTransientError reports whether err is a transport error or rollout 502/503/504 status.
+func IsRelayTransientError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var statusErr *HTTPStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.StatusCode == http.StatusBadGateway ||
+			statusErr.StatusCode == http.StatusServiceUnavailable ||
+			statusErr.StatusCode == http.StatusGatewayTimeout
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+}
 
 const (
 	defaultRetryBaseDelay   = 400 * time.Millisecond
@@ -229,6 +264,18 @@ func (c *DesktopClient) DownloadReleaseBinary(ctx context.Context, goos string) 
 	return data, strings.TrimSpace(hdr.Get("X-DeskDrop-Version")), nil
 }
 
+// DownloadReleaseChecksums fetches /v1/release/SHA256SUMS.txt to verify self-update integrity.
+func (c *DesktopClient) DownloadReleaseChecksums(ctx context.Context) (string, error) {
+	if err := c.ValidateAuth(); err != nil {
+		return "", err
+	}
+	data, _, err := c.getWithRetry(ctx, "/v1/release/SHA256SUMS.txt", 64*1024, "download release checksums")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
 func (c *DesktopClient) HeartbeatTask(ctx context.Context, taskID string, host string, leaseSeconds int) error {
 	return c.postJSONWithRetry(ctx, "/v1/tasks/"+taskID+"/heartbeat", "", contract.ClaimTaskRequest{
 		Host:         host,
@@ -366,7 +413,11 @@ func (c *DesktopClient) getWithRetry(ctx context.Context, subPath string, maxByt
 			if len(errPreview) > 4096 {
 				errPreview = errPreview[:4096]
 			}
-			lastErr = fmt.Errorf("%s HTTP %d: %s", errPrefix, status, strings.TrimSpace(string(errPreview)))
+			lastErr = &HTTPStatusError{
+				Prefix:     errPrefix,
+				StatusCode: status,
+				Body:       strings.TrimSpace(string(errPreview)),
+			}
 			if !isRolloutRetryStatus(status, false) {
 				return nil, nil, lastErr
 			}
@@ -404,8 +455,10 @@ func (c *DesktopClient) postJSONWithRetry(ctx context.Context, subPath string, i
 
 		status, raw, _, doErr := c.doReqWithLimit(req, 256*1024)
 		if doErr == nil && status >= 200 && status < 300 {
-			if dst != nil && len(raw) > 0 {
-				_ = json.Unmarshal(raw, dst)
+			if dst != nil {
+				if err := json.Unmarshal(raw, dst); err != nil {
+					return fmt.Errorf("decode relay JSON response: %w", err)
+				}
 			}
 			return nil
 		}
@@ -415,7 +468,11 @@ func (c *DesktopClient) postJSONWithRetry(ctx context.Context, subPath string, i
 			}
 			lastErr = doErr
 		} else {
-			lastErr = fmt.Errorf("relay HTTP %d: %s", status, strings.TrimSpace(string(raw)))
+			lastErr = &HTTPStatusError{
+				Prefix:     "relay",
+				StatusCode: status,
+				Body:       strings.TrimSpace(string(raw)),
+			}
 			if !isRolloutRetryStatus(status, true) {
 				return lastErr
 			}
@@ -487,8 +544,10 @@ func (c *DesktopClient) postErrorMultipart(ctx context.Context, subPath string, 
 
 		status, raw, _, doErr := c.doReqWithLimit(req, 256*1024)
 		if doErr == nil && status >= 200 && status < 300 {
-			if dst != nil && len(raw) > 0 {
-				_ = json.Unmarshal(raw, dst)
+			if dst != nil {
+				if err := json.Unmarshal(raw, dst); err != nil {
+					return fmt.Errorf("decode relay JSON response: %w", err)
+				}
 			}
 			return nil
 		}
@@ -498,7 +557,11 @@ func (c *DesktopClient) postErrorMultipart(ctx context.Context, subPath string, 
 			}
 			lastErr = doErr
 		} else {
-			lastErr = fmt.Errorf("relay HTTP %d: %s", status, strings.TrimSpace(string(raw)))
+			lastErr = &HTTPStatusError{
+				Prefix:     "relay",
+				StatusCode: status,
+				Body:       strings.TrimSpace(string(raw)),
+			}
 			if !isRolloutRetryStatus(status, false) {
 				return lastErr
 			}
@@ -525,7 +588,16 @@ func (c *DesktopClient) doReqWithLimit(req *http.Request, maxBytes int64) (int, 
 		return 0, nil, nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if readErr != nil {
+		return resp.StatusCode, nil, resp.Header, fmt.Errorf("read response body: %w", readErr)
+	}
+	if int64(len(raw)) > maxBytes {
+		return resp.StatusCode, nil, resp.Header, fmt.Errorf("response body exceeded limit of %d bytes", maxBytes)
+	}
+	if resp.ContentLength >= 0 && int64(len(raw)) != resp.ContentLength {
+		return resp.StatusCode, nil, resp.Header, fmt.Errorf("truncated response body: got %d bytes, expected %d", len(raw), resp.ContentLength)
+	}
 	return resp.StatusCode, raw, resp.Header, nil
 }
 

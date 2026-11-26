@@ -5,12 +5,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/tvaroska/deskdrop/internal/contract"
 	"github.com/tvaroska/deskdrop/internal/recipes"
@@ -353,5 +358,413 @@ func TestClaimTaskAllowedDriversSkipsCDPWhenOnlyUIARunnable(t *testing.T) {
 	_ = json.Unmarshal(w3.Body.Bytes(), &resp3)
 	if resp3.Task == nil || resp3.Task.Kind != contract.TaskKindFallback {
 		t.Fatalf("expected priority-20 fallback_task claimed once CDP allowed, got %+v", resp3.Task)
+	}
+}
+
+type failSaveCatalog struct {
+	recipes.Catalog
+	failSave atomic.Bool
+	getCalls atomic.Int32
+}
+
+func (f *failSaveCatalog) Get(ctx context.Context, name string) (contract.Recipe, bool, error) {
+	f.getCalls.Add(1)
+	return f.Catalog.Get(ctx, name)
+}
+
+func (f *failSaveCatalog) SaveRecipe(ctx context.Context, r contract.Recipe) error {
+	if f.failSave.Load() {
+		return errors.New("simulated catalog write failure")
+	}
+	return f.Catalog.SaveRecipe(ctx, r)
+}
+
+func TestS2ProposalApprovalFailClosedAndRollback(t *testing.T) {
+	baseCat := recipes.NewStaticCatalog(contract.Recipe{
+		Name:     "release-feed",
+		Topic:    "releases",
+		Defaults: map[string]string{"org": "example-org", "repo": "example-repo"},
+		Steps:    []contract.Step{{ID: "s1", URL: "https://releases.example.com/{{org}}/{{repo}}"}},
+	})
+	cat := &failSaveCatalog{Catalog: baseCat}
+	store := NewMemoryStore()
+	svc := NewService(ServerConfig{
+		Version:            "v1.3.2",
+		DesktopClientToken: "desk-tok",
+		AgentBusToken:      "agent-tok",
+	}, store, NewMemoryBlobStore(), cat, nil)
+
+	approve := func(id string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/proposals/"+id+"/approve", strings.NewReader(`{"reviewed_by":"op"}`))
+		req.Header.Set("Authorization", "Bearer agent-tok")
+		w := httptest.NewRecorder()
+		svc.ServeHTTP(w, req)
+		return w
+	}
+
+	// 1. Unregistered recipe (!exists) must fail closed (403).
+	pMissing, _ := store.SaveProposal(context.Background(), contract.RecipePatchProposal{
+		RecipeName:     "unregistered",
+		Verified:       true,
+		ProposedRecipe: contract.Recipe{Name: "unregistered", Topic: "t", Steps: []contract.Step{{ID: "s1", URL: "https://evil.invalid"}}},
+	})
+	if w := approve(pMissing.ID); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "not registered") {
+		t.Fatalf("approve unregistered recipe = %d, want 403 not registered (%s)", w.Code, w.Body.String())
+	}
+
+	// 2. ProposedRecipe.Name mismatch must fail (422).
+	pMismatch, _ := store.SaveProposal(context.Background(), contract.RecipePatchProposal{
+		RecipeName:     "release-feed",
+		Verified:       true,
+		ProposedRecipe: contract.Recipe{Name: "../state", Topic: "releases", Steps: []contract.Step{{ID: "s1", URL: "https://releases.example.com/a/b"}}},
+	})
+	if w := approve(pMismatch.ID); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("approve name mismatch = %d, want 422 (%s)", w.Code, w.Body.String())
+	}
+
+	// 3. Defaults host-template pivot must fail closed (403).
+	pPivot, _ := store.SaveProposal(context.Background(), contract.RecipePatchProposal{
+		RecipeName: "release-feed",
+		Verified:   true,
+		ProposedRecipe: contract.Recipe{
+			Name:     "release-feed",
+			Topic:    "releases",
+			Defaults: map[string]string{"h": "evil.invalid"},
+			Steps:    []contract.Step{{ID: "s1", URL: "https://{{h}}/x"}},
+		},
+	})
+	if w := approve(pPivot.ID); w.Code != http.StatusForbidden {
+		t.Fatalf("approve defaults host pivot = %d, want 403 (%s)", w.Code, w.Body.String())
+	}
+
+	// 4. Valid path-templated release-feed proposal: failed SaveRecipe rolls proposal back to pending, retry succeeds (200).
+	pValid, _ := store.SaveProposal(context.Background(), contract.RecipePatchProposal{
+		RecipeName: "release-feed",
+		Verified:   true,
+		ProposedRecipe: contract.Recipe{
+			Name:        "release-feed",
+			Topic:       "releases",
+			Description: "healed",
+			Defaults:    map[string]string{"org": "example-org", "repo": "example-repo"},
+			Steps:       []contract.Step{{ID: "s1", URL: "https://releases.example.com/{{org}}/{{repo}}"}},
+		},
+	})
+	cat.failSave.Store(true)
+	if w := approve(pValid.ID); w.Code != http.StatusInternalServerError {
+		t.Fatalf("approve with failing SaveRecipe = %d, want 500", w.Code)
+	}
+	afterFail, _ := store.GetProposal(context.Background(), pValid.ID)
+	if afterFail.Status != contract.ProposalStatusPending {
+		t.Fatalf("expected proposal rolled back to pending after SaveRecipe failure, got %q", afterFail.Status)
+	}
+	cat.failSave.Store(false)
+	if w := approve(pValid.ID); w.Code != http.StatusOK {
+		t.Fatalf("approve valid path-templated release-feed = %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+
+	// 5. Concurrent /approve vs /reject TOCTOU: if /reject wins, RECIPES_URI must NEVER be overwritten.
+	pRace, _ := store.SaveProposal(context.Background(), contract.RecipePatchProposal{
+		RecipeName: "release-feed",
+		Verified:   true,
+		ProposedRecipe: contract.Recipe{
+			Name:        "release-feed",
+			Topic:       "releases",
+			Description: "raced-description",
+			Defaults:    map[string]string{"org": "example-org", "repo": "example-repo"},
+			Steps:       []contract.Step{{ID: "s1", URL: "https://releases.example.com/{{org}}/{{repo}}"}},
+		},
+	})
+	var wg sync.WaitGroup
+	var appCode, rejCode atomic.Int32
+	start := make(chan struct{})
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		appCode.Store(int32(approve(pRace.ID).Code))
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		req := httptest.NewRequest(http.MethodPost, "/v1/proposals/"+pRace.ID+"/reject", strings.NewReader(`{"reviewed_by":"op"}`))
+		req.Header.Set("Authorization", "Bearer agent-tok")
+		w := httptest.NewRecorder()
+		svc.ServeHTTP(w, req)
+		rejCode.Store(int32(w.Code))
+	}()
+	close(start)
+	wg.Wait()
+	if !((appCode.Load() == http.StatusOK && rejCode.Load() == http.StatusConflict) ||
+		(rejCode.Load() == http.StatusOK && appCode.Load() == http.StatusConflict)) {
+		t.Fatalf("concurrent approve/reject codes = (%d, %d), want one 200 and one 409", appCode.Load(), rejCode.Load())
+	}
+	if rejCode.Load() == http.StatusOK {
+		cur, _, _ := baseCat.Get(context.Background(), "release-feed")
+		if cur.Description == "raced-description" {
+			t.Fatal("TOCTOU bug: rejected proposal still overwrote RECIPES_URI")
+		}
+	}
+}
+
+func TestS3DiagnosticZipBoundsDuplicatesAndAirGap(t *testing.T) {
+	svc := NewService(ServerConfig{
+		Version:            "v1.3.2",
+		DesktopClientToken: "desk-tok",
+		AgentBusToken:      "agent-tok",
+		ForbiddenTerms:     []string{"top-secret-term"},
+	}, NewMemoryStore(), NewMemoryBlobStore(), recipes.NewStaticCatalog(), nil)
+
+	postErrBundle := func(metaJSON string, bundle []byte) *httptest.ResponseRecorder {
+		var mp bytes.Buffer
+		mw := multipart.NewWriter(&mp)
+		_ = mw.WriteField("payload_json", metaJSON)
+		if bundle != nil {
+			fw, _ := mw.CreateFormFile("bundle", "debug.zip")
+			_, _ = fw.Write(bundle)
+		}
+		_ = mw.Close()
+		req := httptest.NewRequest(http.MethodPost, "/v1/errors", &mp)
+		req.Header.Set("Authorization", "Bearer desk-tok")
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		w := httptest.NewRecorder()
+		svc.ServeHTTP(w, req)
+		return w
+	}
+
+	// 1. Non-zip body rejected with 422.
+	if w := postErrBundle(`{"error":"boom"}`, []byte("not-a-zip-file")); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("non-zip bundle = %d, want 422", w.Code)
+	}
+
+	// 2. Duplicate entries (zip bomb vector) rejected with 422.
+	var dupBuf bytes.Buffer
+	zw := zip.NewWriter(&dupBuf)
+	w1, _ := zw.Create("screenshot.png")
+	_, _ = w1.Write([]byte("a"))
+	w2, _ := zw.Create("screenshot.png")
+	_, _ = w2.Write([]byte("b"))
+	_ = zw.Close()
+	if w := postErrBundle(`{"error":"boom"}`, dupBuf.Bytes()); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("duplicate zip entry = %d, want 422 (%s)", w.Code, w.Body.String())
+	}
+
+	// 3. Oversized dom.html (>512 KiB) rejected with 422.
+	var bigBuf bytes.Buffer
+	zwBig := zip.NewWriter(&bigBuf)
+	wb, _ := zwBig.Create("dom.html")
+	_, _ = wb.Write(bytes.Repeat([]byte("a"), 513*1024))
+	_ = zwBig.Close()
+	if w := postErrBundle(`{"error":"boom"}`, bigBuf.Bytes()); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("oversized dom.html = %d, want 422 (%s)", w.Code, w.Body.String())
+	}
+
+	// 4. Secret inside error.json or meta.Recipe blocked with 422.
+	var errJSONBuf bytes.Buffer
+	zwErr := zip.NewWriter(&errJSONBuf)
+	we, _ := zwErr.Create("error.json")
+	_, _ = we.Write([]byte(`{"detail":"contains top-secret-term"}`))
+	_ = zwErr.Close()
+	if w := postErrBundle(`{"error":"boom"}`, errJSONBuf.Bytes()); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("secret in error.json = %d, want 422 (%s)", w.Code, w.Body.String())
+	}
+	if w := postErrBundle(`{"error":"boom","recipe":"top-secret-term"}`, nil); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("secret in meta.Recipe = %d, want 422 (%s)", w.Code, w.Body.String())
+	}
+
+	// 5. Non-PNG payload disguised as .png and non-canonical ./dom.html entry rejected with 422.
+	var fakePNGBuf bytes.Buffer
+	zwPNG := zip.NewWriter(&fakePNGBuf)
+	wp, _ := zwPNG.Create("leak.png")
+	_, _ = wp.Write([]byte("top-secret-term plain text masquerading as png"))
+	_ = zwPNG.Close()
+	if w := postErrBundle(`{"error":"boom"}`, fakePNGBuf.Bytes()); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("fake .png entry = %d, want 422 (%s)", w.Code, w.Body.String())
+	}
+
+	var dotSlashBuf bytes.Buffer
+	zwDot := zip.NewWriter(&dotSlashBuf)
+	wd, _ := zwDot.Create("./dom.html")
+	_, _ = wd.Write([]byte("<html></html>"))
+	_ = zwDot.Close()
+	if w := postErrBundle(`{"error":"boom"}`, dotSlashBuf.Bytes()); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("./dom.html entry = %d, want 422 (%s)", w.Code, w.Body.String())
+	}
+}
+
+func TestS4FileStoreRollbackIdempPruningTaskProtectionAndTransitionGuards(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. FileStore rollback on persist failure (read-only directory).
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.json")
+	fs, err := OpenFileStore(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fs.PostMessage(ctx, contract.PostMessageRequest{From: "a", Body: "seed"}, "k0"); err != nil {
+		t.Fatal(err)
+	}
+	// Make directory read-only so atomic temp file creation fails.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(dir, 0o755) }()
+
+	if _, _, err := fs.PostMessage(ctx, contract.PostMessageRequest{From: "a", Body: "must-rollback"}, "k1"); err == nil {
+		t.Fatal("expected PostMessage to fail in read-only directory")
+	}
+	// Restore permissions: retrying with same idempotency key k1 must create (not deduplicate a rolled-back entry).
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, created, err := fs.PostMessage(ctx, contract.PostMessageRequest{From: "a", Body: "must-rollback"}, "k1")
+	if err != nil || !created {
+		t.Fatalf("retry after rollback: created=%v err=%v, want created=true err=nil", created, err)
+	}
+
+	// 2. Identical idle UpsertWorkerStatus skips fsync (state.json mtime unchanged).
+	ws := contract.WorkerStatus{Host: "win-pc", Version: "v1.3.2", BrowserConnected: true, ReadyToAccept: true, LastAction: "sync"}
+	if _, err := fs.UpsertWorkerStatus(ctx, ws); err != nil {
+		t.Fatal(err)
+	}
+	st1, _ := os.Stat(statePath)
+	past := time.Now().Add(-10 * time.Second)
+	_ = os.Chtimes(statePath, past, past)
+	if _, err := fs.UpsertWorkerStatus(ctx, ws); err != nil {
+		t.Fatal(err)
+	}
+	st2, _ := os.Stat(statePath)
+	if !st2.ModTime().Equal(past.Truncate(time.Second)) && st2.ModTime().After(past.Add(time.Second)) {
+		t.Fatalf("expected no-op UpsertWorkerStatus to skip persist, mtime changed from %v to %v (initial %v)", past, st2.ModTime(), st1.ModTime())
+	}
+
+	// 3. MemoryStore prunes evicted msgIdemp/dropIdemp keys and protects pending tasks from eviction.
+	ms := NewMemoryStore()
+	for i := 0; i < maxRetainedMessages+25; i++ {
+		_, _, _ = ms.PostMessage(ctx, contract.PostMessageRequest{From: "a", Body: "msg"}, "idemp-"+string(rune('a'+(i%26)))+strings.Repeat("x", i%10)+time.Now().Format("150405.000000000"))
+	}
+	if len(ms.msgIdemp) > maxRetainedMessages {
+		t.Fatalf("msgIdemp leaked evicted keys: len=%d > %d", len(ms.msgIdemp), maxRetainedMessages)
+	}
+
+	// Enqueue one pending task, then churn > maxRetainedTasks completed tasks: pending task must survive.
+	pinned, _, _ := ms.EnqueueTask(ctx, contract.EnqueueTaskRequest{Recipe: "pinned-pending", Domain: "paused.example.com"})
+	_, _, _ = ms.TripDomainAuthBreaker(ctx, "paused.example.com", "paused")
+	for i := 0; i < maxRetainedTasks+15; i++ {
+		t2, _, _ := ms.EnqueueTask(ctx, contract.EnqueueTaskRequest{Recipe: "churn", Domain: "ok.example.com"})
+		claimed, _ := ms.ClaimNextTask(ctx, "w1", time.Minute, nil)
+		if claimed != nil && claimed.ID == t2.ID {
+			_, _ = ms.CompleteTask(ctx, t2.ID, "drop_x")
+		}
+	}
+	if _, err := ms.GetTask(ctx, pinned.ID); err != nil {
+		t.Fatalf("live pending task %s was evicted: %v", pinned.ID, err)
+	}
+
+	// 4. FailTask cannot revert succeeded task or fail a task owned by another worker.
+	t3, _, _ := ms.EnqueueTask(ctx, contract.EnqueueTaskRequest{Recipe: "r1", Domain: "ok.example.com"})
+	claimed3, _ := ms.ClaimNextTask(ctx, "worker-a", time.Minute, nil)
+	if _, _, _, err := ms.FailTask(ctx, claimed3.ID, "worker-b", contract.ErrorTriage{Code: contract.ErrorCodeUnknown, Action: contract.TriageRetryBackoff}, "wrong owner", ""); !errors.Is(err, ErrConflict) {
+		t.Fatalf("FailTask by non-owner = %v, want ErrConflict", err)
+	}
+	if _, _, _, err := ms.FailTask(ctx, claimed3.ID, "", contract.ErrorTriage{Code: contract.ErrorCodeUnknown, Action: contract.TriageRetryBackoff}, "empty owner", ""); !errors.Is(err, ErrConflict) {
+		t.Fatalf("FailTask with empty host = %v, want ErrConflict", err)
+	}
+	if _, err := ms.HeartbeatTask(ctx, claimed3.ID, "", time.Minute); !errors.Is(err, ErrConflict) {
+		t.Fatalf("HeartbeatTask with empty host = %v, want ErrConflict", err)
+	}
+	if _, err := ms.CompleteTask(ctx, claimed3.ID, "drop_done"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := ms.FailTask(ctx, t3.ID, "worker-a", contract.ErrorTriage{Code: contract.ErrorCodeUnknown, Action: contract.TriageRetryBackoff}, "late fail", ""); !errors.Is(err, ErrConflict) {
+		t.Fatalf("FailTask on succeeded task = %v, want ErrConflict", err)
+	}
+}
+
+func TestS5ErrorCodeOverrideGuardAndS6PreLockDriverResolution(t *testing.T) {
+	var healerCalls atomic.Int32
+	cat := &failSaveCatalog{
+		Catalog: recipes.NewStaticCatalog(contract.Recipe{
+			Name:  "status-board",
+			Topic: "ops",
+			Steps: []contract.Step{{ID: "s1", URL: "https://status.example.com"}},
+		}),
+	}
+	store := NewMemoryStore()
+	svc := NewService(ServerConfig{
+		Version:            "v1.3.2",
+		DesktopClientToken: "desk-tok",
+		AgentBusToken:      "agent-tok",
+	}, store, NewMemoryBlobStore(), cat, &stubHealer{
+		fn: func(_ context.Context, _ HealRequest) (HealResult, error) {
+			healerCalls.Add(1)
+			return HealResult{}, nil
+		},
+	})
+
+	// S-5: Caller passing error_code=SELECTOR_DRIFT on /login URL must stay AUTH_EXPIRED and NEVER run healer.
+	var zbuf bytes.Buffer
+	zw := zip.NewWriter(&zbuf)
+	wh, _ := zw.Create("dom.html")
+	_, _ = wh.Write([]byte(`<html><body>Sign in</body></html>`))
+	_ = zw.Close()
+
+	var mp bytes.Buffer
+	mw := multipart.NewWriter(&mp)
+	_ = mw.WriteField("payload_json", `{"recipe":"status-board","landed_url":"https://status.example.com/login","error_code":"SELECTOR_DRIFT","error":"redirected to login"}`)
+	fw, _ := mw.CreateFormFile("bundle", "debug.zip")
+	_, _ = fw.Write(zbuf.Bytes())
+	_ = mw.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/errors", &mp)
+	req.Header.Set("Authorization", "Bearer desk-tok")
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	w := httptest.NewRecorder()
+	svc.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/errors = %d (%s)", w.Code, w.Body.String())
+	}
+	if healerCalls.Load() != 0 {
+		t.Fatalf("expected 0 healer calls on /login override attempt, got %d", healerCalls.Load())
+	}
+	if !strings.Contains(w.Body.String(), `"AUTH_EXPIRED"`) {
+		t.Fatalf("expected AUTH_EXPIRED triage, got %s", w.Body.String())
+	}
+
+	// Clear the tripped auth breaker before testing CONTRACT_INVALID task failure.
+	if err := store.ClearDomainBreaker(context.Background(), "status.example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	// S-5: CONTRACT_INVALID sets diagnostic_escalation (0 retries).
+	t1, _, _ := store.EnqueueTask(context.Background(), contract.EnqueueTaskRequest{Recipe: "status-board", Domain: "status.example.com", MaxAttempts: 3})
+	claimed, err := store.ClaimNextTask(context.Background(), "win-pc", time.Minute, nil)
+	if err != nil || claimed == nil || claimed.ID != t1.ID {
+		t.Fatalf("expected t1 claimed, got %+v err=%v", claimed, err)
+	}
+	failReq := httptest.NewRequest(http.MethodPost, "/v1/tasks/"+t1.ID+"/fail", strings.NewReader(`{"from":"win-pc","error_code":"CONTRACT_INVALID","error":"missing resolved recipe"}`))
+	failReq.Header.Set("Authorization", "Bearer desk-tok")
+	fw2 := httptest.NewRecorder()
+	svc.ServeHTTP(fw2, failReq)
+	if fw2.Code != http.StatusOK {
+		t.Fatalf("fail CONTRACT_INVALID = %d (%s)", fw2.Code, fw2.Body.String())
+	}
+	t1After, _ := store.GetTask(context.Background(), t1.ID)
+	if t1After.Status != contract.TaskStatusFailedDiagnostic {
+		t.Fatalf("CONTRACT_INVALID status = %q, want failed_diagnostic (no retry)", t1After.Status)
+	}
+
+	// S-6: handleClaimTask resolves drivers from catalog.List BEFORE ClaimNextTask (0 catalog.Get calls during claim filter).
+	_, _, _ = store.EnqueueTask(context.Background(), contract.EnqueueTaskRequest{Recipe: "status-board", Domain: "status.example.com"})
+	cat.getCalls.Store(0)
+	claimReq := httptest.NewRequest(http.MethodPost, "/v1/tasks/claim", strings.NewReader(`{"host":"win-pc","allowed_drivers":["uia"]}`))
+	claimReq.Header.Set("Authorization", "Bearer desk-tok")
+	cw := httptest.NewRecorder()
+	svc.ServeHTTP(cw, claimReq)
+	if cw.Code != http.StatusOK {
+		t.Fatalf("claim = %d", cw.Code)
+	}
+	if cat.getCalls.Load() != 0 {
+		t.Fatalf("expected 0 catalog.Get calls during ClaimNextTask filter, got %d", cat.getCalls.Load())
 	}
 }

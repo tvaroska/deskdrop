@@ -60,7 +60,73 @@ type AXNode struct {
 	Properties       []AXProperty `json:"properties,omitempty"`
 }
 
-// ScrubAXNodes returns a copy of nodes with password and editable control values redacted to "[REDACTED]".
+type axTreeIndex struct {
+	byID             map[string]*AXNode
+	childrenByParent map[string][]string
+	roots            []string
+	order            []string
+}
+
+func buildAXTreeIndex(nodes []AXNode) axTreeIndex {
+	idx := axTreeIndex{
+		byID:             make(map[string]*AXNode, len(nodes)),
+		childrenByParent: make(map[string][]string, len(nodes)),
+		order:            make([]string, 0, len(nodes)),
+	}
+	hasParent := make(map[string]bool, len(nodes))
+	for i := range nodes {
+		n := &nodes[i]
+		if n.NodeID == "" {
+			continue
+		}
+		if _, exists := idx.byID[n.NodeID]; !exists {
+			idx.order = append(idx.order, n.NodeID)
+		}
+		idx.byID[n.NodeID] = n
+	}
+	for _, id := range idx.order {
+		n := idx.byID[id]
+		for _, cid := range n.ChildIDs {
+			if _, ok := idx.byID[cid]; ok {
+				hasParent[cid] = true
+				if !containsString(idx.childrenByParent[id], cid) {
+					idx.childrenByParent[id] = append(idx.childrenByParent[id], cid)
+				}
+			}
+		}
+		if n.ParentID != "" {
+			if _, ok := idx.byID[n.ParentID]; ok {
+				hasParent[id] = true
+			}
+		}
+	}
+	for _, id := range idx.order {
+		n := idx.byID[id]
+		if n.ParentID != "" {
+			if _, ok := idx.byID[n.ParentID]; ok && !containsString(idx.childrenByParent[n.ParentID], id) {
+				idx.childrenByParent[n.ParentID] = append(idx.childrenByParent[n.ParentID], id)
+			}
+		}
+	}
+	for _, id := range idx.order {
+		if !hasParent[id] {
+			idx.roots = append(idx.roots, id)
+		}
+	}
+	if len(idx.roots) == 0 && len(idx.order) > 0 {
+		idx.roots = append(idx.roots, idx.order[0])
+	}
+	return idx
+}
+
+func isNodeSensitive(n *AXNode) (isPwd bool, isSens bool) {
+	roleLower := NormalizeAXRole(n.Role.StringValue())
+	isPwd = n.IsPassword || roleLower == "password" || hasTruthyAXProp(n.Properties, "ispassword") || hasTruthyAXProp(n.Properties, "password")
+	return isPwd, isPwd || isSensitiveInputRole(roleLower)
+}
+
+// ScrubAXNodes returns a copy of nodes with password/editable control values AND all
+// descendants (e.g., child StaticText) inside sensitive inputs redacted to "[REDACTED]".
 func ScrubAXNodes(nodes []AXNode) []AXNode {
 	if len(nodes) == 0 {
 		return nil
@@ -75,21 +141,64 @@ func ScrubAXNodes(nodes []AXNode) []AXNode {
 			cp.Properties = make([]AXProperty, len(n.Properties))
 			copy(cp.Properties, n.Properties)
 		}
-		roleLower := NormalizeAXRole(n.Role.StringValue())
-		isPwd := n.IsPassword || roleLower == "password" || hasTruthyAXProp(n.Properties, "ispassword") || hasTruthyAXProp(n.Properties, "password")
-		if isPwd {
+		out[i] = cp
+	}
+
+	idx := buildAXTreeIndex(out)
+	sensitiveDescendant := make(map[string]bool)
+	passwordDescendant := make(map[string]bool)
+
+	var markDesc func(id string, pwd bool)
+	markDesc = func(id string, pwd bool) {
+		for _, cid := range idx.childrenByParent[id] {
+			alreadySens := sensitiveDescendant[cid]
+			alreadyPwd := passwordDescendant[cid]
+			if alreadySens && (!pwd || alreadyPwd) {
+				continue
+			}
+			sensitiveDescendant[cid] = true
+			if pwd {
+				passwordDescendant[cid] = true
+			}
+			markDesc(cid, pwd)
+		}
+	}
+
+	for i := range out {
+		n := &out[i]
+		isPwd, isSens := isNodeSensitive(n)
+		if isSens && n.NodeID != "" {
+			markDesc(n.NodeID, isPwd)
+		}
+	}
+
+	for i := range out {
+		cp := &out[i]
+		isPwd, isSens := isNodeSensitive(cp)
+		inSens := cp.NodeID != "" && sensitiveDescendant[cp.NodeID]
+		inPwd := cp.NodeID != "" && passwordDescendant[cp.NodeID]
+		if isPwd || inPwd {
 			cp.IsPassword = true
 		}
-		if cp.Value != nil && cp.Value.StringValue() != "" && (isPwd || isSensitiveInputRole(roleLower)) {
-			cp.Value = &AXValue{Type: "string", Value: "[REDACTED]"}
-		}
-		for pi := range cp.Properties {
-			pk := strings.ToLower(strings.TrimSpace(cp.Properties[pi].Name))
-			if pk == "value" && cp.Properties[pi].Value.StringValue() != "" && (isPwd || isSensitiveInputRole(roleLower)) {
-				cp.Properties[pi].Value = AXValue{Type: "string", Value: "[REDACTED]"}
+		if inSens {
+			if cp.Name != nil && cp.Name.StringValue() != "" {
+				cp.Name = &AXValue{Type: "string", Value: "[REDACTED]"}
+			}
+			if cp.Description != nil && cp.Description.StringValue() != "" {
+				cp.Description = &AXValue{Type: "string", Value: "[REDACTED]"}
 			}
 		}
-		out[i] = cp
+		if (isSens || inSens) && cp.Value != nil && cp.Value.StringValue() != "" {
+			cp.Value = &AXValue{Type: "string", Value: "[REDACTED]"}
+		}
+		if isSens || inSens {
+			for pi := range cp.Properties {
+				pk := strings.ToLower(strings.TrimSpace(cp.Properties[pi].Name))
+				if pk == "value" && cp.Properties[pi].Value.StringValue() != "" {
+					cp.Properties[pi].Value = AXValue{Type: "string", Value: "[REDACTED]"}
+				}
+			}
+		}
 	}
 	return out
 }
@@ -159,45 +268,11 @@ func FormatCompactAXTree(nodes []AXNode, rawByteLen int) (string, AXGroundingSta
 		return "", stats
 	}
 
-	byID := make(map[string]*AXNode, len(nodes))
-	hasParent := make(map[string]bool, len(nodes))
-	order := make([]string, 0, len(nodes))
-	for i := range nodes {
-		n := &nodes[i]
-		if n.NodeID == "" {
-			continue
-		}
-		if _, exists := byID[n.NodeID]; !exists {
-			order = append(order, n.NodeID)
-		}
-		byID[n.NodeID] = n
-	}
-	for _, id := range order {
-		n := byID[id]
-		for _, cid := range n.ChildIDs {
-			if _, ok := byID[cid]; ok {
-				hasParent[cid] = true
-			}
-		}
-		if n.ParentID != "" {
-			if _, ok := byID[n.ParentID]; ok {
-				hasParent[id] = true
-			}
-		}
-	}
-
-	var roots []string
-	for _, id := range order {
-		if !hasParent[id] {
-			roots = append(roots, id)
-		}
-	}
-	if len(roots) == 0 && len(order) > 0 {
-		roots = append(roots, order[0])
-	}
+	scrubbed := ScrubAXNodes(nodes)
+	idx := buildAXTreeIndex(scrubbed)
 
 	var b strings.Builder
-	visited := make(map[string]bool, len(nodes))
+	visited := make(map[string]bool, len(scrubbed))
 
 	var walk func(id string, depth int, parentName string)
 	walk = func(id string, depth int, parentName string) {
@@ -205,7 +280,7 @@ func FormatCompactAXTree(nodes []AXNode, rawByteLen int) (string, AXGroundingSta
 			return
 		}
 		visited[id] = true
-		n, ok := byID[id]
+		n, ok := idx.byID[id]
 		if !ok {
 			return
 		}
@@ -220,7 +295,7 @@ func FormatCompactAXTree(nodes []AXNode, rawByteLen int) (string, AXGroundingSta
 
 		// Ignored wrappers may still own non-ignored semantic descendants in flat CDP trees.
 		if n.Ignored {
-			for _, cid := range n.ChildIDs {
+			for _, cid := range idx.childrenByParent[id] {
 				walk(cid, depth, parentName)
 			}
 			return
@@ -228,14 +303,14 @@ func FormatCompactAXTree(nodes []AXNode, rawByteLen int) (string, AXGroundingSta
 
 		name := n.Name.StringValue()
 		val := n.Value.StringValue()
-		isPwd := n.IsPassword || roleLower == "password" || hasTruthyAXProp(n.Properties, "ispassword") || hasTruthyAXProp(n.Properties, "password")
-		if (isPwd || isSensitiveInputRole(roleLower)) && val != "" {
+		_, isSens := isNodeSensitive(n)
+		if isSens && val == "" && hasAccessibleDescendantText(id, idx, 0) {
 			val = "[REDACTED]"
 		}
 
 		if isCanvasLikeRole(roleLower, n) {
 			stats.CanvasNodes++
-			if name == "" && !hasAccessibleDescendantText(n, byID, 0) {
+			if name == "" && !hasAccessibleDescendantText(id, idx, 0) {
 				stats.UnlabelledCanvases++
 			}
 		}
@@ -256,7 +331,7 @@ func FormatCompactAXTree(nodes []AXNode, rawByteLen int) (string, AXGroundingSta
 		props := formatSalientAXProps(n.Properties)
 		isStructuralNoise := isUnnamedWrapperRole(roleLower) && name == "" && val == "" && props == ""
 		if isStructuralNoise {
-			for _, cid := range n.ChildIDs {
+			for _, cid := range idx.childrenByParent[id] {
 				walk(cid, depth, parentName)
 			}
 			return
@@ -285,27 +360,32 @@ func FormatCompactAXTree(nodes []AXNode, rawByteLen int) (string, AXGroundingSta
 			b.WriteString(" ")
 			b.WriteString(props)
 		}
-		if isCanvasLikeRole(roleLower, n) && name == "" && !hasAccessibleDescendantText(n, byID, 0) {
+		if isCanvasLikeRole(roleLower, n) && name == "" && !hasAccessibleDescendantText(id, idx, 0) {
 			b.WriteString(" [UNGROUNDED_PIXEL_SURFACE]")
 		}
 		b.WriteByte('\n')
+
+		// Do not descend into sensitive input subtrees once the control itself is emitted redacted.
+		if isSens {
+			return
+		}
 
 		nextParentName := parentName
 		if name != "" {
 			nextParentName = name
 		}
-		for _, cid := range n.ChildIDs {
+		for _, cid := range idx.childrenByParent[id] {
 			walk(cid, depth+1, nextParentName)
 		}
 	}
 
-	for _, rid := range roots {
+	for _, rid := range idx.roots {
 		walk(rid, 0, "")
 	}
 
 	out := strings.TrimSpace(b.String())
 	if len(out) > MaxCompactAXTreeBytes {
-		out = strings.TrimSpace(out[:MaxCompactAXTreeBytes])
+		out = strings.TrimSpace(truncateUTF8Bytes(out, MaxCompactAXTreeBytes))
 	}
 	stats.CompactBytes = len(out)
 	// Canvas blind spot triggers when unlabelled <canvas>/WebGL surfaces exist and little or no semantic text is exposed.
@@ -313,18 +393,6 @@ func FormatCompactAXTree(nodes []AXNode, rawByteLen int) (string, AXGroundingSta
 		stats.CanvasBlindSpot = true
 	}
 	return out, stats
-}
-
-// InspectHTMLCanvasBlindSpot checks whether scrubbed HTML relies on <canvas> elements without fallback text.
-func InspectHTMLCanvasBlindSpot(scrubbedHTML string, axStats AXGroundingStats) bool {
-	if axStats.CanvasBlindSpot {
-		return true
-	}
-	lower := strings.ToLower(scrubbedHTML)
-	if !strings.Contains(lower, "<canvas") {
-		return false
-	}
-	return axStats.UnlabelledCanvases > 0 || axStats.TotalNodes == 0
 }
 
 func isSensitiveInputRole(roleLower string) bool {
@@ -367,19 +435,19 @@ func isCanvasLikeRole(roleLower string, n *AXNode) bool {
 	return false
 }
 
-func hasAccessibleDescendantText(n *AXNode, byID map[string]*AXNode, depth int) bool {
-	if n == nil || depth > 8 {
+func hasAccessibleDescendantText(id string, idx axTreeIndex, depth int) bool {
+	if depth > 8 {
 		return false
 	}
-	for _, cid := range n.ChildIDs {
-		child, ok := byID[cid]
+	for _, cid := range idx.childrenByParent[id] {
+		child, ok := idx.byID[cid]
 		if !ok {
 			continue
 		}
 		if !child.Ignored && child.Name.StringValue() != "" {
 			return true
 		}
-		if hasAccessibleDescendantText(child, byID, depth+1) {
+		if hasAccessibleDescendantText(cid, idx, depth+1) {
 			return true
 		}
 	}

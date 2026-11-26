@@ -2,10 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -402,20 +406,71 @@ func startTaskHeartbeat(ctx context.Context, svcClient *bus.DesktopClient, taskI
 	return done
 }
 
+var errRelayRestarting = errors.New("relay restarting")
+
+// runTraySyncStep executes one tray sync tick: checks /v1/status first and skips drainQueue
+// (0 heartbeat/claim calls) whenever the relay is mid-rollout (transport error or 502/503/504).
+func runTraySyncStep(
+	ctx context.Context,
+	drv driver.TargetDriver,
+	cfg contract.Config,
+	svcClient *bus.DesktopClient,
+	hostLabel string,
+	approver FallbackApprover,
+	onNewerVersion func(remoteVer string) bool,
+) (drained int, updated bool, err error) {
+	remoteStatus, serr := svcClient.GetDesktopStatus(ctx)
+	if serr != nil {
+		if bus.IsRelayTransientError(serr) {
+			return 0, false, errRelayRestarting
+		}
+	} else if srvVer, _ := remoteStatus["server_version"].(string); isNewerVersion(srvVer, version) && onNewerVersion != nil {
+		if onNewerVersion(srvVer) {
+			return 0, true, nil
+		}
+	}
+
+	drained, derr := drainQueue(ctx, drv, cfg, svcClient, hostLabel, 0, false, approver)
+	return drained, false, derr
+}
+
 func performSelfUpdate(ctx context.Context, svcClient *bus.DesktopClient) (string, error) {
 	exe, err := os.Executable()
 	if err != nil || exe == "" {
 		return "", fmt.Errorf("cannot resolve executable path: %w", err)
 	}
-	data, remoteVer, err := svcClient.DownloadReleaseBinary(ctx, runtime.GOOS)
+	return performSelfUpdateTo(ctx, svcClient, exe, runtime.GOOS, 512*1024)
+}
+
+func performSelfUpdateTo(ctx context.Context, svcClient *bus.DesktopClient, exe string, goos string, minBytes int) (string, error) {
+	asset := "deskdrop"
+	if goos == "windows" {
+		asset = "deskdrop.exe"
+	}
+	sumsRaw, err := svcClient.DownloadReleaseChecksums(ctx)
+	if err != nil {
+		return "", fmt.Errorf("fetch release SHA256SUMS.txt failed: %w", err)
+	}
+	expectedHex, err := parseSHA256Sum(sumsRaw, asset)
+	if err != nil {
+		return "", fmt.Errorf("parse SHA256SUMS.txt for %s failed: %w", asset, err)
+	}
+
+	data, remoteVer, err := svcClient.DownloadReleaseBinary(ctx, goos)
 	if err != nil {
 		return "", err
 	}
-	if len(data) < 512*1024 {
+	if len(data) < minBytes {
 		return "", fmt.Errorf("downloaded binary too small (%d bytes)", len(data))
 	}
-	if runtime.GOOS == "windows" && (data[0] != 'M' || data[1] != 'Z') {
+	if goos == "windows" && (len(data) < 2 || data[0] != 'M' || data[1] != 'Z') {
 		return "", errors.New("downloaded binary is not a valid Windows PE executable")
+	}
+
+	sum := sha256.Sum256(data)
+	actualHex := hex.EncodeToString(sum[:])
+	if subtle.ConstantTimeCompare([]byte(actualHex), []byte(expectedHex)) != 1 {
+		return "", fmt.Errorf("SHA-256 mismatch for %s: got %s, want %s", asset, actualHex, expectedHex)
 	}
 
 	tmpPath := exe + ".new"
@@ -442,6 +497,28 @@ func performSelfUpdate(ctx context.Context, svcClient *bus.DesktopClient) (strin
 		remoteVer = "latest"
 	}
 	return remoteVer, nil
+}
+
+func parseSHA256Sum(raw string, asset string) (string, error) {
+	for _, line := range strings.Split(raw, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		digest := strings.ToLower(strings.TrimSpace(fields[0]))
+		name := strings.TrimPrefix(strings.TrimSpace(fields[1]), "*")
+		if filepath.Base(name) != asset {
+			continue
+		}
+		if len(digest) != 64 {
+			return "", fmt.Errorf("invalid sha256 digest length %d for %s", len(digest), asset)
+		}
+		if _, err := hex.DecodeString(digest); err != nil {
+			return "", fmt.Errorf("invalid sha256 hex digest for %s: %w", asset, err)
+		}
+		return digest, nil
+	}
+	return "", fmt.Errorf("no SHA-256 entry found for %q", asset)
 }
 
 func isNewerVersion(remoteVer, localVer string) bool {

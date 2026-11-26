@@ -1,6 +1,7 @@
 package contract
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,12 +9,19 @@ import (
 	"strings"
 )
 
+type builtinAirGapRule struct {
+	name      string
+	re        *regexp.Regexp
+	checkSafe bool
+}
+
 // Builtin patterns blocking accidental internal or corporate leaks on outbound payloads.
-var builtinForbiddenPatterns = []*regexp.Regexp{
-	regexp.MustCompile("(?i)" + "//" + "depot/"),
-	regexp.MustCompile(`(?i)\b` + "b" + `/\d{6,}\b`),
-	regexp.MustCompile(`(?i)\b` + "go" + `/[a-zA-Z0-9_-]{3,}\b`),
-	regexp.MustCompile(`(?i)\.` + "corp" + `\.google\.com`),
+var builtinForbiddenRules = []builtinAirGapRule{
+	{name: "depot_path", re: regexp.MustCompile("(?i)" + "//" + "depot/")},
+	{name: "bug_tracker_id", re: regexp.MustCompile(`(?i)\b` + "b" + `/\d{6,}\b`)},
+	{name: "internal_shortlink_url", re: regexp.MustCompile(`(?i)https?://` + "go" + `/[a-zA-Z0-9_-]{3,}\b`), checkSafe: true},
+	{name: "internal_shortlink", re: regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9_./-])(` + "go" + `/[a-zA-Z0-9_-]{3,})\b`), checkSafe: true},
+	{name: "corp_hostname", re: regexp.MustCompile(`(?i)\.` + "corp" + `\.google\.com`)},
 }
 
 var safeGoRefs = map[string]bool{
@@ -24,40 +32,47 @@ var safeGoRefs = map[string]bool{
 	"go/build":   true,
 }
 
-// EnforceAirGap verifies text contains zero forbidden internal or user-configured terms.
+// EnforceAirGap verifies text contains zero forbidden internal or caller-supplied terms.
+// Extra terms are matched literally (case-insensitive) and matched values are never echoed in errors.
 func EnforceAirGap(text string, extraTerms []string) error {
-	for _, re := range builtinForbiddenPatterns {
-		matches := re.FindAllString(text, -1)
+	for _, rule := range builtinForbiddenRules {
+		matches := rule.re.FindAllStringSubmatch(text, -1)
 		for _, m := range matches {
-			if safeGoRefs[strings.ToLower(m)] {
-				continue
+			token := m[0]
+			if len(m) > 1 && m[1] != "" {
+				token = m[1]
 			}
-			return fmt.Errorf("air-gap guard blocked outbound payload matching pattern %q", m)
+			if rule.checkSafe {
+				lowerTok := strings.ToLower(token)
+				lowerTok = strings.TrimPrefix(lowerTok, "https://")
+				lowerTok = strings.TrimPrefix(lowerTok, "http://")
+				if safeGoRefs[lowerTok] {
+					continue
+				}
+			}
+			return fmt.Errorf("air-gap guard blocked outbound payload (rule: %s)", rule.name)
 		}
 	}
 
-	allTerms := append([]string{}, extraTerms...)
-	allTerms = append(allTerms, loadLocalGuardTerms()...)
-	for _, term := range allTerms {
+	if len(extraTerms) == 0 {
+		return nil
+	}
+	lowerText := strings.ToLower(text)
+	for _, term := range extraTerms {
 		t := strings.TrimSpace(term)
 		if t == "" || strings.HasPrefix(t, "#") {
 			continue
 		}
-		re, err := regexp.Compile("(?i)" + t)
-		if err != nil {
-			if strings.Contains(strings.ToLower(text), strings.ToLower(t)) {
-				return fmt.Errorf("air-gap guard blocked outbound payload matching term %q", t)
-			}
-			continue
-		}
-		if m := re.FindString(text); m != "" {
-			return fmt.Errorf("air-gap guard blocked outbound payload matching term %q", m)
+		if strings.Contains(lowerText, strings.ToLower(t)) {
+			return errors.New("air-gap guard blocked outbound payload matching configured forbidden term")
 		}
 	}
 	return nil
 }
 
-func loadLocalGuardTerms() []string {
+// LoadLocalGuardTerms reads optional workstation-local guard terms once at process startup.
+// Keeping this outside EnforceAirGap ensures unit tests and library callers remain hermetic.
+func LoadLocalGuardTerms() []string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return nil
@@ -67,5 +82,13 @@ func loadLocalGuardTerms() []string {
 	if err != nil {
 		return nil
 	}
-	return strings.Split(string(raw), "\n")
+	var out []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
 }

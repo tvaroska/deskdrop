@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tvaroska/deskdrop/internal/contract"
 	"github.com/tvaroska/deskdrop/internal/healer"
 	"github.com/tvaroska/deskdrop/internal/recipes"
 	"github.com/tvaroska/deskdrop/internal/server"
@@ -69,6 +70,7 @@ func main() {
 	}
 
 	var forbidden []string
+	forbidden = append(forbidden, contract.LoadLocalGuardTerms()...)
 	if raw := strings.TrimSpace(os.Getenv("EXTRA_FORBIDDEN_TERMS")); raw != "" {
 		for _, p := range strings.Split(raw, ",") {
 			if s := strings.TrimSpace(p); s != "" {

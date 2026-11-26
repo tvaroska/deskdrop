@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -138,13 +139,36 @@ func (s *Service) writeIngestError(w http.ResponseWriter, err error) {
 	writeAPIError(w, http.StatusInternalServerError, "STORE_ERROR", err.Error(), nil)
 }
 
+const (
+	maxMultipartRequestBytes   = 15 * 1024 * 1024
+	maxBundleZipBytes          = 14 * 1024 * 1024
+	maxDiagnosticZipEntries    = 16
+	maxDiagnosticZipTotalBytes = 10 * 1024 * 1024
+	maxDiagnosticDOMBytes      = 512 * 1024
+	maxDiagnosticAXTreeBytes   = 256 * 1024
+	maxDiagnosticTextBytes     = 256 * 1024
+	maxDiagnosticPNGBytes      = 8 * 1024 * 1024
+)
+
+type diagnosticZipContents struct {
+	DOMHTML       string
+	AXTreeText    string
+	AllText       string
+	ScreenshotPNG []byte
+}
+
 func parseFailRequest(r *http.Request) (contract.FailReportMetadata, []byte, error) {
 	ct := strings.ToLower(r.Header.Get("Content-Type"))
 	if strings.HasPrefix(ct, "multipart/form-data") {
-		r.Body = http.MaxBytesReader(nil, r.Body, 15*1024*1024)
-		if err := r.ParseMultipartForm(15 * 1024 * 1024); err != nil {
+		r.Body = http.MaxBytesReader(nil, r.Body, maxMultipartRequestBytes)
+		if err := r.ParseMultipartForm(4 * 1024 * 1024); err != nil {
 			return contract.FailReportMetadata{}, nil, fmt.Errorf("invalid multipart form: %w", err)
 		}
+		defer func() {
+			if r.MultipartForm != nil {
+				_ = r.MultipartForm.RemoveAll()
+			}
+		}()
 		var meta contract.FailReportMetadata
 		rawJSON := r.FormValue("payload_json")
 		if rawJSON == "" {
@@ -157,7 +181,16 @@ func parseFailRequest(r *http.Request) (contract.FailReportMetadata, []byte, err
 		file, _, ferr := r.FormFile("bundle")
 		if ferr == nil {
 			defer file.Close()
-			zipBytes, _ = io.ReadAll(io.LimitReader(file, 14*1024*1024))
+			raw, rerr := io.ReadAll(io.LimitReader(file, maxBundleZipBytes+1))
+			if rerr != nil {
+				return meta, nil, fmt.Errorf("read diagnostic bundle: %w", rerr)
+			}
+			if int64(len(raw)) > maxBundleZipBytes {
+				return meta, nil, fmt.Errorf("diagnostic bundle exceeds %d bytes", maxBundleZipBytes)
+			}
+			zipBytes = raw
+		} else if !errors.Is(ferr, http.ErrMissingFile) {
+			return meta, nil, fmt.Errorf("read bundle form field: %w", ferr)
 		}
 		return meta, zipBytes, nil
 	}
@@ -169,39 +202,105 @@ func parseFailRequest(r *http.Request) (contract.FailReportMetadata, []byte, err
 	return meta, nil, nil
 }
 
-func inspectDiagnosticZip(zipBytes []byte) (domHTML string, axTreeText string, screenshotPNG []byte, err error) {
+func inspectDiagnosticZip(zipBytes []byte) (diagnosticZipContents, error) {
+	var out diagnosticZipContents
 	if len(zipBytes) == 0 {
-		return "", "", nil, nil
+		return out, nil
 	}
 	zr, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
 	if err != nil {
-		return "", "", nil, err
+		return diagnosticZipContents{}, fmt.Errorf("invalid diagnostic zip: %w", err)
 	}
+	if len(zr.File) > maxDiagnosticZipEntries {
+		return diagnosticZipContents{}, fmt.Errorf("diagnostic zip contains %d entries (max %d)", len(zr.File), maxDiagnosticZipEntries)
+	}
+
+	seen := make(map[string]bool, len(zr.File))
+	var totalBytes int64
+	var textBuf strings.Builder
+	pngMagic := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
+
 	for _, f := range zr.File {
-		switch f.Name {
+		name := f.Name
+		clean := path.Clean(name)
+		if name == "" || clean == "." || clean != name || strings.HasPrefix(name, "/") || strings.HasPrefix(name, "./") || strings.Contains(name, "\\") || strings.Contains(name, "..") {
+			return diagnosticZipContents{}, fmt.Errorf("invalid diagnostic zip entry name %q", name)
+		}
+		if f.FileInfo().IsDir() {
+			return diagnosticZipContents{}, fmt.Errorf("unexpected directory entry %q in diagnostic zip", name)
+		}
+		if seen[clean] {
+			return diagnosticZipContents{}, fmt.Errorf("duplicate diagnostic zip entry %q", clean)
+		}
+		seen[clean] = true
+
+		entryLimit := int64(maxDiagnosticTextBytes)
+		switch name {
 		case "dom.html":
-			rc, oerr := f.Open()
-			if oerr == nil {
-				raw, _ := io.ReadAll(io.LimitReader(rc, 512*1024))
-				_ = rc.Close()
-				domHTML = contract.ScrubHTML(string(raw))
-			}
+			entryLimit = maxDiagnosticDOMBytes
 		case "axtree.txt":
-			rc, oerr := f.Open()
-			if oerr == nil {
-				raw, _ := io.ReadAll(io.LimitReader(rc, 256*1024))
-				_ = rc.Close()
-				axTreeText = strings.TrimSpace(string(raw))
-			}
+			entryLimit = maxDiagnosticAXTreeBytes
 		case "screenshot.png":
-			rc, oerr := f.Open()
-			if oerr == nil {
-				screenshotPNG, _ = io.ReadAll(io.LimitReader(rc, 8*1024*1024))
-				_ = rc.Close()
+			entryLimit = maxDiagnosticPNGBytes
+		}
+		remaining := int64(maxDiagnosticZipTotalBytes) - totalBytes
+		if remaining <= 0 {
+			return diagnosticZipContents{}, fmt.Errorf("diagnostic zip decompressed size exceeds %d bytes", maxDiagnosticZipTotalBytes)
+		}
+		readCap := entryLimit
+		if remaining < readCap {
+			readCap = remaining
+		}
+
+		rc, oerr := f.Open()
+		if oerr != nil {
+			return diagnosticZipContents{}, fmt.Errorf("open diagnostic zip entry %q: %w", name, oerr)
+		}
+		raw, rerr := io.ReadAll(io.LimitReader(rc, readCap+1))
+		cerr := rc.Close()
+		if rerr != nil {
+			return diagnosticZipContents{}, fmt.Errorf("read diagnostic zip entry %q: %w", name, rerr)
+		}
+		if cerr != nil {
+			return diagnosticZipContents{}, fmt.Errorf("close diagnostic zip entry %q: %w", name, cerr)
+		}
+		if int64(len(raw)) > entryLimit {
+			return diagnosticZipContents{}, fmt.Errorf("diagnostic zip entry %q exceeds %d bytes", name, entryLimit)
+		}
+		totalBytes += int64(len(raw))
+		if totalBytes > maxDiagnosticZipTotalBytes {
+			return diagnosticZipContents{}, fmt.Errorf("diagnostic zip decompressed size exceeds %d bytes", maxDiagnosticZipTotalBytes)
+		}
+
+		switch name {
+		case "dom.html":
+			textBuf.Write(raw)
+			textBuf.WriteByte('\n')
+			out.DOMHTML = contract.ScrubHTML(string(raw))
+			textBuf.WriteString(out.DOMHTML)
+			textBuf.WriteByte('\n')
+		case "axtree.txt":
+			out.AXTreeText = strings.TrimSpace(string(raw))
+			textBuf.Write(raw)
+			textBuf.WriteByte('\n')
+		case "screenshot.png":
+			if len(raw) < len(pngMagic) || !bytes.Equal(raw[:len(pngMagic)], pngMagic) {
+				return diagnosticZipContents{}, errors.New("diagnostic zip entry screenshot.png is not a valid PNG image")
+			}
+			out.ScreenshotPNG = raw
+		default:
+			if strings.HasSuffix(strings.ToLower(clean), ".png") {
+				if len(raw) < len(pngMagic) || !bytes.Equal(raw[:len(pngMagic)], pngMagic) {
+					return diagnosticZipContents{}, fmt.Errorf("diagnostic zip entry %q is not a valid PNG image", clean)
+				}
+			} else {
+				textBuf.Write(raw)
+				textBuf.WriteByte('\n')
 			}
 		}
 	}
-	return domHTML, axTreeText, screenshotPNG, nil
+	out.AllText = textBuf.String()
+	return out, nil
 }
 
 func formatDropBusBody(rec contract.DropRecord, baseURL string) string {

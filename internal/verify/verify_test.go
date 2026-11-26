@@ -415,3 +415,92 @@ func TestVerifyRecipeOnAXTreeDesktopUIAAndRedaction(t *testing.T) {
 		t.Fatalf("VerifyRecipeOnAXTreeJSON leaked password value in TextExcerpt: %q", out.StepResult.TextExcerpt)
 	}
 }
+
+func TestA7VerifyNodeTextInlineSpansAriaHiddenAndCSSParity(t *testing.T) {
+	htmlDoc := `<!doctype html><html><body>
+		<main>
+			<div class="feed-card" data-urn="urn:li:activity:777">
+				<span class="age">5 min</span>
+				<span class="age2">3 months</span>
+				<button aria-label="View Reactions" class="skip">Ignore</button>
+				<button aria-label="64 Reactions" class="live"><span aria-hidden="true">64</span></button>
+				<a href="/analytics/post-summary/urn:li:activity:777/">
+					<span aria-hidden="true"><span>1,</span><span>234</span></span><span aria-hidden="true">impressions</span>
+				</a>
+				<div class="alt">impressions: 980</div>
+			</div>
+		</main>
+	</body></html>`
+
+	recipe := contract.Recipe{
+		Name:  "parity-test",
+		Topic: "analytics",
+		Steps: []contract.Step{
+			{
+				ID:  "feed",
+				URL: "https://example.com/feed",
+				Items: &contract.ItemRule{
+					Container:     `a[href*="/analytics/post-summary/"]`,
+					AnchorClosest: "div.feed-card",
+					Fields: map[string]contract.FieldRule{
+						"impressions": {
+							Selector: `div.feed-card a[href*="/analytics/post-summary/"]`,
+							Regex:    `(?i)([\d,]+)\s+impressions`,
+							Parse:    "number",
+						},
+						"reactions": {
+							Selector: `button[aria-label*="reaction" i]:not(.skip)`,
+							Attr:     "aria-label|text",
+							Parse:    "number",
+						},
+						"age_min": {
+							Selector: `span.age`,
+							Parse:    "number",
+						},
+						"alt_group2": {
+							Selector: `div.feed-card > div:last-child`,
+							Regex:    `(?i)(?:(\d+)\s+impressions|impressions:\s*(\d+))`,
+							Parse:    "number",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	out, err := VerifyRecipeOnHTML(recipe, nil, "feed", htmlDoc, "https://example.com/feed")
+	if err != nil || !out.Passed || len(out.StepResult.Items) != 1 {
+		t.Fatalf("VerifyRecipeOnHTML failed: passed=%v err=%v outErr=%s items=%d", out.Passed, err, out.Error, len(out.StepResult.Items))
+	}
+	item := out.StepResult.Items[0]
+	if item["impressions"] != int64(1234) {
+		t.Fatalf("impressions = %#v, want 1234 (aria-hidden + split inline spans)", item["impressions"])
+	}
+	if item["reactions"] != int64(64) {
+		t.Fatalf("reactions = %#v, want 64 ([attr*='x' i] + :not(.skip))", item["reactions"])
+	}
+	if item["age_min"] != int64(5) {
+		t.Fatalf("age_min = %#v, want 5 (not 5e6 from '5 min')", item["age_min"])
+	}
+	if item["alt_group2"] != int64(980) {
+		t.Fatalf("alt_group2 = %#v, want 980 (:last-child + group-2 alternation)", item["alt_group2"])
+	}
+
+	// Quoted attribute operators and parentheses inside :not(...) must parse cleanly.
+	quotedHTML := `<html><body><div data-u="a*=b" title="ok">MATCH</div><div data-u="a*=b" title="a)b">SKIP</div></body></html>`
+	qRecipe := contract.Recipe{
+		Name:  "quoted-sel",
+		Topic: "t",
+		Steps: []contract.Step{{
+			ID:  "s1",
+			URL: "https://example.com/",
+			Fields: map[string]contract.FieldRule{
+				"picked": {Selector: `div[data-u="a*=b"]:not([title="a)b"])`},
+			},
+		}},
+	}
+	qOut, err := VerifyRecipeOnHTML(qRecipe, nil, "s1", quotedHTML, "https://example.com/")
+	if err != nil || !qOut.Passed || qOut.StepResult.Fields["picked"] != "MATCH" {
+		t.Fatalf("quoted selector parity failed: passed=%v err=%v fields=%+v", qOut.Passed, err, qOut.StepResult.Fields)
+	}
+}

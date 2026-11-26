@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/net/html"
 
@@ -381,18 +383,21 @@ func applyRegex(text string, pattern string, group int) string {
 	if len(m) == 0 {
 		return ""
 	}
-	idx := group
-	if idx <= 0 {
-		if len(m) > 1 {
-			idx = 1
-		} else {
-			idx = 0
+	if group > 0 {
+		if group >= len(m) {
+			return ""
+		}
+		return m[group]
+	}
+	if len(m) == 1 {
+		return m[0]
+	}
+	for i := 1; i < len(m); i++ {
+		if m[i] != "" {
+			return m[i]
 		}
 	}
-	if idx >= len(m) {
-		return ""
-	}
-	return m[idx]
+	return ""
 }
 
 func extractHeadings(root *html.Node) []string {
@@ -524,26 +529,46 @@ func extractTables(root *html.Node) []contract.TableData {
 
 func nodeText(n *html.Node) string {
 	var sb strings.Builder
+	pendingSpace := false
 	var walk func(*html.Node)
 	walk = func(cur *html.Node) {
 		if cur == nil {
 			return
 		}
 		if cur.Type == html.ElementNode {
-			switch strings.ToLower(cur.Data) {
+			tag := strings.ToLower(cur.Data)
+			switch tag {
 			case "script", "style", "svg", "noscript":
 				return
 			}
 			if _, hidden := lookupAttr(cur, "hidden"); hidden {
 				return
 			}
-			if strings.EqualFold(getAttr(cur, "aria-hidden"), "true") {
-				return
+			isBlock := isBlockOrBoundaryTag(tag)
+			if isBlock && sb.Len() > 0 {
+				pendingSpace = true
 			}
+			for c := cur.FirstChild; c != nil; c = c.NextSibling {
+				walk(c)
+			}
+			if sb.Len() > 0 {
+				// Mark element boundary so adjacent inline spans insert a space unless joining a split number/punctuation.
+				pendingSpace = true
+			}
+			return
 		}
 		if cur.Type == html.TextNode {
-			sb.WriteString(cur.Data)
-			sb.WriteByte(' ')
+			txt := cur.Data
+			if txt == "" {
+				return
+			}
+			if pendingSpace && sb.Len() > 0 {
+				if shouldInsertBoundarySpace(sb.String(), txt) {
+					sb.WriteByte(' ')
+				}
+				pendingSpace = false
+			}
+			sb.WriteString(txt)
 			return
 		}
 		for c := cur.FirstChild; c != nil; c = c.NextSibling {
@@ -552,6 +577,49 @@ func nodeText(n *html.Node) string {
 	}
 	walk(n)
 	return contract.NormalizeWhitespace(sb.String())
+}
+
+func isBlockOrBoundaryTag(tag string) bool {
+	switch tag {
+	case "div", "p", "li", "ul", "ol", "dl", "dt", "dd",
+		"tr", "td", "th", "table", "thead", "tbody", "tfoot",
+		"h1", "h2", "h3", "h4", "h5", "h6",
+		"section", "article", "header", "footer", "nav", "aside", "main",
+		"br", "hr", "blockquote", "pre", "button", "a", "label", "summary", "figcaption":
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldInsertBoundarySpace(prev string, next string) bool {
+	if prev == "" || next == "" {
+		return false
+	}
+	lastRune, _ := utf8.DecodeLastRuneInString(prev)
+	firstRune, _ := utf8.DecodeRuneInString(next)
+	if unicode.IsSpace(lastRune) || unicode.IsSpace(firstRune) {
+		return false
+	}
+	// Preserve numbers split across inline spans (e.g. <span>1,</span><span>234</span>, <span>12</span><span>.5</span>).
+	if (lastRune == ',' || lastRune == '.') && unicode.IsDigit(firstRune) {
+		return false
+	}
+	if unicode.IsDigit(lastRune) && (firstRune == ',' || firstRune == '.' || firstRune == '%') {
+		return false
+	}
+	// Preserve currency/sign prefix attached to digits (e.g. <span>$</span><span>100</span>).
+	if (lastRune == '$' || lastRune == '€' || lastRune == '£' || lastRune == '+' || lastRune == '-') && unicode.IsDigit(firstRune) {
+		return false
+	}
+	switch firstRune {
+	case ',', '.', ';', ':', '!', '?', '%', ')', ']':
+		return false
+	}
+	if lastRune == '(' || lastRune == '[' {
+		return false
+	}
+	return true
 }
 
 func nodeTextLines(n *html.Node) []string {

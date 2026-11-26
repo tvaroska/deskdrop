@@ -154,15 +154,68 @@ function normalizeWS(raw) {
 	return String(raw || "").replace(/[\u200b\u00a0\ufeff]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
+function shouldInsertBoundarySpace(prev, next) {
+	if (!prev || !next) return false;
+	const lastCh = prev[prev.length - 1];
+	const firstCh = next[0];
+	if (/\s/.test(lastCh) || /\s/.test(firstCh)) return false;
+	if ((lastCh === "," || lastCh === ".") && /\d/.test(firstCh)) return false;
+	if (/\d/.test(lastCh) && (firstCh === "," || firstCh === "." || firstCh === "%")) return false;
+	if ((lastCh === "$" || lastCh === "\u20ac" || lastCh === "\u00a3" || lastCh === "+" || lastCh === "-") && /\d/.test(firstCh)) return false;
+	if (/^[,.;:!?%)\]]$/.test(firstCh)) return false;
+	if (lastCh === "(" || lastCh === "[") return false;
+	return true;
+}
+
 function cleanText(el) {
 	if (!el) return "";
+	if (el.childNodes && el.childNodes.length > 0) {
+		let buf = "";
+		let pendingSpace = false;
+		const skipTags = { SCRIPT: 1, STYLE: 1, SVG: 1, NOSCRIPT: 1 };
+		const walk = (cur) => {
+			if (!cur) return;
+			if (cur.nodeType === 3) {
+				const txt = String(cur.nodeValue || "");
+				if (!txt) return;
+				if (pendingSpace && buf.length > 0) {
+					if (shouldInsertBoundarySpace(buf, txt)) buf += " ";
+					pendingSpace = false;
+				}
+				buf += txt;
+				return;
+			}
+			if (cur.nodeType === 1) {
+				const tag = (cur.tagName || "").toUpperCase();
+				if (skipTags[tag] || cur.hidden) return;
+				if (typeof window !== "undefined" && window.getComputedStyle) {
+					try {
+						const st = window.getComputedStyle(cur);
+						if (st && (st.display === "none" || st.visibility === "hidden")) return;
+					} catch (_) {}
+				}
+				if (buf.length > 0) pendingSpace = true;
+				if (cur.shadowRoot) {
+					for (const sc of (cur.shadowRoot.childNodes || [])) walk(sc);
+				}
+				for (const ch of (cur.childNodes || [])) walk(ch);
+				if (buf.length > 0) pendingSpace = true;
+				return;
+			}
+			if (cur.childNodes) {
+				for (const ch of cur.childNodes) walk(ch);
+			}
+		};
+		walk(el);
+		return normalizeWS(buf);
+	}
 	const raw = (el.innerText !== undefined && el.innerText !== "") ? el.innerText : (el.textContent || "");
 	return normalizeWS(raw);
 }
 
 function parseCompactFloat(raw) {
 	const cleaned = normalizeWS(raw).replace(/,/g, "");
-	const m = cleaned.match(/(-?\d+(?:\.\d+)?)\s*([KkMmBb])?/);
+	const m = cleaned.match(/(-?\d+(?:\.\d+)?)(?:\s*([KkMmBb])\b)?/);
 	if (!m) return { ok: false, val: 0 };
 	let n = parseFloat(m[1]);
 	if (Number.isNaN(n)) return { ok: false, val: 0 };
@@ -175,13 +228,57 @@ function parseCompactFloat(raw) {
 
 function compileCompatRegex(pattern) {
 	let pat = String(pattern || "");
-	let flags = "";
-	const flagPrefix = pat.match(/^\(\?([ims]+)\)/);
-	if (flagPrefix) {
-		flags = flagPrefix[1];
-		pat = pat.slice(flagPrefix[0].length);
+	const flagSet = new Set();
+	let ungreedy = false;
+	pat = pat.replace(/\(\?([imsU]+)\)/g, (_, fl) => {
+		for (const ch of fl) {
+			if (ch === "i" || ch === "m" || ch === "s") flagSet.add(ch);
+			if (ch === "U") ungreedy = true;
+		}
+		return "";
+	});
+	const multiline = flagSet.has("m");
+	let translated = "";
+	let inClass = false;
+	for (let i = 0; i < pat.length; i++) {
+		const ch = pat[i];
+		if (ch === "\\" && i + 1 < pat.length) {
+			const nxt = pat[i + 1];
+			if (!inClass && !multiline && nxt === "A") {
+				translated += "^";
+				i++;
+				continue;
+			}
+			if (!inClass && !multiline && nxt === "z") {
+				translated += "$";
+				i++;
+				continue;
+			}
+			translated += ch + nxt;
+			i++;
+			continue;
+		}
+		if (ch === "[") inClass = true;
+		else if (ch === "]" && inClass) inClass = false;
+		if (!inClass && ungreedy && (ch === "*" || ch === "+" || ch === "?")) {
+			const prev = translated.length > 0 ? translated[translated.length - 1] : "";
+			if (prev !== "(" && pat[i + 1] !== "?") {
+				translated += ch + "?";
+				continue;
+			}
+		}
+		translated += ch;
 	}
-	return new RegExp(pat, flags);
+	const flags = Array.from(flagSet).join("");
+	try {
+		return new RegExp(translated, flags);
+	} catch (_) {
+		const downgraded = translated.replace(/\(\?([ims]+):/g, (_, fl) => {
+			for (const ch of fl) flagSet.add(ch);
+			return "(?:";
+		});
+		return new RegExp(downgraded, Array.from(flagSet).join(""));
+	}
 }
 
 function applyRegexCapture(text, pattern, group) {
@@ -190,8 +287,14 @@ function applyRegexCapture(text, pattern, group) {
 		const re = compileCompatRegex(pattern);
 		const m = String(text || "").match(re);
 		if (!m) return "";
-		const idx = group > 0 ? group : (m.length > 1 ? 1 : 0);
-		return m[idx] !== undefined ? m[idx] : "";
+		if (group > 0) {
+			return m[group] !== undefined ? m[group] : "";
+		}
+		if (m.length === 1) return m[0];
+		for (let i = 1; i < m.length; i++) {
+			if (m[i] !== undefined && m[i] !== "") return m[i];
+		}
+		return "";
 	} catch (_) {
 		return "";
 	}

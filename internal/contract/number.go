@@ -10,7 +10,7 @@ import (
 var (
 	invisibleCharsRe = regexp.MustCompile("[\u200b\u00a0\ufeff]+")
 	whitespaceRunRe  = regexp.MustCompile(`\s+`)
-	compactNumRe     = regexp.MustCompile(`(-?\d+(?:\.\d+)?)\s*([KkMmBb])?`)
+	compactNumRe     = regexp.MustCompile(`(-?\d+(?:\.\d+)?)(?:\s*([KkMmBb])\b)?`)
 )
 
 // NormalizeWhitespace removes invisible Unicode separators and collapses whitespace runs.

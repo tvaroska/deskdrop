@@ -351,7 +351,55 @@ func ResolveRecipe(r Recipe, cliVars map[string]string) (Recipe, error) {
 		return Recipe{}, fmt.Errorf("missing required recipe variable(s): %s (pass --var key=value)", strings.Join(uniqueStrings(missing), ", "))
 	}
 	r.Steps = steps
+	if err := validateResolvedTargets(r); err != nil {
+		return Recipe{}, err
+	}
 	return r, nil
+}
+
+func validateResolvedTargets(r Recipe) error {
+	if r.NormalizedDriver() == "uia" {
+		for _, s := range r.Steps {
+			u := strings.TrimSpace(s.URL)
+			if u != "" && !strings.HasPrefix(strings.ToLower(u), "uia://") {
+				return fmt.Errorf("uia step %q url %q must use uia:// scheme", s.ID, s.URL)
+			}
+		}
+		return nil
+	}
+
+	var allowed []string
+	for _, raw := range r.AllowedDomains {
+		d := ExtractDomain(raw)
+		if d == "" {
+			return fmt.Errorf("recipe %q has invalid allowed_domain %q", r.Name, raw)
+		}
+		allowed = append(allowed, d)
+	}
+
+	for _, s := range r.Steps {
+		if u := strings.TrimSpace(s.URL); u != "" {
+			if err := validateHTTPURL(u); err != nil {
+				return fmt.Errorf("step %q url %q: %w", s.ID, s.URL, err)
+			}
+			if len(allowed) > 0 {
+				dom := ExtractDomain(u)
+				if !domainInAllowlist(dom, allowed) {
+					return fmt.Errorf("step %q url domain %q violates recipe allowed_domains", s.ID, dom)
+				}
+			}
+		}
+		if m := strings.TrimSpace(s.MatchTabURL); m != "" {
+			dom := ExtractDomain(m)
+			if dom == "" {
+				return fmt.Errorf("step %q match_tab_url %q must specify an explicit HTTP/HTTPS host", s.ID, s.MatchTabURL)
+			}
+			if len(allowed) > 0 && !domainInAllowlist(dom, allowed) {
+				return fmt.Errorf("step %q match_tab_url domain %q violates recipe allowed_domains", s.ID, dom)
+			}
+		}
+	}
+	return nil
 }
 
 func resolveFieldRules(scope string, in map[string]FieldRule, sub func(string) string) (map[string]FieldRule, error) {

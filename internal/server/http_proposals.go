@@ -26,6 +26,58 @@ func (s *Service) handleListRecipes(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func failMetadataAirGapText(meta contract.FailReportMetadata) string {
+	return strings.Join([]string{
+		meta.From,
+		meta.To,
+		meta.Topic,
+		meta.Recipe,
+		meta.StepID,
+		meta.LandedURL,
+		meta.Domain,
+		string(meta.ErrorCode),
+		meta.Error,
+	}, " ")
+}
+
+// applySafeErrorCodeOverride restricts caller-supplied meta.ErrorCode overrides to an explicit safe
+// allowlist, never allowing a caller to downgrade AUTH_EXPIRED into SELECTOR_DRIFT or trigger the healer.
+func applySafeErrorCodeOverride(triage contract.ErrorTriage, requested contract.ErrorCode) (contract.ErrorTriage, error) {
+	code := contract.ErrorCode(strings.TrimSpace(string(requested)))
+	if code == "" {
+		return triage, nil
+	}
+	if triage.Action == contract.TriageHoldDomainAuth {
+		// Auth/login/CAPTCHA holds are fail-closed and cannot be overridden by caller error_code.
+		return triage, nil
+	}
+	switch code {
+	case contract.ErrorCodeContractInvalid:
+		triage.Code = contract.ErrorCodeContractInvalid
+		triage.Action = contract.TriageDiagnosticEscalation
+	case contract.ErrorCodeFallbackDeclined:
+		triage.Code = contract.ErrorCodeFallbackDeclined
+		triage.Action = contract.TriageDiagnosticEscalation
+	case contract.ErrorCodeAuthExpired:
+		triage.Code = contract.ErrorCodeAuthExpired
+		triage.Action = contract.TriageHoldDomainAuth
+	case contract.ErrorCodeCDPTransient:
+		triage.Code = contract.ErrorCodeCDPTransient
+		triage.Action = contract.TriageRetryBackoff
+	case contract.ErrorCodeUnknown:
+		triage.Code = contract.ErrorCodeUnknown
+	case contract.ErrorCodeSelectorDrift:
+		// Never allow callers to force SELECTOR_DRIFT and invoke the LLM healer unless
+		// deterministic classification already identified SELECTOR_DRIFT.
+		if triage.Code != contract.ErrorCodeSelectorDrift {
+			return triage, nil
+		}
+	default:
+		return triage, fmt.Errorf("unsupported error_code %q", code)
+	}
+	return triage, nil
+}
+
 func (s *Service) handleSubmitError(w http.ResponseWriter, r *http.Request) {
 	meta, zipBytes, err := parseFailRequest(r)
 	if err != nil {
@@ -36,21 +88,27 @@ func (s *Service) handleSubmitError(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusUnprocessableEntity, string(contract.ErrorCodeContractInvalid), "error field is required", nil)
 		return
 	}
-	if err := contract.EnforceAirGap(meta.Topic+" "+meta.Error+" "+meta.LandedURL, s.cfg.ForbiddenTerms); err != nil {
+	if err := contract.EnforceAirGap(failMetadataAirGapText(meta), s.cfg.ForbiddenTerms); err != nil {
 		writeAPIError(w, http.StatusUnprocessableEntity, "AIRGAP_VIOLATION", err.Error(), nil)
 		return
 	}
-	domHTML, axTreeText, screenshotPNG, zerr := inspectDiagnosticZip(zipBytes)
-	if zerr == nil && (domHTML != "" || axTreeText != "") {
-		if err := contract.EnforceAirGap(domHTML+" "+axTreeText, s.cfg.ForbiddenTerms); err != nil {
+	zdata, zerr := inspectDiagnosticZip(zipBytes)
+	if zerr != nil {
+		writeAPIError(w, http.StatusUnprocessableEntity, string(contract.ErrorCodeContractInvalid), zerr.Error(), nil)
+		return
+	}
+	if zdata.AllText != "" {
+		if err := contract.EnforceAirGap(zdata.AllText, s.cfg.ForbiddenTerms); err != nil {
 			writeAPIError(w, http.StatusUnprocessableEntity, "AIRGAP_VIOLATION", err.Error(), nil)
 			return
 		}
 	}
 
 	triage := contract.ClassifyExtractionError(meta.Error, meta.LandedURL, meta.Domain, len(zipBytes) > 0)
-	if meta.ErrorCode != "" {
-		triage.Code = meta.ErrorCode
+	triage, oerr := applySafeErrorCodeOverride(triage, meta.ErrorCode)
+	if oerr != nil {
+		writeAPIError(w, http.StatusUnprocessableEntity, string(contract.ErrorCodeContractInvalid), oerr.Error(), nil)
+		return
 	}
 
 	diagID, err := s.persistDiagnosticIfPresent(r.Context(), "", meta, triage, zipBytes)
@@ -86,9 +144,9 @@ func (s *Service) handleSubmitError(w http.ResponseWriter, r *http.Request) {
 
 	var proposalID string
 	var fallbackDropID string
-	if triage.Code == contract.ErrorCodeSelectorDrift && s.healer != nil && domHTML != "" && meta.Recipe != "" {
+	if triage.Code == contract.ErrorCodeSelectorDrift && triage.Action == contract.TriageDiagnosticEscalation && s.healer != nil && zdata.DOMHTML != "" && meta.Recipe != "" {
 		if rcp, ok, _ := s.catalog.Get(r.Context(), meta.Recipe); ok && rcp.AllowsComputerUseFallback() {
-			outcome := s.runDriftHealer(r.Context(), contract.Task{Recipe: rcp.Name, NotifyTo: to, Domain: triage.Domain}, rcp, meta.StepID, meta.LandedURL, meta.Error, diagID, domHTML, axTreeText, screenshotPNG, false)
+			outcome := s.runDriftHealer(r.Context(), contract.Task{Recipe: rcp.Name, NotifyTo: to, Domain: triage.Domain}, rcp, meta.StepID, meta.LandedURL, meta.Error, diagID, zdata.DOMHTML, zdata.AXTreeText, zdata.ScreenshotPNG, false)
 			proposalID = outcome.ProposalID
 			fallbackDropID = outcome.DropID
 		}
@@ -115,6 +173,10 @@ func (s *Service) handleFailTask(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, "STORE_ERROR", err.Error(), nil)
 		return
 	}
+	if task.Status != contract.TaskStatusClaimed {
+		writeAPIError(w, http.StatusConflict, "TASK_NOT_CLAIMED", fmt.Sprintf("task %q is in status %q, expected claimed", id, task.Status), nil)
+		return
+	}
 
 	meta, zipBytes, err := parseFailRequest(r)
 	if err != nil {
@@ -125,13 +187,21 @@ func (s *Service) handleFailTask(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusUnprocessableEntity, string(contract.ErrorCodeContractInvalid), "error field is required", nil)
 		return
 	}
-	if err := contract.EnforceAirGap(meta.Error+" "+meta.LandedURL, s.cfg.ForbiddenTerms); err != nil {
+	if meta.From != "" && task.ClaimedBy != "" && !strings.EqualFold(strings.TrimSpace(meta.From), strings.TrimSpace(task.ClaimedBy)) {
+		writeAPIError(w, http.StatusConflict, "TASK_NOT_CLAIMED", fmt.Sprintf("task %q is claimed by %q", id, task.ClaimedBy), nil)
+		return
+	}
+	if err := contract.EnforceAirGap(failMetadataAirGapText(meta), s.cfg.ForbiddenTerms); err != nil {
 		writeAPIError(w, http.StatusUnprocessableEntity, "AIRGAP_VIOLATION", err.Error(), nil)
 		return
 	}
-	domHTML, axTreeText, screenshotPNG, _ := inspectDiagnosticZip(zipBytes)
-	if domHTML != "" || axTreeText != "" {
-		if err := contract.EnforceAirGap(domHTML+" "+axTreeText, s.cfg.ForbiddenTerms); err != nil {
+	zdata, zerr := inspectDiagnosticZip(zipBytes)
+	if zerr != nil {
+		writeAPIError(w, http.StatusUnprocessableEntity, string(contract.ErrorCodeContractInvalid), zerr.Error(), nil)
+		return
+	}
+	if zdata.AllText != "" {
+		if err := contract.EnforceAirGap(zdata.AllText, s.cfg.ForbiddenTerms); err != nil {
 			writeAPIError(w, http.StatusUnprocessableEntity, "AIRGAP_VIOLATION", err.Error(), nil)
 			return
 		}
@@ -148,8 +218,10 @@ func (s *Service) handleFailTask(w http.ResponseWriter, r *http.Request) {
 		fallbackDomain = task.Domain
 	}
 	triage := contract.ClassifyExtractionError(meta.Error, meta.LandedURL, fallbackDomain, len(zipBytes) > 0)
-	if meta.ErrorCode != "" {
-		triage.Code = meta.ErrorCode
+	triage, oerr := applySafeErrorCodeOverride(triage, meta.ErrorCode)
+	if oerr != nil {
+		writeAPIError(w, http.StatusUnprocessableEntity, string(contract.ErrorCodeContractInvalid), oerr.Error(), nil)
+		return
 	}
 
 	diagID, err := s.persistDiagnosticIfPresent(r.Context(), id, meta, triage, zipBytes)
@@ -163,6 +235,10 @@ func (s *Service) handleFailTask(w http.ResponseWriter, r *http.Request) {
 		host = task.ClaimedBy
 	}
 	updated, _, newlyAlerted, err := s.store.FailTask(r.Context(), id, host, triage, meta.Error, diagID)
+	if errors.Is(err, ErrConflict) {
+		writeAPIError(w, http.StatusConflict, "TASK_NOT_CLAIMED", "task is no longer in claimed state", nil)
+		return
+	}
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "STORE_ERROR", err.Error(), nil)
 		return
@@ -182,11 +258,11 @@ func (s *Service) handleFailTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var healOut driftHealSummary
-	if triage.Code == contract.ErrorCodeSelectorDrift && s.healer != nil && domHTML != "" {
+	if triage.Code == contract.ErrorCodeSelectorDrift && triage.Action == contract.TriageDiagnosticEscalation && s.healer != nil && zdata.DOMHTML != "" {
 		rcp, rerr := s.catalog.ValidateAndResolveTask(r.Context(), task.Recipe, task.CustomRecipe, task.Vars)
 		if rerr == nil && rcp.AllowsComputerUseFallback() {
 			allowTier2 := task.Kind != contract.TaskKindFallback
-			healOut = s.runDriftHealer(r.Context(), updated, rcp, meta.StepID, meta.LandedURL, meta.Error, diagID, domHTML, axTreeText, screenshotPNG, allowTier2)
+			healOut = s.runDriftHealer(r.Context(), updated, rcp, meta.StepID, meta.LandedURL, meta.Error, diagID, zdata.DOMHTML, zdata.AXTreeText, zdata.ScreenshotPNG, allowTier2)
 			if refreshed, gerr := s.store.GetTask(r.Context(), id); gerr == nil {
 				updated = refreshed
 			}
@@ -221,18 +297,30 @@ func (s *Service) handleFallbackResult(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusUnprocessableEntity, string(contract.ErrorCodeContractInvalid), "task is not a fallback_task", nil)
 		return
 	}
+	if task.Status != contract.TaskStatusClaimed {
+		writeAPIError(w, http.StatusConflict, "TASK_NOT_CLAIMED", fmt.Sprintf("task %q is in status %q, expected claimed", id, task.Status), nil)
+		return
+	}
 
 	meta, zipBytes, err := parseFailRequest(r)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
 		return
 	}
-	domHTML, axTreeText, screenshotPNG, err := inspectDiagnosticZip(zipBytes)
-	if err != nil || domHTML == "" {
-		writeAPIError(w, http.StatusUnprocessableEntity, string(contract.ErrorCodeContractInvalid), "fallback result bundle must include dom.html", nil)
+	if err := contract.EnforceAirGap(failMetadataAirGapText(meta), s.cfg.ForbiddenTerms); err != nil {
+		writeAPIError(w, http.StatusUnprocessableEntity, "AIRGAP_VIOLATION", err.Error(), nil)
 		return
 	}
-	if err := contract.EnforceAirGap(domHTML+" "+axTreeText+" "+meta.LandedURL, s.cfg.ForbiddenTerms); err != nil {
+	zdata, err := inspectDiagnosticZip(zipBytes)
+	if err != nil || zdata.DOMHTML == "" {
+		msg := "fallback result bundle must include dom.html"
+		if err != nil {
+			msg = err.Error()
+		}
+		writeAPIError(w, http.StatusUnprocessableEntity, string(contract.ErrorCodeContractInvalid), msg, nil)
+		return
+	}
+	if err := contract.EnforceAirGap(zdata.AllText, s.cfg.ForbiddenTerms); err != nil {
 		writeAPIError(w, http.StatusUnprocessableEntity, "AIRGAP_VIOLATION", err.Error(), nil)
 		return
 	}
@@ -252,7 +340,7 @@ func (s *Service) handleFallbackResult(w http.ResponseWriter, r *http.Request) {
 	if s.healer != nil {
 		rcp, rerr := s.catalog.ValidateAndResolveTask(r.Context(), task.Recipe, task.CustomRecipe, task.Vars)
 		if rerr == nil && rcp.AllowsComputerUseFallback() {
-			healOut = s.runDriftHealer(r.Context(), task, rcp, meta.StepID, meta.LandedURL, meta.Error, diagID, domHTML, axTreeText, screenshotPNG, false)
+			healOut = s.runDriftHealer(r.Context(), task, rcp, meta.StepID, meta.LandedURL, meta.Error, diagID, zdata.DOMHTML, zdata.AXTreeText, zdata.ScreenshotPNG, false)
 		}
 	}
 
@@ -443,38 +531,30 @@ func (s *Service) handleApproveProposal(w http.ResponseWriter, r *http.Request) 
 		writeAPIError(w, http.StatusUnprocessableEntity, "PROPOSAL_UNVERIFIED", "cannot approve an unverified recipe patch proposal", nil)
 		return
 	}
+	if err := contract.ValidateRecipeName(prop.ProposedRecipe.Name); err != nil || strings.TrimSpace(prop.ProposedRecipe.Name) != strings.TrimSpace(prop.RecipeName) {
+		writeAPIError(w, http.StatusUnprocessableEntity, string(contract.ErrorCodeContractInvalid), fmt.Sprintf("proposed_recipe.name %q must strictly match proposal recipe_name %q", prop.ProposedRecipe.Name, prop.RecipeName), nil)
+		return
+	}
 
-	// Enforce domain lock: a proposed patch may never pivot a recipe onto an unapproved domain.
+	// Fail closed: recipe must exist in catalog and proposed domains must remain inside approved domains.
 	existing, exists, gerr := s.catalog.Get(r.Context(), prop.RecipeName)
 	if gerr != nil {
 		writeAPIError(w, http.StatusInternalServerError, "CATALOG_ERROR", gerr.Error(), nil)
 		return
 	}
-	if exists {
-		allowed := contract.InferRecipeDomains(existing)
-		for _, dom := range contract.InferRecipeDomains(prop.ProposedRecipe) {
-			matched := false
-			for _, a := range allowed {
-				if contract.DomainsMatch(dom, a) {
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				writeAPIError(w, http.StatusForbidden, "DOMAIN_PIVOT_BLOCKED", fmt.Sprintf("proposed recipe domain %q is outside approved recipe domains", dom), nil)
-				return
-			}
-		}
+	if !exists {
+		writeAPIError(w, http.StatusForbidden, "DOMAIN_PIVOT_BLOCKED", fmt.Sprintf("recipe %q is not registered in RECIPES_URI", prop.RecipeName), nil)
+		return
 	}
-
-	rawProposal, _ := json.Marshal(prop.ProposedRecipe)
-	if err := contract.EnforceAirGap(string(rawProposal), s.cfg.ForbiddenTerms); err != nil {
-		writeAPIError(w, http.StatusUnprocessableEntity, "AIRGAP_VIOLATION", err.Error(), nil)
+	allowed := contract.InferRecipeDomains(existing)
+	if err := contract.ValidateRecipeDomains(prop.ProposedRecipe, allowed, nil); err != nil {
+		writeAPIError(w, http.StatusForbidden, "DOMAIN_PIVOT_BLOCKED", fmt.Sprintf("proposed recipe domain check failed: %v", err), nil)
 		return
 	}
 
-	if err := s.catalog.SaveRecipe(r.Context(), prop.ProposedRecipe); err != nil {
-		writeAPIError(w, http.StatusInternalServerError, "CATALOG_WRITE_ERROR", err.Error(), nil)
+	rawProposal, _ := json.Marshal(prop.ProposedRecipe)
+	if err := contract.EnforceAirGap(string(rawProposal)+" "+req.Note+" "+req.ReviewedBy, s.cfg.ForbiddenTerms); err != nil {
+		writeAPIError(w, http.StatusUnprocessableEntity, "AIRGAP_VIOLATION", err.Error(), nil)
 		return
 	}
 
@@ -482,6 +562,8 @@ func (s *Service) handleApproveProposal(w http.ResponseWriter, r *http.Request) 
 	if reviewer == "" {
 		reviewer = "operator"
 	}
+	// Reserve approval state atomically BEFORE writing RECIPES_URI so a concurrent /reject
+	// cannot race with SaveRecipe and leave RECIPES_URI overwritten on a 409 conflict.
 	approved, err := s.store.ReviewProposal(r.Context(), id, contract.ProposalStatusApproved, reviewer, req.Note)
 	if errors.Is(err, ErrConflict) {
 		writeAPIError(w, http.StatusConflict, "PROPOSAL_NOT_PENDING", "proposal already reviewed", nil)
@@ -489,6 +571,12 @@ func (s *Service) handleApproveProposal(w http.ResponseWriter, r *http.Request) 
 	}
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "STORE_ERROR", err.Error(), nil)
+		return
+	}
+
+	if err := s.catalog.SaveRecipe(r.Context(), prop.ProposedRecipe); err != nil {
+		_ = s.store.RevertProposalToPending(r.Context(), id)
+		writeAPIError(w, http.StatusInternalServerError, "CATALOG_WRITE_ERROR", err.Error(), nil)
 		return
 	}
 

@@ -1,39 +1,305 @@
 package contract
 
 import (
-	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 const maxScrubbedHTMLBytes = 256 * 1024
 
-var (
-	stripScriptRe   = regexp.MustCompile(`(?is)<script\b[^>]*>.*?</script>`)
-	stripStyleRe    = regexp.MustCompile(`(?is)<style\b[^>]*>.*?</style>`)
-	stripSVGRe      = regexp.MustCompile(`(?is)<svg\b[^>]*>.*?</svg>`)
-	stripNoScriptRe = regexp.MustCompile(`(?is)<noscript\b[^>]*>.*?</noscript>`)
-	stripCommentRe  = regexp.MustCompile(`(?s)<!--.*?-->`)
-	stripTextareaRe = regexp.MustCompile(`(?is)(<textarea\b[^>]*>).*?(</textarea>)`)
-	inputTagRe      = regexp.MustCompile(`(?is)<input\b[^>]*>`)
-	inputValueRe    = regexp.MustCompile(`(?is)\bvalue\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)`)
-)
-
 // ScrubHTML removes active/visual noise (<script>, <style>, <svg>, <noscript>, comments)
-// and redacts form field values (<input value=...>, <textarea>...</textarea>) before
-// diagnostic bundle packaging or exception-route verification.
+// and redacts form field values (<input value=...>, <textarea>...</textarea>) using a pure-stdlib
+// quote-aware HTML state-machine scanner before diagnostic packaging or exception verification.
 func ScrubHTML(raw string) string {
-	s := stripScriptRe.ReplaceAllString(raw, "")
-	s = stripStyleRe.ReplaceAllString(s, "")
-	s = stripSVGRe.ReplaceAllString(s, "")
-	s = stripNoScriptRe.ReplaceAllString(s, "")
-	s = stripCommentRe.ReplaceAllString(s, "")
-	s = stripTextareaRe.ReplaceAllString(s, "$1$2")
-	s = inputTagRe.ReplaceAllStringFunc(s, func(tag string) string {
-		return inputValueRe.ReplaceAllString(tag, `value=""`)
-	})
-	s = strings.TrimSpace(s)
+	var out strings.Builder
+	out.Grow(min(len(raw), maxScrubbedHTMLBytes))
+
+	n := len(raw)
+	i := 0
+	for i < n {
+		if raw[i] != '<' {
+			out.WriteByte(raw[i])
+			i++
+			continue
+		}
+
+		// HTML comment: <!-- ... --> (unclosed strips to EOF).
+		if strings.HasPrefix(raw[i:], "<!--") {
+			if end := strings.Index(raw[i+4:], "-->"); end >= 0 {
+				i += 4 + end + 3
+			} else {
+				i = n
+			}
+			continue
+		}
+
+		// Declarations (<!DOCTYPE ...>) or processing instructions (<?...?>).
+		if i+1 < n && (raw[i+1] == '!' || raw[i+1] == '?') {
+			end := scanTagEnd(raw, i+2)
+			out.WriteString(raw[i:end])
+			i = end
+			continue
+		}
+
+		// Closing tag (</tag ...>).
+		if i+1 < n && raw[i+1] == '/' {
+			end := scanTagEnd(raw, i+2)
+			out.WriteString(raw[i:end])
+			i = end
+			continue
+		}
+
+		// Opening tag must start with ASCII letter.
+		if i+1 >= n || !isASCIILetter(raw[i+1]) {
+			out.WriteByte(raw[i])
+			i++
+			continue
+		}
+
+		nameStart := i + 1
+		j := nameStart
+		for j < n && isTagNameChar(raw[j]) {
+			j++
+		}
+		tagLower := strings.ToLower(raw[nameStart:j])
+		tagEnd, attrs, selfClosing := parseOpeningTag(raw, j)
+
+		switch tagLower {
+		case "script", "style", "noscript":
+			// HTML5 raw-text elements are never self-closing; always skip through the matching end tag or EOF.
+			i = skipUntilClosingTag(raw, tagEnd, tagLower)
+		case "svg":
+			i = tagEnd
+			if !selfClosing {
+				i = skipNestedSVG(raw, i)
+			}
+		case "textarea":
+			// HTML5 RCDATA textarea is never self-closing; always redact body through </textarea> or EOF.
+			out.WriteString(raw[i:tagEnd])
+			nextIdx, foundClose := findClosingTag(raw, tagEnd, "textarea")
+			if foundClose {
+				out.WriteString("</textarea>")
+			}
+			i = nextIdx
+		case "input":
+			writeRedactedInputTag(&out, raw[nameStart:j], attrs, selfClosing)
+			i = tagEnd
+		default:
+			out.WriteString(raw[i:tagEnd])
+			i = tagEnd
+		}
+	}
+
+	s := strings.TrimSpace(out.String())
 	if len(s) > maxScrubbedHTMLBytes {
-		s = s[:maxScrubbedHTMLBytes]
+		s = truncateUTF8Bytes(s, maxScrubbedHTMLBytes)
 	}
 	return s
+}
+
+type htmlAttrSpan struct {
+	name      string
+	raw       string
+	hasValue  bool
+	nameLower string
+}
+
+func parseOpeningTag(raw string, pos int) (end int, attrs []htmlAttrSpan, selfClosing bool) {
+	n := len(raw)
+	i := pos
+	for i < n {
+		for i < n && isHTMLSpace(raw[i]) {
+			i++
+		}
+		if i >= n {
+			return n, attrs, selfClosing
+		}
+		if raw[i] == '>' {
+			return i + 1, attrs, selfClosing
+		}
+		if raw[i] == '/' {
+			if i+1 < n && raw[i+1] == '>' {
+				return i + 2, attrs, true
+			}
+			i++
+			continue
+		}
+
+		attrStart := i
+		for i < n && !isHTMLSpace(raw[i]) && raw[i] != '=' && raw[i] != '>' && raw[i] != '/' {
+			i++
+		}
+		if i == attrStart {
+			i++
+			continue
+		}
+		attrName := raw[attrStart:i]
+		nameLower := strings.ToLower(attrName)
+
+		for i < n && isHTMLSpace(raw[i]) {
+			i++
+		}
+		hasVal := false
+		if i < n && raw[i] == '=' {
+			hasVal = true
+			i++
+			for i < n && isHTMLSpace(raw[i]) {
+				i++
+			}
+			if i < n && (raw[i] == '"' || raw[i] == '\'') {
+				q := raw[i]
+				i++
+				for i < n && raw[i] != q {
+					i++
+				}
+				if i < n && raw[i] == q {
+					i++
+				}
+			} else {
+				for i < n && !isHTMLSpace(raw[i]) && raw[i] != '>' {
+					i++
+				}
+			}
+		}
+		attrs = append(attrs, htmlAttrSpan{
+			name:      attrName,
+			raw:       raw[attrStart:i],
+			hasValue:  hasVal,
+			nameLower: nameLower,
+		})
+	}
+	return n, attrs, selfClosing
+}
+
+func writeRedactedInputTag(out *strings.Builder, origTagName string, attrs []htmlAttrSpan, selfClosing bool) {
+	out.WriteByte('<')
+	out.WriteString(origTagName)
+	for _, a := range attrs {
+		out.WriteByte(' ')
+		if a.nameLower == "value" {
+			out.WriteString(`value=""`)
+		} else {
+			out.WriteString(a.raw)
+		}
+	}
+	if selfClosing {
+		out.WriteString(" />")
+	} else {
+		out.WriteByte('>')
+	}
+}
+
+func scanTagEnd(raw string, pos int) int {
+	n := len(raw)
+	inQuote := byte(0)
+	for i := pos; i < n; i++ {
+		c := raw[i]
+		if inQuote != 0 {
+			if c == inQuote {
+				inQuote = 0
+			}
+			continue
+		}
+		if c == '"' || c == '\'' {
+			inQuote = c
+			continue
+		}
+		if c == '>' {
+			return i + 1
+		}
+	}
+	return n
+}
+
+func skipUntilClosingTag(raw string, pos int, tagLower string) int {
+	nextIdx, _ := findClosingTag(raw, pos, tagLower)
+	return nextIdx
+}
+
+func findClosingTag(raw string, pos int, tagLower string) (nextIdx int, found bool) {
+	n := len(raw)
+	tLen := len(tagLower)
+	for i := pos; i < n; i++ {
+		if raw[i] != '<' || i+2+tLen > n || raw[i+1] != '/' {
+			continue
+		}
+		if !strings.EqualFold(raw[i+2:i+2+tLen], tagLower) {
+			continue
+		}
+		after := i + 2 + tLen
+		if after < n && !isHTMLSpace(raw[after]) && raw[after] != '>' && raw[after] != '/' {
+			continue
+		}
+		end := scanTagEnd(raw, after)
+		return end, true
+	}
+	return n, false
+}
+
+func skipNestedSVG(raw string, pos int) int {
+	n := len(raw)
+	depth := 1
+	i := pos
+	for i < n && depth > 0 {
+		if raw[i] != '<' {
+			i++
+			continue
+		}
+		if strings.HasPrefix(raw[i:], "<!--") {
+			if end := strings.Index(raw[i+4:], "-->"); end >= 0 {
+				i += 4 + end + 3
+			} else {
+				return n
+			}
+			continue
+		}
+		if i+5 <= n && raw[i+1] == '/' && strings.EqualFold(raw[i+2:i+5], "svg") {
+			after := i + 5
+			if after >= n || isHTMLSpace(raw[after]) || raw[after] == '>' || raw[after] == '/' {
+				i = scanTagEnd(raw, after)
+				depth--
+				continue
+			}
+		}
+		if i+4 <= n && strings.EqualFold(raw[i+1:i+4], "svg") {
+			after := i + 4
+			if after >= n || isHTMLSpace(raw[after]) || raw[after] == '>' || raw[after] == '/' {
+				end, _, selfClosing := parseOpeningTag(raw, after)
+				i = end
+				if !selfClosing {
+					depth++
+				}
+				continue
+			}
+		}
+		if i+1 < n && (isASCIILetter(raw[i+1]) || raw[i+1] == '/' || raw[i+1] == '!' || raw[i+1] == '?') {
+			i = scanTagEnd(raw, i+1)
+			continue
+		}
+		i++
+	}
+	return i
+}
+
+func isASCIILetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func isTagNameChar(c byte) bool {
+	return isASCIILetter(c) || (c >= '0' && c <= '9') || c == '-' || c == ':' || c == '_'
+}
+
+func isHTMLSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'
+}
+
+func truncateUTF8Bytes(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }

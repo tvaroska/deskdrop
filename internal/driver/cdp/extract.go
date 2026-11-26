@@ -3,7 +3,9 @@ package cdp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -71,6 +73,11 @@ func (c *Client) ExecuteStep(ctx context.Context, step contract.Step) (contract.
 		candTimeout = 18 * time.Second
 	}
 
+	c.mu.Lock()
+	verifiedCtx := c.verifiedContextID
+	c.mu.Unlock()
+	targetDomain := contract.ExtractDomain(step.URL)
+
 	var lastRes contract.StepResult
 	var lastErr error
 	for i, candCtx := range candidates {
@@ -96,6 +103,13 @@ func (c *Client) ExecuteStep(ctx context.Context, step contract.Step) (contract.
 		}
 		lastRes = res
 		lastErr = stepErr
+
+		// Stop multi-profile fallback when the verified/logged-in profile reached the target domain
+		// and failed with a non-auth error (e.g. SELECTOR_DRIFT), so another unauthenticated Chrome
+		// profile cannot mask SELECTOR_DRIFT with a /login AUTH_EXPIRED error.
+		if shouldStopProfileFallback(stepErr, targetDomain, candCtx, verifiedCtx) {
+			return lastRes, lastErr
+		}
 		if i+1 < len(candidates) {
 			continue
 		}
@@ -103,11 +117,39 @@ func (c *Client) ExecuteStep(ctx context.Context, step contract.Step) (contract.
 	return lastRes, lastErr
 }
 
+func shouldStopProfileFallback(stepErr error, targetDomain string, candCtx string, verifiedCtx string) bool {
+	if stepErr == nil {
+		return false
+	}
+	landedURL := ""
+	var execErr *driver.StepExecError
+	if errors.As(stepErr, &execErr) {
+		landedURL = execErr.Partial.URL
+	}
+	triage := contract.ClassifyExtractionError(stepErr.Error(), landedURL, targetDomain, execErr != nil)
+	if triage.Code == contract.ErrorCodeAuthExpired || triage.Action == contract.TriageHoldDomainAuth {
+		return false
+	}
+	if targetDomain != "" && landedURL != "" {
+		if landedDom := contract.ExtractDomain(landedURL); landedDom != "" && contract.DomainsMatch(landedDom, targetDomain) {
+			return true
+		}
+	}
+	if verifiedCtx != "" && candCtx == verifiedCtx && triage.Code == contract.ErrorCodeSelectorDrift {
+		return true
+	}
+	return false
+}
+
 // ExecuteFallback opens a fresh stateless scratch tab on the allowlisted domain, executes at most
 // 3 safe actions ({scroll, wait, click}), captures fresh scrubbed HTML + AXTree + PNG screenshot +
 // declarative extraction, and closes the scratch tab unconditionally.
 func (c *Client) ExecuteFallback(ctx context.Context, step contract.Step, plan contract.FallbackPlan) (driver.FallbackExecResult, error) {
-	if err := contract.ValidateFallbackPlan(plan, nil); err != nil {
+	allowedDomains := contract.StepDomains(step)
+	if len(allowedDomains) == 0 {
+		return driver.FallbackExecResult{}, errors.New("fallback step has no approved HTTP/HTTPS domain")
+	}
+	if err := contract.ValidateFallbackPlan(plan, allowedDomains); err != nil {
 		return driver.FallbackExecResult{}, err
 	}
 	timeout := 30 * time.Second
@@ -125,7 +167,13 @@ func (c *Client) ExecuteFallback(ctx context.Context, step contract.Step, plan c
 		_ = c.CloseScratchPage(context.Background(), scratchID, sessionID)
 	}()
 
-	_ = c.waitDocumentReady(fctx, sessionID)
+	if err := c.waitDocumentReady(fctx, sessionID); err != nil {
+		return driver.FallbackExecResult{}, fmt.Errorf("fallback page load failed: %w", err)
+	}
+	// Fail-closed URL/domain/login check BEFORE executing any interactive action.
+	if _, err := c.verifyAllowedSessionURL(fctx, sessionID, step, plan.AllowedDomain, allowedDomains, "fallback"); err != nil {
+		return driver.FallbackExecResult{}, err
+	}
 
 	actionsRun := 0
 	for _, act := range plan.Actions {
@@ -148,13 +196,10 @@ func (c *Client) ExecuteFallback(ctx context.Context, step contract.Step, plan c
 			}
 		}
 		actionsRun++
-	}
-
-	// Verify we did not navigate off the allowlisted domain.
-	var landedURL string
-	_ = c.EvalJSON(fctx, sessionID, "location.href || ''", &landedURL)
-	if landedDomain := contract.ExtractDomain(landedURL); landedDomain != "" && !contract.DomainsMatch(landedDomain, plan.AllowedDomain) {
-		return driver.FallbackExecResult{}, fmt.Errorf("fallback navigated off allowlisted domain %q to %q", plan.AllowedDomain, landedDomain)
+		// Re-verify allowlisted domain and NotURLContains after every action.
+		if _, err := c.verifyAllowedSessionURL(fctx, sessionID, step, plan.AllowedDomain, allowedDomains, "fallback"); err != nil {
+			return driver.FallbackExecResult{}, err
+		}
 	}
 
 	maxText := step.MaxTextChars
@@ -163,7 +208,9 @@ func (c *Client) ExecuteFallback(ctx context.Context, step contract.Step, plan c
 	}
 	extractExpr := buildDeclarativeExtractJS(step, maxText)
 	var stepRes contract.StepResult
-	_ = c.EvalJSON(fctx, sessionID, extractExpr, &stepRes)
+	if err := c.EvalJSON(fctx, sessionID, extractExpr, &stepRes); err != nil {
+		return driver.FallbackExecResult{}, fmt.Errorf("fallback extraction failed: %w", err)
+	}
 	stepRes.StepID = step.ID
 	if stepRes.StepID == "" {
 		stepRes.StepID = plan.StepID
@@ -172,11 +219,19 @@ func (c *Client) ExecuteFallback(ctx context.Context, step contract.Step, plan c
 		stepRes.StepID = "fallback"
 	}
 
-	pngBytes, _ := c.CaptureScreenshotPNG(fctx, sessionID)
+	pngBytes, err := c.CaptureScreenshotPNG(fctx, sessionID)
+	if err != nil {
+		return driver.FallbackExecResult{}, fmt.Errorf("fallback screenshot capture failed: %w", err)
+	}
 	var rawHTML string
-	_ = c.EvalJSON(fctx, sessionID, buildScrubbedHTMLJS(), &rawHTML)
+	if err := c.EvalJSON(fctx, sessionID, buildScrubbedHTMLJS(), &rawHTML); err != nil {
+		return driver.FallbackExecResult{}, fmt.Errorf("fallback dom capture failed: %w", err)
+	}
 	scrubbed := contract.ScrubHTML(rawHTML)
-	axTree, _, _ := c.CaptureCompactAXTree(fctx, sessionID)
+	axTree, _, err := c.CaptureCompactAXTree(fctx, sessionID)
+	if err != nil {
+		return driver.FallbackExecResult{}, fmt.Errorf("fallback axtree capture failed: %w", err)
+	}
 
 	return driver.FallbackExecResult{
 		StepResult:    stepRes,
@@ -185,6 +240,50 @@ func (c *Client) ExecuteFallback(ctx context.Context, step contract.Step, plan c
 		AXTreeText:    axTree,
 		ActionsRun:    actionsRun,
 	}, nil
+}
+
+func (c *Client) verifyAllowedSessionURL(
+	ctx context.Context,
+	sessionID string,
+	step contract.Step,
+	planAllowed string,
+	allowedDomains []string,
+	phase string,
+) (string, error) {
+	var curURL string
+	if err := c.EvalJSON(ctx, sessionID, "location.href || ''", &curURL); err != nil {
+		return "", fmt.Errorf("%s URL check failed: %w", phase, err)
+	}
+	curURL = strings.TrimSpace(curURL)
+	if curURL == "" {
+		return "", fmt.Errorf("%s landed on empty URL", phase)
+	}
+	lowerURL := strings.ToLower(curURL)
+	for _, bad := range step.Expect.NotURLContains {
+		if bad != "" && strings.Contains(lowerURL, strings.ToLower(bad)) {
+			return "", fmt.Errorf("step %q landed on blocked/login URL %q (matched %q)", step.ID, curURL, bad)
+		}
+	}
+	landedDomain := contract.ExtractDomain(curURL)
+	if landedDomain == "" {
+		return "", fmt.Errorf("%s navigated to non-HTTP URL %q", phase, curURL)
+	}
+	if planAllowed != "" && !contract.DomainsMatch(landedDomain, planAllowed) {
+		return "", fmt.Errorf("%s navigated off allowlisted domain %q to %q", phase, planAllowed, landedDomain)
+	}
+	if len(allowedDomains) > 0 {
+		matched := false
+		for _, dom := range allowedDomains {
+			if contract.DomainsMatch(landedDomain, dom) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return "", fmt.Errorf("%s navigated off approved recipe domains %v to %q", phase, allowedDomains, landedDomain)
+		}
+	}
+	return curURL, nil
 }
 
 func (c *Client) runAttachedStep(sctx context.Context, sessionID string, step contract.Step, reused bool) (contract.StepResult, error) {
@@ -265,6 +364,12 @@ func (c *Client) wrapStepError(sessionID string, stepID string, partial contract
 	dctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	if strings.TrimSpace(partial.URL) == "" {
+		var curURL string
+		if uerr := c.EvalJSON(dctx, sessionID, "String(location.href || '')", &curURL); uerr == nil && strings.TrimSpace(curURL) != "" {
+			partial.URL = curURL
+		}
+	}
 	pngBytes, _ := c.CaptureScreenshotPNG(dctx, sessionID)
 	var rawHTML string
 	_ = c.EvalJSON(dctx, sessionID, buildScrubbedHTMLJS(), &rawHTML)
@@ -300,24 +405,90 @@ func (c *Client) waitDocumentReady(ctx context.Context, sessionID string) error 
 }
 
 func matchesTabPattern(pageURL string, pattern string) bool {
-	uLower := strings.ToLower(strings.TrimSpace(pageURL))
-	pLower := strings.ToLower(strings.TrimSpace(pattern))
-	if uLower == "" || pLower == "" {
+	uRaw := strings.TrimSpace(pageURL)
+	pRaw := strings.TrimSpace(pattern)
+	if uRaw == "" || pRaw == "" {
 		return false
 	}
-	if strings.HasSuffix(pLower, "$") {
-		base := strings.TrimSuffix(pLower, "$")
-		noFrag := strings.SplitN(uLower, "#", 2)[0]
-		noQuery := strings.SplitN(noFrag, "?", 2)[0]
-		if strings.HasSuffix(noQuery, base) {
-			return true
-		}
-		if strings.HasSuffix(base, "/") && strings.HasSuffix(noQuery+"/", base) {
-			return true
-		}
+	pu, err := url.Parse(uRaw)
+	if err != nil {
 		return false
 	}
-	return strings.Contains(uLower, pLower)
+	pageScheme := strings.ToLower(pu.Scheme)
+	if pageScheme != "http" && pageScheme != "https" {
+		return false
+	}
+	pageHost := strings.ToLower(strings.TrimSuffix(pu.Hostname(), "."))
+	if pageHost == "" {
+		return false
+	}
+
+	anchored := strings.HasSuffix(pRaw, "$")
+	base := strings.TrimSuffix(pRaw, "$")
+	if base == "" {
+		return false
+	}
+
+	hasScheme := strings.Contains(base, "://")
+	parseTarget := base
+	if !hasScheme {
+		if strings.HasPrefix(base, "/") {
+			return false
+		}
+		parseTarget = "https://" + base
+	}
+	patURL, err := url.Parse(parseTarget)
+	if err != nil {
+		return false
+	}
+	patHost := strings.ToLower(strings.TrimSuffix(patURL.Hostname(), "."))
+	if patHost == "" {
+		return false
+	}
+	if hasScheme {
+		if strings.ToLower(patURL.Scheme) != pageScheme || pageHost != patHost {
+			return false
+		}
+	} else {
+		// Enforce host boundary: exact match or www. prefix (never evil-scholar.google.com).
+		if pageHost != patHost && pageHost != "www."+patHost {
+			return false
+		}
+	}
+
+	pagePath := strings.ToLower(pu.EscapedPath())
+	if pagePath == "" {
+		pagePath = "/"
+	}
+	patPath := strings.ToLower(patURL.EscapedPath())
+	pageQuery := strings.ToLower(pu.RawQuery)
+	patQuery := strings.ToLower(patURL.RawQuery)
+	patHasQuery := strings.Contains(base, "?")
+
+	if anchored {
+		normPatPath := patPath
+		if normPatPath == "" {
+			normPatPath = "/"
+		}
+		pathMatch := pagePath == normPatPath || (strings.HasSuffix(normPatPath, "/") && pagePath+"/" == normPatPath)
+		if !pathMatch {
+			return false
+		}
+		if patHasQuery {
+			return pageQuery == patQuery
+		}
+		return true
+	}
+
+	if patHasQuery {
+		pagePQ := pagePath + "?" + pageQuery
+		patPQ := patPath + "?" + patQuery
+		return strings.Contains(pagePQ, patPQ)
+	}
+	if patPath == "" || patPath == "/" {
+		return true
+	}
+	return strings.HasPrefix(pagePath, patPath)
 }
 
 func (c *Client) waitForCondition(ctx context.Context, sessionID string, selector string, text string, forbiddenURLSubstrings []string) error {

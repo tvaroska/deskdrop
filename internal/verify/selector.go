@@ -18,18 +18,21 @@ const (
 )
 
 type attrCheck struct {
-	name  string
-	op    attrOp
-	value string
+	name            string
+	op              attrOp
+	value           string
+	caseInsensitive bool
 }
 
 type simpleSelector struct {
-	tag        string
-	id         string
-	classes    []string
-	attrs      []attrCheck
-	firstChild bool
-	nthChild   int
+	tag          string
+	id           string
+	classes      []string
+	attrs        []attrCheck
+	firstChild   bool
+	lastChild    bool
+	nthChild     int
+	notSelectors []complexSelector
 }
 
 type combinator byte
@@ -128,7 +131,7 @@ func matchesComplex(node *html.Node, scopeRoot *html.Node, parts complexSelector
 	return matchPart(node, scopeRoot, parts, len(parts)-1)
 }
 
-func matchPart(node *html.Node, scopeRoot *html.Node, parts complexSelector, idx int) bool {
+func matchPart(node *html.Node, _ *html.Node, parts complexSelector, idx int) bool {
 	if node == nil || node.Type != html.ElementNode {
 		return false
 	}
@@ -142,13 +145,13 @@ func matchPart(node *html.Node, scopeRoot *html.Node, parts complexSelector, idx
 	switch comb {
 	case combChild:
 		parent := node.Parent
-		if parent == nil || parent == scopeRoot || parent.Type != html.ElementNode {
+		if parent == nil || parent.Type != html.ElementNode {
 			return false
 		}
-		return matchPart(parent, scopeRoot, parts, idx-1)
+		return matchPart(parent, nil, parts, idx-1)
 	default: // combDescendant
-		for anc := node.Parent; anc != nil && anc != scopeRoot; anc = anc.Parent {
-			if anc.Type == html.ElementNode && matchPart(anc, scopeRoot, parts, idx-1) {
+		for anc := node.Parent; anc != nil; anc = anc.Parent {
+			if anc.Type == html.ElementNode && matchPart(anc, nil, parts, idx-1) {
 				return true
 			}
 		}
@@ -183,22 +186,27 @@ func matchesSimple(n *html.Node, s simpleSelector) bool {
 		if !exists {
 			return false
 		}
+		gotVal, wantVal := val, ac.value
+		if ac.caseInsensitive {
+			gotVal = strings.ToLower(gotVal)
+			wantVal = strings.ToLower(wantVal)
+		}
 		switch ac.op {
 		case attrExists:
 		case attrEquals:
-			if val != ac.value {
+			if gotVal != wantVal {
 				return false
 			}
 		case attrContains:
-			if !strings.Contains(val, ac.value) {
+			if !strings.Contains(gotVal, wantVal) {
 				return false
 			}
 		case attrPrefix:
-			if !strings.HasPrefix(val, ac.value) {
+			if !strings.HasPrefix(gotVal, wantVal) {
 				return false
 			}
 		case attrSuffix:
-			if !strings.HasSuffix(val, ac.value) {
+			if !strings.HasSuffix(gotVal, wantVal) {
 				return false
 			}
 		}
@@ -206,8 +214,28 @@ func matchesSimple(n *html.Node, s simpleSelector) bool {
 	if s.firstChild && elementChildIndex(n) != 1 {
 		return false
 	}
+	if s.lastChild && !isLastElementChild(n) {
+		return false
+	}
 	if s.nthChild > 0 && elementChildIndex(n) != s.nthChild {
 		return false
+	}
+	for _, neg := range s.notSelectors {
+		if len(neg) > 0 && matchesComplex(n, nil, neg) {
+			return false
+		}
+	}
+	return true
+}
+
+func isLastElementChild(n *html.Node) bool {
+	if n == nil || n.Parent == nil {
+		return false
+	}
+	for cur := n.NextSibling; cur != nil; cur = cur.NextSibling {
+		if cur.Type == html.ElementNode {
+			return false
+		}
 	}
 	return true
 }
@@ -368,8 +396,18 @@ func parseSimpleSelector(tok string) simpleSelector {
 			i++
 			start := i
 			inParen := 0
+			inQ := byte(0)
 			for i < len(tok) {
-				if tok[i] == '(' {
+				if inQ != 0 {
+					if tok[i] == inQ {
+						inQ = 0
+					}
+					i++
+					continue
+				}
+				if tok[i] == '\'' || tok[i] == '"' {
+					inQ = tok[i]
+				} else if tok[i] == '(' {
 					inParen++
 				} else if tok[i] == ')' && inParen > 0 {
 					inParen--
@@ -378,13 +416,24 @@ func parseSimpleSelector(tok string) simpleSelector {
 				}
 				i++
 			}
-			pseudo := strings.ToLower(strings.TrimSpace(tok[start:i]))
-			if pseudo == "first-child" {
+			rawPseudo := strings.TrimSpace(tok[start:i])
+			pseudo := strings.ToLower(rawPseudo)
+			switch {
+			case pseudo == "first-child":
 				ss.firstChild = true
-			} else if strings.HasPrefix(pseudo, "nth-child(") && strings.HasSuffix(pseudo, ")") {
+			case pseudo == "last-child":
+				ss.lastChild = true
+			case strings.HasPrefix(pseudo, "nth-child(") && strings.HasSuffix(pseudo, ")"):
 				numStr := strings.TrimSpace(pseudo[len("nth-child(") : len(pseudo)-1])
 				if n, err := strconv.Atoi(numStr); err == nil && n > 0 {
 					ss.nthChild = n
+				}
+			case strings.HasPrefix(pseudo, "not(") && strings.HasSuffix(rawPseudo, ")"):
+				inner := strings.TrimSpace(rawPseudo[4 : len(rawPseudo)-1])
+				for _, g := range splitTopLevel(inner, ',') {
+					if cs := parseComplexSelector(g); len(cs) > 0 {
+						ss.notSelectors = append(ss.notSelectors, cs)
+					}
 				}
 			}
 		default:
@@ -406,16 +455,69 @@ func parseAttrExpr(expr string) (attrCheck, bool) {
 	if expr == "" {
 		return attrCheck{}, false
 	}
-	for _, op := range []attrOp{attrContains, attrPrefix, attrSuffix, attrEquals} {
-		idx := strings.Index(expr, string(op))
-		if idx > 0 {
-			name := strings.TrimSpace(expr[:idx])
-			val := strings.TrimSpace(expr[idx+len(op):])
-			val = strings.Trim(val, `"'`)
-			return attrCheck{name: name, op: op, value: val}, true
+	inQ := byte(0)
+	for i := 0; i < len(expr); i++ {
+		c := expr[i]
+		if inQ != 0 {
+			if c == inQ {
+				inQ = 0
+			}
+			continue
+		}
+		if c == '"' || c == '\'' {
+			inQ = c
+			continue
+		}
+		if c == '=' && i > 0 {
+			op := attrEquals
+			nameEnd := i
+			if i >= 2 {
+				switch expr[i-1] {
+				case '*':
+					op = attrContains
+					nameEnd = i - 1
+				case '^':
+					op = attrPrefix
+					nameEnd = i - 1
+				case '$':
+					op = attrSuffix
+					nameEnd = i - 1
+				}
+			}
+			name := strings.TrimSpace(expr[:nameEnd])
+			if name == "" {
+				return attrCheck{}, false
+			}
+			val, ci := parseAttrValueAndFlag(expr[i+1:])
+			return attrCheck{name: name, op: op, value: val, caseInsensitive: ci}, true
 		}
 	}
 	return attrCheck{name: strings.TrimSpace(expr), op: attrExists}, true
+}
+
+func parseAttrValueAndFlag(raw string) (val string, caseInsensitive bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", false
+	}
+	if s[0] == '"' || s[0] == '\'' {
+		q := s[0]
+		end := strings.IndexByte(s[1:], q)
+		if end >= 0 {
+			val = s[1 : 1+end]
+			rest := strings.TrimSpace(s[2+end:])
+			return val, strings.EqualFold(rest, "i")
+		}
+		return strings.Trim(s, `"'`), false
+	}
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return "", false
+	}
+	if len(fields) >= 2 && strings.EqualFold(fields[len(fields)-1], "i") {
+		return strings.Join(fields[:len(fields)-1], " "), true
+	}
+	return s, false
 }
 
 func splitTopLevel(s string, sep byte) []string {

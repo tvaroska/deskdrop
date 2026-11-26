@@ -1,9 +1,11 @@
 package contract
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -156,33 +158,102 @@ func ComputeRetryBackoff(attempt int) time.Duration {
 	return d
 }
 
-// ExtractDomain parses a normalized lowercase hostname from a URL or match pattern.
+var validRecipeNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
+
+// ValidateRecipeName enforces safe portable recipe identifiers (rejecting traversal or separators).
+func ValidateRecipeName(name string) error {
+	if name == "" || name != strings.TrimSpace(name) || strings.Contains(name, "..") || !validRecipeNameRe.MatchString(name) {
+		return fmt.Errorf("invalid recipe name %q (must match ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$ without '..')", name)
+	}
+	return nil
+}
+
+// ExtractDomain parses a normalized lowercase HTTP/HTTPS hostname from a URL or host/path match pattern.
+// Non-HTTP schemes (file:, javascript:, data:, uia:), relative paths ("/"), userinfo URLs, and
+// templated hostnames ("{{host}}") return "".
 func ExtractDomain(raw string) string {
 	s := strings.TrimSpace(raw)
-	if s == "" {
+	if s == "" || strings.HasPrefix(s, "/") {
 		return ""
 	}
-	if !strings.Contains(s, "://") {
-		s = "https://" + strings.TrimPrefix(s, "//")
+	if idx := strings.Index(s, "://"); idx >= 0 {
+		scheme := strings.ToLower(s[:idx])
+		if scheme != "http" && scheme != "https" {
+			return ""
+		}
+		s = s[idx+3:]
+	} else {
+		firstEnd := strings.IndexAny(s, "/?#")
+		head := s
+		if firstEnd >= 0 {
+			head = s[:firstEnd]
+		}
+		if colon := strings.IndexByte(head, ':'); colon >= 0 {
+			hostPart := strings.ToLower(head[:colon])
+			switch hostPart {
+			case "file", "data", "javascript", "vbscript", "mailto", "tel", "uia", "blob", "about", "ftp", "ws", "wss":
+				return ""
+			}
+			port := head[colon+1:]
+			if port == "" || !isAllDigits(port) {
+				return ""
+			}
+		}
 	}
-	u, err := url.Parse(s)
-	if err != nil || u.Hostname() == "" {
+	if cut := strings.IndexAny(s, "/?#"); cut >= 0 {
+		s = s[:cut]
+	}
+	if s == "" || strings.ContainsAny(s, "{}@ \t\r\n$") {
 		return ""
 	}
-	return strings.ToLower(u.Hostname())
+	u, err := url.Parse("https://" + s)
+	if err != nil || u.Hostname() == "" || u.User != nil {
+		return ""
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if host == "" || strings.ContainsAny(host, "{}@ \t\r\n$") {
+		return ""
+	}
+	return host
+}
+
+func isAllDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
 }
 
 // DomainsMatch reports whether host matches allowedDomain (exact or subdomain match).
+// www. is never stripped from allowedDomain so "www.example.com" cannot widen to "*.example.com".
 func DomainsMatch(host string, allowedDomain string) bool {
-	h := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(host)), "www.")
-	a := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(allowedDomain)), "www.")
+	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	a := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(allowedDomain)), ".")
 	if h == "" || a == "" {
 		return false
 	}
 	return h == a || strings.HasSuffix(h, "."+a)
 }
 
-// InferRecipeDomain extracts the primary target domain of a Recipe from its steps.
+func substituteKnownVars(in string, vars map[string]string) string {
+	if len(vars) == 0 || !strings.Contains(in, "{{") {
+		return in
+	}
+	return varPlaceholderRe.ReplaceAllStringFunc(in, func(m string) string {
+		submatch := varPlaceholderRe.FindStringSubmatch(m)
+		if len(submatch) < 2 {
+			return m
+		}
+		if val, ok := vars[submatch[1]]; ok && val != "" {
+			return val
+		}
+		return m
+	})
+}
+
+// InferRecipeDomain extracts the primary target domain of a Recipe from its allowlist or steps.
 func InferRecipeDomain(r Recipe) string {
 	for _, d := range r.AllowedDomains {
 		if norm := ExtractDomain(d); norm != "" {
@@ -190,10 +261,10 @@ func InferRecipeDomain(r Recipe) string {
 		}
 	}
 	for _, s := range r.Steps {
-		if d := ExtractDomain(s.URL); d != "" && !strings.Contains(d, "{{") {
+		if d := ExtractDomain(substituteKnownVars(s.URL, r.Defaults)); d != "" {
 			return d
 		}
-		if d := ExtractDomain(s.MatchTabURL); d != "" && !strings.Contains(d, "{{") {
+		if d := ExtractDomain(substituteKnownVars(s.MatchTabURL, r.Defaults)); d != "" {
 			return d
 		}
 	}
@@ -203,14 +274,11 @@ func InferRecipeDomain(r Recipe) string {
 	return ""
 }
 
-// InferRecipeDomains returns all distinct hostnames referenced by a Recipe.
+// InferRecipeDomains returns all distinct hostnames referenced by a Recipe (expanding Defaults).
 func InferRecipeDomains(r Recipe) []string {
 	var out []string
 	seen := make(map[string]bool)
 	add := func(raw string) {
-		if strings.Contains(raw, "{{") {
-			return
-		}
 		d := ExtractDomain(raw)
 		if d != "" && !seen[d] {
 			seen[d] = true
@@ -221,13 +289,135 @@ func InferRecipeDomains(r Recipe) []string {
 		add(d)
 	}
 	for _, s := range r.Steps {
-		add(s.URL)
-		add(s.MatchTabURL)
+		add(substituteKnownVars(s.URL, r.Defaults))
+		add(substituteKnownVars(s.MatchTabURL, r.Defaults))
 	}
 	if len(out) == 0 && r.NormalizedDriver() == "uia" {
 		out = append(out, "uia.local")
 	}
 	return out
+}
+
+// StepDomains extracts distinct HTTP/HTTPS hostnames referenced by a single Step.
+func StepDomains(s Step) []string {
+	var out []string
+	seen := make(map[string]bool)
+	for _, raw := range []string{s.URL, s.MatchTabURL} {
+		if d := ExtractDomain(raw); d != "" && !seen[d] {
+			seen[d] = true
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func domainInAllowlist(dom string, allowedDomains []string) bool {
+	for _, allowed := range allowedDomains {
+		if DomainsMatch(dom, allowed) {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateRecipeDomains verifies that every domain referenced by candidate (both under its own
+// Defaults and when merged with vars) resolves to an explicit HTTP/HTTPS hostname (or uia.local for UIA)
+// within the non-empty allowedDomains allowlist.
+func ValidateRecipeDomains(candidate Recipe, allowedDomains []string, vars map[string]string) error {
+	if len(allowedDomains) == 0 {
+		return errors.New("approved recipe domains allowlist is empty")
+	}
+	varSets := []map[string]string{candidate.Defaults}
+	if len(vars) > 0 {
+		merged := make(map[string]string, len(candidate.Defaults)+len(vars))
+		for k, v := range candidate.Defaults {
+			merged[k] = v
+		}
+		for k, v := range vars {
+			merged[k] = v
+		}
+		varSets = append(varSets, merged)
+	}
+
+	if candidate.NormalizedDriver() == "uia" {
+		for _, d := range candidate.AllowedDomains {
+			dom := ExtractDomain(d)
+			if dom == "" || !domainInAllowlist(dom, allowedDomains) {
+				return fmt.Errorf("recipe allowed_domain %q is outside approved domains", d)
+			}
+		}
+		if !domainInAllowlist("uia.local", allowedDomains) {
+			return errors.New(`uia recipe domain "uia.local" is outside approved domains`)
+		}
+		for _, vs := range varSets {
+			for _, s := range candidate.Steps {
+				u := strings.TrimSpace(substituteKnownVars(s.URL, vs))
+				if u != "" && !strings.HasPrefix(strings.ToLower(u), "uia://") {
+					return fmt.Errorf("uia step %q url %q must use uia:// scheme", s.ID, u)
+				}
+				m := strings.TrimSpace(substituteKnownVars(s.MatchTabURL, vs))
+				if m != "" && !strings.HasPrefix(strings.ToLower(m), "uia://") {
+					return fmt.Errorf("uia step %q match_tab_url %q must use uia:// scheme or be empty", s.ID, m)
+				}
+			}
+		}
+		return nil
+	}
+
+	// Check AllowedDomains declarations.
+	for _, raw := range candidate.AllowedDomains {
+		dom := ExtractDomain(raw)
+		if dom == "" {
+			return fmt.Errorf("invalid allowed_domain %q", raw)
+		}
+		if !domainInAllowlist(dom, allowedDomains) {
+			return fmt.Errorf("domain %q is outside approved domains", dom)
+		}
+	}
+
+	foundAny := false
+	for _, vs := range varSets {
+		for _, s := range candidate.Steps {
+			urlVal := strings.TrimSpace(substituteKnownVars(s.URL, vs))
+			if urlVal != "" {
+				if err := validateHTTPURL(urlVal); err != nil {
+					return fmt.Errorf("step %q url %q: %w", s.ID, urlVal, err)
+				}
+				dom := ExtractDomain(urlVal)
+				if !domainInAllowlist(dom, allowedDomains) {
+					return fmt.Errorf("domain %q is outside approved domains", dom)
+				}
+				foundAny = true
+			}
+			matchVal := strings.TrimSpace(substituteKnownVars(s.MatchTabURL, vs))
+			if matchVal != "" {
+				dom := ExtractDomain(matchVal)
+				if dom == "" {
+					return fmt.Errorf("step %q match_tab_url %q must specify an explicit HTTP/HTTPS host", s.ID, matchVal)
+				}
+				if !domainInAllowlist(dom, allowedDomains) {
+					return fmt.Errorf("domain %q is outside approved domains", dom)
+				}
+				foundAny = true
+			}
+		}
+	}
+	if !foundAny {
+		return errors.New("recipe resolved to zero approved target domains")
+	}
+	return nil
+}
+
+func validateHTTPURL(raw string) error {
+	s := strings.TrimSpace(raw)
+	if !strings.HasPrefix(strings.ToLower(s), "http://") && !strings.HasPrefix(strings.ToLower(s), "https://") {
+		return errors.New("must use http or https scheme")
+	}
+	dom := ExtractDomain(s)
+	if dom == "" {
+		return errors.New("must contain a valid non-templated hostname without userinfo")
+	}
+	return nil
 }
 
 // FallbackAction represents a single bounded Tier-2 recovery interaction (zero text input).
@@ -248,15 +438,19 @@ type FallbackPlan struct {
 }
 
 // ValidateFallbackPlan enforces the ADR-004 Tier-2 safety envelope (<=3 safe actions, same domain, no text input).
+// allowedDomains must be non-empty; both target_url and allowed_domain must belong to allowedDomains.
 func ValidateFallbackPlan(plan FallbackPlan, allowedDomains []string) error {
+	if len(allowedDomains) == 0 {
+		return errors.New("fallback_plan requires non-empty approved recipe domains")
+	}
 	if len(plan.Actions) == 0 || len(plan.Actions) > 3 {
 		return fmt.Errorf("fallback_plan must contain between 1 and 3 actions, got %d", len(plan.Actions))
 	}
 	u, err := url.Parse(strings.TrimSpace(plan.TargetURL))
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil {
 		return fmt.Errorf("fallback_plan.target_url %q must be an http/https URL", plan.TargetURL)
 	}
-	targetDomain := strings.ToLower(u.Hostname())
+	targetDomain := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
 	allowedDomain := ExtractDomain(plan.AllowedDomain)
 	if allowedDomain == "" {
 		return errors.New("fallback_plan.allowed_domain is required")
@@ -264,17 +458,11 @@ func ValidateFallbackPlan(plan FallbackPlan, allowedDomains []string) error {
 	if !DomainsMatch(targetDomain, allowedDomain) {
 		return fmt.Errorf("fallback_plan target domain %q violates allowed_domain %q", targetDomain, allowedDomain)
 	}
-	if len(allowedDomains) > 0 {
-		matched := false
-		for _, dom := range allowedDomains {
-			if DomainsMatch(targetDomain, dom) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			return fmt.Errorf("fallback_plan target domain %q is not in approved recipe domains", targetDomain)
-		}
+	if !domainInAllowlist(allowedDomain, allowedDomains) {
+		return fmt.Errorf("fallback_plan allowed_domain %q is not in approved recipe domains", allowedDomain)
+	}
+	if !domainInAllowlist(targetDomain, allowedDomains) {
+		return fmt.Errorf("fallback_plan target domain %q is not in approved recipe domains", targetDomain)
 	}
 	for i, act := range plan.Actions {
 		switch strings.ToLower(strings.TrimSpace(act.Action)) {
@@ -297,8 +485,8 @@ func ValidateFallbackPlan(plan FallbackPlan, allowedDomains []string) error {
 	return nil
 }
 
-// ValidateDropReport enforces structural invariants on a DropReport.
-func ValidateDropReport(r DropReport, _ []string) error {
+// ValidateDropReport enforces structural invariants and outbound air-gap rules on a DropReport.
+func ValidateDropReport(r DropReport, extraForbidden []string) error {
 	if strings.TrimSpace(r.Recipe) == "" {
 		return errors.New("drop_report.recipe is required")
 	}
@@ -311,12 +499,55 @@ func ValidateDropReport(r DropReport, _ []string) error {
 	if len(r.Steps) == 0 {
 		return errors.New("drop_report.steps must contain at least 1 step")
 	}
+	hasStructuredData := false
 	for i, s := range r.Steps {
 		if strings.TrimSpace(s.StepID) == "" {
 			return fmt.Errorf("drop_report.steps[%d].step_id is required", i)
 		}
+		if hasNonEmptyStepData(s) {
+			hasStructuredData = true
+		}
+	}
+	if r.Mode == DropModeComputerUseFallback && !hasStructuredData {
+		return errors.New("fallback drop_report must contain at least one non-empty extracted field, item, table, metric, or selector")
+	}
+	raw, err := json.Marshal(r)
+	if err != nil {
+		return fmt.Errorf("marshal drop_report: %w", err)
+	}
+	if err := EnforceAirGap(string(raw), extraForbidden); err != nil {
+		return err
 	}
 	return nil
+}
+
+func hasNonEmptyStepData(s StepResult) bool {
+	if len(s.Tables) > 0 || len(s.Metrics) > 0 || len(s.Selectors) > 0 {
+		return true
+	}
+	for _, v := range s.Fields {
+		if !isEmptyAnyValue(v) {
+			return true
+		}
+	}
+	for _, item := range s.Items {
+		for _, v := range item {
+			if !isEmptyAnyValue(v) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isEmptyAnyValue(v any) bool {
+	if v == nil {
+		return true
+	}
+	if str, ok := v.(string); ok {
+		return strings.TrimSpace(str) == ""
+	}
+	return false
 }
 
 // AttemptLog records a single execution attempt on a queued Task.

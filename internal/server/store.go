@@ -59,6 +59,7 @@ type Store interface {
 	GetProposal(ctx context.Context, id string) (contract.RecipePatchProposal, error)
 	ListProposals(ctx context.Context, statusFilter string, limit int) ([]contract.RecipePatchProposal, error)
 	ReviewProposal(ctx context.Context, id string, status contract.ProposalStatus, reviewedBy string, note string) (contract.RecipePatchProposal, error)
+	RevertProposalToPending(ctx context.Context, id string) error
 }
 
 func newID(prefix string) string {

@@ -65,13 +65,13 @@ func (m *MemoryStore) exportSnapshot() storeSnapshot {
 	snap := storeSnapshot{
 		SchemaVersion: "2.0",
 		SavedAtUTC:    nowISO(),
-		Messages:      slices.Clone(m.messages),
+		Messages:      cloneMessages(m.messages),
 		MsgIdemp:      cloneStringMap(m.msgIdemp),
 		Drops:         slices.Clone(m.drops),
 		DropIdemp:     cloneStringMap(m.dropIdemp),
 		Diagnostics:   slices.Clone(m.diagnostics),
 		Breakers:      make(map[string]contract.DomainBreaker, len(m.breakers)),
-		Tasks:         slices.Clone(m.tasks),
+		Tasks:         cloneTasks(m.tasks),
 		Workers:       make(map[string]contract.WorkerStatus, len(m.workers)),
 		Proposals:     slices.Clone(m.proposals),
 	}
@@ -79,6 +79,7 @@ func (m *MemoryStore) exportSnapshot() storeSnapshot {
 		snap.Breakers[k] = v
 	}
 	for k, v := range m.workers {
+		v.AvailableSessions = slices.Clone(v.AvailableSessions)
 		snap.Workers[k] = v
 	}
 	return snap
@@ -88,7 +89,7 @@ func (m *MemoryStore) importSnapshot(snap storeSnapshot) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.messages = slices.Clone(snap.Messages)
+	m.messages = cloneMessages(snap.Messages)
 	m.msgIdemp = cloneStringMap(snap.MsgIdemp)
 	m.drops = slices.Clone(snap.Drops)
 	m.dropIdemp = cloneStringMap(snap.DropIdemp)
@@ -97,15 +98,46 @@ func (m *MemoryStore) importSnapshot(snap storeSnapshot) {
 	for k, v := range snap.Breakers {
 		m.breakers[k] = v
 	}
-	m.tasks = slices.Clone(snap.Tasks)
+	m.tasks = cloneTasks(snap.Tasks)
 	m.workers = make(map[string]contract.WorkerStatus, len(snap.Workers))
 	for k, v := range snap.Workers {
+		v.AvailableSessions = slices.Clone(v.AvailableSessions)
 		m.workers[k] = v
 	}
 	m.proposals = slices.Clone(snap.Proposals)
 }
 
+func cloneMessages(in []contract.BusMessage) []contract.BusMessage {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]contract.BusMessage, len(in))
+	for i, msg := range in {
+		msg.To = slices.Clone(msg.To)
+		msg.Notes = slices.Clone(msg.Notes)
+		msg.AckNotes = slices.Clone(msg.AckNotes)
+		out[i] = msg
+	}
+	return out
+}
+
+func cloneTasks(in []contract.Task) []contract.Task {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]contract.Task, len(in))
+	for i, t := range in {
+		t.Vars = cloneStringMap(t.Vars)
+		t.Attempts = slices.Clone(t.Attempts)
+		out[i] = t
+	}
+	return out
+}
+
 func cloneStringMap(in map[string]string) map[string]string {
+	if in == nil {
+		return make(map[string]string)
+	}
 	out := make(map[string]string, len(in))
 	for k, v := range in {
 		out[k] = v
@@ -142,13 +174,29 @@ func (m *MemoryStore) PostMessage(_ context.Context, req contract.PostMessageReq
 		msg.From = "agent"
 	}
 	m.messages = append(m.messages, msg)
-	if len(m.messages) > maxRetainedMessages {
-		m.messages = m.messages[len(m.messages)-maxRetainedMessages:]
-	}
 	if idempotencyKey != "" {
 		m.msgIdemp[idempotencyKey] = msg.ID
 	}
+	if len(m.messages) > maxRetainedMessages {
+		m.messages = m.messages[len(m.messages)-maxRetainedMessages:]
+		m.pruneMessageIdempLocked()
+	}
 	return msg, true, nil
+}
+
+func (m *MemoryStore) pruneMessageIdempLocked() {
+	if len(m.msgIdemp) == 0 {
+		return
+	}
+	alive := make(map[string]struct{}, len(m.messages))
+	for _, msg := range m.messages {
+		alive[msg.ID] = struct{}{}
+	}
+	for k, id := range m.msgIdemp {
+		if _, ok := alive[id]; !ok {
+			delete(m.msgIdemp, k)
+		}
+	}
 }
 
 func (m *MemoryStore) ListMessages(_ context.Context, target string, statusFilter string, limit int) ([]contract.BusMessage, error) {
@@ -263,13 +311,29 @@ func (m *MemoryStore) SaveDrop(_ context.Context, req contract.SubmitDropRequest
 	}
 
 	m.drops = append(m.drops, rec)
-	if len(m.drops) > maxRetainedDrops {
-		m.drops = m.drops[len(m.drops)-maxRetainedDrops:]
-	}
 	if idempotencyKey != "" {
 		m.dropIdemp[idempotencyKey] = rec.ID
 	}
+	if len(m.drops) > maxRetainedDrops {
+		m.drops = m.drops[len(m.drops)-maxRetainedDrops:]
+		m.pruneDropIdempLocked()
+	}
 	return rec, true, nil
+}
+
+func (m *MemoryStore) pruneDropIdempLocked() {
+	if len(m.dropIdemp) == 0 {
+		return
+	}
+	alive := make(map[string]struct{}, len(m.drops))
+	for _, d := range m.drops {
+		alive[d.ID] = struct{}{}
+	}
+	for k, id := range m.dropIdemp {
+		if _, ok := alive[id]; !ok {
+			delete(m.dropIdemp, k)
+		}
+	}
 }
 
 func (m *MemoryStore) GetDrop(_ context.Context, idOrShortID string) (contract.DropRecord, error) {
@@ -437,10 +501,24 @@ func (m *MemoryStore) EnqueueTask(_ context.Context, req contract.EnqueueTaskReq
 		UpdatedAtUTC: now,
 	}
 	m.tasks = append(m.tasks, task)
-	if len(m.tasks) > maxRetainedTasks {
-		m.tasks = m.tasks[len(m.tasks)-maxRetainedTasks:]
-	}
+	m.pruneTasksLocked()
 	return task, false, nil
+}
+
+func (m *MemoryStore) pruneTasksLocked() {
+	for len(m.tasks) > maxRetainedTasks {
+		evictIdx := -1
+		for i, t := range m.tasks {
+			if t.Status != contract.TaskStatusPending && t.Status != contract.TaskStatusClaimed {
+				evictIdx = i
+				break
+			}
+		}
+		if evictIdx == -1 {
+			break // Never evict live pending or claimed tasks.
+		}
+		m.tasks = append(m.tasks[:evictIdx], m.tasks[evictIdx+1:]...)
+	}
 }
 
 func (m *MemoryStore) sweepExpiredLeasesLocked(now time.Time) {
@@ -512,11 +590,15 @@ func (m *MemoryStore) HeartbeatTask(_ context.Context, taskID string, host strin
 			if t.Status != contract.TaskStatusClaimed {
 				return contract.Task{}, ErrConflict
 			}
+			reqHost := strings.TrimSpace(host)
+			if t.ClaimedBy != "" && (reqHost == "" || !strings.EqualFold(reqHost, strings.TrimSpace(t.ClaimedBy))) {
+				return contract.Task{}, ErrConflict
+			}
 			now := time.Now().UTC()
 			t.LeaseUntil = formatISO(now.Add(lease))
 			t.UpdatedAtUTC = formatISO(now)
-			if host != "" {
-				t.ClaimedBy = host
+			if reqHost != "" {
+				t.ClaimedBy = reqHost
 			}
 			return *t, nil
 		}
@@ -531,6 +613,12 @@ func (m *MemoryStore) CompleteTask(_ context.Context, taskID string, dropID stri
 	for i := range m.tasks {
 		t := &m.tasks[i]
 		if t.ID == taskID {
+			if t.Status == contract.TaskStatusSucceeded && t.DropID == dropID {
+				return *t, nil
+			}
+			if t.Status != contract.TaskStatusClaimed && t.Status != contract.TaskStatusFailedDiagnostic {
+				return contract.Task{}, ErrConflict
+			}
 			t.Status = contract.TaskStatusSucceeded
 			t.DropID = dropID
 			t.LeaseUntil = ""
@@ -559,9 +647,17 @@ func (m *MemoryStore) FailTask(_ context.Context, taskID string, host string, tr
 		return contract.Task{}, contract.DomainBreaker{}, false, ErrNotFound
 	}
 
+	t := &m.tasks[idx]
+	if t.Status != contract.TaskStatusClaimed {
+		return contract.Task{}, contract.DomainBreaker{}, false, ErrConflict
+	}
+	reqHost := strings.TrimSpace(host)
+	if t.ClaimedBy != "" && (reqHost == "" || !strings.EqualFold(reqHost, strings.TrimSpace(t.ClaimedBy))) {
+		return contract.Task{}, contract.DomainBreaker{}, false, ErrConflict
+	}
+
 	now := time.Now().UTC()
 	nowStr := formatISO(now)
-	t := &m.tasks[idx]
 	t.LastError = errMsg
 	t.LastCode = triage.Code
 	t.LeaseUntil = ""
@@ -671,6 +767,11 @@ func (m *MemoryStore) ListTasks(_ context.Context, statusFilter string, limit in
 }
 
 func (m *MemoryStore) UpsertWorkerStatus(_ context.Context, ws contract.WorkerStatus) (contract.WorkerStatus, error) {
+	updated, _ := m.upsertWorkerStatusWithChange(ws)
+	return updated, nil
+}
+
+func (m *MemoryStore) upsertWorkerStatusWithChange(ws contract.WorkerStatus) (contract.WorkerStatus, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -678,7 +779,7 @@ func (m *MemoryStore) UpsertWorkerStatus(_ context.Context, ws contract.WorkerSt
 	if host == "" {
 		host = "desktop-worker"
 	}
-	existing := m.workers[host]
+	existing, existed := m.workers[host]
 	ws.Host = host
 	if ws.Version == "" {
 		ws.Version = existing.Version
@@ -701,11 +802,30 @@ func (m *MemoryStore) UpsertWorkerStatus(_ context.Context, ws contract.WorkerSt
 	if len(ws.AvailableSessions) == 0 {
 		ws.AvailableSessions = existing.AvailableSessions
 	}
+	changed := !existed || !workerDurableEqual(existing, ws)
 	ws.LastSeenUTC = nowISO()
 	ws.AgeSeconds = 0
 	ws.Connected = true
 	m.workers[host] = ws
-	return ws, nil
+	return ws, changed
+}
+
+func workerDurableEqual(a, b contract.WorkerStatus) bool {
+	return a.Host == b.Host &&
+		a.Hostname == b.Hostname &&
+		a.Version == b.Version &&
+		a.OS == b.OS &&
+		a.Arch == b.Arch &&
+		a.BrowserConnected == b.BrowserConnected &&
+		a.BrowserStatus == b.BrowserStatus &&
+		a.ReadyToAccept == b.ReadyToAccept &&
+		a.Busy == b.Busy &&
+		a.FallbackGate == b.FallbackGate &&
+		a.ChromeSession == b.ChromeSession &&
+		a.OpenTabsCount == b.OpenTabsCount &&
+		a.LastAction == b.LastAction &&
+		a.LastError == b.LastError &&
+		slices.Equal(a.AvailableSessions, b.AvailableSessions)
 }
 
 func (m *MemoryStore) ListWorkerStatuses(_ context.Context) ([]contract.WorkerStatus, error) {
@@ -803,4 +923,24 @@ func (m *MemoryStore) ReviewProposal(_ context.Context, id string, status contra
 		}
 	}
 	return contract.RecipePatchProposal{}, ErrNotFound
+}
+
+func (m *MemoryStore) RevertProposalToPending(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	needle := strings.TrimSpace(id)
+	for i := range m.proposals {
+		if m.proposals[i].ID == needle {
+			if m.proposals[i].Status == contract.ProposalStatusApproved {
+				m.proposals[i].Status = contract.ProposalStatusPending
+				m.proposals[i].ReviewedBy = ""
+				m.proposals[i].ReviewNote = ""
+				m.proposals[i].ReviewedAtUTC = ""
+				m.proposals[i].UpdatedAtUTC = nowISO()
+			}
+			return nil
+		}
+	}
+	return ErrNotFound
 }

@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -626,17 +627,18 @@ func (a *trayApp) runSyncCycle(manual bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	if remoteStatus, serr := svcClient.GetDesktopStatus(ctx); serr == nil {
-		if srvVer, _ := remoteStatus["server_version"].(string); isNewerVersion(srvVer, version) {
-			if a.doSelfUpdate(false) {
-				return
-			}
-		}
-	}
-
 	drv := cdp.NewDriver(a.pool, cfg)
 	approver := makeFallbackApprover(cfg.NormalizedFallbackGate())
-	drained, derr := drainQueue(ctx, drv, cfg, svcClient, resolveHostLabel(cfg), 0, false, approver)
+	drained, updated, derr := runTraySyncStep(ctx, drv, cfg, svcClient, resolveHostLabel(cfg), approver, func(_ string) bool {
+		return a.doSelfUpdate(false)
+	})
+	if updated {
+		return
+	}
+	if errors.Is(derr, errRelayRestarting) {
+		a.setBusy(false, "Relay restarting")
+		return
+	}
 	a.refreshStatus()
 	stamp := time.Now().Format("15:04:05")
 	if derr != nil {
@@ -671,8 +673,12 @@ func (a *trayApp) doSelfUpdate(manual bool) bool {
 		}
 		return false
 	}
+	if serr := spawnDetachedSelf(os.Args[1:]); serr != nil {
+		a.setBusy(false, "Update restart failed: "+serr.Error())
+		a.updateTrayIcon("DeskDrop Update Restart Failed", serr.Error(), niifError)
+		return false
+	}
 	a.updateTrayIcon("DeskDrop Updated", fmt.Sprintf("Updated to %s — restarting...", newVer), niifInfo)
-	_ = spawnDetachedSelf(os.Args[1:])
 	time.Sleep(300 * time.Millisecond)
 	procPostMessageW.Call(a.hwnd, wmDestroy, 0, 0)
 	return true

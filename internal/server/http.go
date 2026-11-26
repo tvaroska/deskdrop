@@ -490,11 +490,18 @@ func (s *Service) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if len(allowedSet) > 0 {
+			// Resolve all catalog drivers BEFORE entering MemoryStore.ClaimNextTask's lock
+			// so GCS/disk catalog reloads never run while holding the store mutex.
+			recipeDrivers := make(map[string]string)
 			if s.catalog != nil {
-				_, _ = s.catalog.List(r.Context())
+				if list, lerr := s.catalog.List(r.Context()); lerr == nil {
+					for _, rcp := range list {
+						recipeDrivers[strings.ToLower(strings.TrimSpace(rcp.Name))] = rcp.NormalizedDriver()
+					}
+				}
 			}
 			allow = func(t contract.Task) bool {
-				return allowedSet[s.taskDriver(r.Context(), t)]
+				return allowedSet[taskDriverFromMap(t, recipeDrivers)]
 			}
 		}
 	}
@@ -520,16 +527,16 @@ func (s *Service) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Service) taskDriver(ctx context.Context, t contract.Task) string {
+func taskDriverFromMap(t contract.Task, recipeDrivers map[string]string) string {
 	if t.Kind == contract.TaskKindFallback {
 		return "cdp"
 	}
 	if t.CustomRecipe != nil {
 		return t.CustomRecipe.NormalizedDriver()
 	}
-	if s.catalog != nil && t.Recipe != "" {
-		if rcp, ok, err := s.catalog.Get(ctx, t.Recipe); err == nil && ok {
-			return rcp.NormalizedDriver()
+	if t.Recipe != "" {
+		if drv, ok := recipeDrivers[strings.ToLower(strings.TrimSpace(t.Recipe))]; ok {
+			return drv
 		}
 	}
 	if strings.EqualFold(strings.TrimSpace(t.Domain), "uia.local") {
@@ -573,6 +580,10 @@ func (s *Service) handleCompleteTask(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, "STORE_ERROR", err.Error(), nil)
 		return
 	}
+	if task.Status != contract.TaskStatusClaimed {
+		writeAPIError(w, http.StatusConflict, "TASK_NOT_CLAIMED", fmt.Sprintf("task %q is in status %q, expected claimed", id, task.Status), nil)
+		return
+	}
 
 	var req contract.SubmitDropRequest
 	if err := decodeJSONBody(r, 4*1024*1024, &req); err != nil {
@@ -591,6 +602,10 @@ func (s *Service) handleCompleteTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	updated, err := s.store.CompleteTask(r.Context(), id, rec.ID)
+	if errors.Is(err, ErrConflict) {
+		writeAPIError(w, http.StatusConflict, "TASK_NOT_CLAIMED", "task is no longer in claimed state", nil)
+		return
+	}
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "STORE_ERROR", err.Error(), nil)
 		return

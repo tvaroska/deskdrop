@@ -2,12 +2,19 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/tvaroska/deskdrop/internal/bus"
 	"github.com/tvaroska/deskdrop/internal/contract"
@@ -299,5 +306,100 @@ func TestDrainQueueExecutesUIATasksWhileBrowserCDPDisconnected(t *testing.T) {
 	drained2, err2 := drainQueue(context.Background(), cdpPrimary, cfg, client, "win-pc", 0, false, makeFallbackApprover("tray"))
 	if drained2 != 0 || err2 == nil || !strings.Contains(err2.Error(), "Disconnected") {
 		t.Fatalf("drainQueue second pass: drained=%d err=%v, want 0 + Disconnected error", drained2, err2)
+	}
+}
+
+func TestS1PerformSelfUpdateVerifiesSHA256BeforeSwap(t *testing.T) {
+	goodBin := []byte("MZ-valid-updated-binary-payload-1234567890")
+	goodSum := sha256.Sum256(goodBin)
+	goodHex := hex.EncodeToString(goodSum[:])
+
+	var serveBadHash atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/release/SHA256SUMS.txt":
+			h := goodHex
+			if serveBadHash.Load() {
+				h = strings.Repeat("0", 64)
+			}
+			_, _ = w.Write([]byte(h + "  deskdrop.exe\n"))
+		case "/v1/release/deskdrop.exe":
+			w.Header().Set("X-DeskDrop-Version", "v1.3.2")
+			_, _ = w.Write(goodBin)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	exePath := filepath.Join(dir, "deskdrop.exe")
+	origBin := []byte("MZ-original-binary")
+	if err := os.WriteFile(exePath, origBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	client := bus.NewDesktopClient(contract.Config{ServiceURL: srv.URL, ServiceToken: "desk-tok"})
+	client.RetryBaseDelay = 1 * time.Millisecond
+
+	// Mismatched SHA-256 must fail and leave existing binary intact.
+	serveBadHash.Store(true)
+	if _, err := performSelfUpdateTo(context.Background(), client, exePath, "windows", 10); err == nil {
+		t.Fatal("expected SHA-256 mismatch to fail self-update")
+	}
+	afterBad, _ := os.ReadFile(exePath)
+	if string(afterBad) != string(origBin) {
+		t.Fatalf("existing binary was overwritten on SHA-256 mismatch: got %q", string(afterBad))
+	}
+
+	// Matching SHA-256 swaps atomically.
+	serveBadHash.Store(false)
+	ver, err := performSelfUpdateTo(context.Background(), client, exePath, "windows", 10)
+	if err != nil || ver != "v1.3.2" {
+		t.Fatalf("performSelfUpdateTo valid SHA-256 = (%q, %v), want (v1.3.2, nil)", ver, err)
+	}
+	afterGood, _ := os.ReadFile(exePath)
+	if string(afterGood) != string(goodBin) {
+		t.Fatalf("updated binary mismatch: got %q", string(afterGood))
+	}
+}
+
+func TestM25RunTraySyncStepSkipsDrainOnRelay503(t *testing.T) {
+	var (
+		statusHits    atomic.Int32
+		heartbeatHits atomic.Int32
+		claimHits     atomic.Int32
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/status":
+			statusHits.Add(1)
+			http.Error(w, "recreating pod", http.StatusServiceUnavailable)
+		case "/v1/workers/heartbeat":
+			heartbeatHits.Add(1)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/v1/tasks/claim":
+			claimHits.Add(1)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := contract.Config{From: "win-pc", ServiceURL: srv.URL, ServiceToken: "desk-tok"}
+	client := bus.NewDesktopClient(cfg)
+	client.RetryBaseDelay = 1 * time.Millisecond
+
+	drv := &fakeDriver{name: "cdp"}
+	drained, updated, err := runTraySyncStep(context.Background(), drv, cfg, client, "win-pc", makeFallbackApprover("tray"), nil)
+	if !errors.Is(err, errRelayRestarting) || drained != 0 || updated {
+		t.Fatalf("runTraySyncStep on 503 = (drained=%d, updated=%v, err=%v), want (0, false, errRelayRestarting)", drained, updated, err)
+	}
+	if heartbeatHits.Load() != 0 || claimHits.Load() != 0 {
+		t.Fatalf("expected 0 heartbeat and 0 claim calls on 503 status, got heartbeat=%d claim=%d", heartbeatHits.Load(), claimHits.Load())
+	}
+	if statusHits.Load() > 4 {
+		t.Fatalf("expected <=4 /v1/status calls per tick, got %d", statusHits.Load())
 	}
 }

@@ -3,8 +3,8 @@ package cdp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/tvaroska/deskdrop/internal/contract"
@@ -35,15 +35,27 @@ func (c *Client) runPaginationLoop(
 		return acc, nil
 	}
 
-	baseDomain := contract.ExtractDomain(initial.URL)
+	allowedDomains := contract.StepDomains(step)
+	baseDomain := ""
+	if len(allowedDomains) > 0 {
+		baseDomain = allowedDomains[0]
+	} else {
+		baseDomain = contract.ExtractDomain(initial.URL)
+		if baseDomain != "" {
+			allowedDomains = []string{baseDomain}
+		}
+	}
 	if baseDomain == "" {
-		baseDomain = contract.ExtractDomain(step.URL)
+		return acc, errors.New("pagination requires a valid HTTP/HTTPS base domain")
 	}
 
 	clickNextExpr := buildClickNextIfEnabledJS(pag.NextSelector)
 	extractExpr := buildDeclarativeExtractJS(step, maxText)
 
 	for pageIdx := 2; pageIdx <= pag.MaxPages; pageIdx++ {
+		if _, err := c.verifyAllowedSessionURL(sctx, sessionID, step, baseDomain, allowedDomains, "pagination"); err != nil {
+			return acc, err
+		}
 		var clickRes nextClickState
 		if err := c.EvalJSON(sctx, sessionID, clickNextExpr, &clickRes); err != nil {
 			return acc, fmt.Errorf("pagination click %q on page %d failed: %w", pag.NextSelector, pageIdx, err)
@@ -66,18 +78,8 @@ func (c *Client) runPaginationLoop(
 			}
 		}
 
-		var curURL string
-		_ = c.EvalJSON(sctx, sessionID, "location.href || ''", &curURL)
-		if curURL != "" {
-			lowerURL := strings.ToLower(curURL)
-			for _, bad := range step.Expect.NotURLContains {
-				if bad != "" && strings.Contains(lowerURL, strings.ToLower(bad)) {
-					return acc, fmt.Errorf("step %q landed on blocked/login URL %q (matched %q)", step.ID, curURL, bad)
-				}
-			}
-			if landedDomain := contract.ExtractDomain(curURL); baseDomain != "" && landedDomain != "" && !contract.DomainsMatch(landedDomain, baseDomain) {
-				return acc, fmt.Errorf("pagination navigated off allowlisted domain %q to %q", baseDomain, landedDomain)
-			}
+		if _, err := c.verifyAllowedSessionURL(sctx, sessionID, step, baseDomain, allowedDomains, "pagination"); err != nil {
+			return acc, err
 		}
 
 		var pageRes contract.StepResult

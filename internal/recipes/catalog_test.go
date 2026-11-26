@@ -170,3 +170,112 @@ func TestReloadableCatalogGCSHotReloadETagAndWriteBack(t *testing.T) {
 		t.Fatalf("fresh GCS catalog read mismatch: %+v ok=%v err=%v", r2, ok, err)
 	}
 }
+
+func TestA1A2CatalogHardeningTraversalCachePoisoningAndVarHostPivot(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Directory mode rejects "../state" path traversal in SaveRecipe.
+	dir := t.TempDir()
+	recipesDir := filepath.Join(dir, "recipes")
+	if err := os.MkdirAll(recipesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dirCat := NewReloadableCatalog(recipesDir)
+	if err := dirCat.SaveRecipe(ctx, contract.Recipe{
+		Name:  "../state",
+		Topic: "evil",
+		Steps: []contract.Step{{ID: "s1", URL: "https://status.example.com"}},
+	}); err == nil {
+		t.Fatal("expected SaveRecipe to reject ../state traversal name")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "state.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("SaveRecipe wrote outside recipes directory")
+	}
+	// Non-dir (single-file / in-memory) SaveRecipe must also enforce ValidateRecipeName directly.
+	memCat := NewStaticCatalog()
+	if err := memCat.SaveRecipe(ctx, contract.Recipe{
+		Name:  "../state",
+		Topic: "evil",
+		Steps: []contract.Step{{ID: "s1", URL: "https://status.example.com"}},
+	}); err == nil {
+		t.Fatal("expected non-dir SaveRecipe to reject ../state recipe name")
+	}
+
+	// 2. Registered catalog recipe with host variable cannot be pivoted via task vars (custom == nil).
+	cat := NewStaticCatalog(contract.Recipe{
+		Name:           "templated-host",
+		Topic:          "ops",
+		AllowedDomains: []string{"status.example.com"},
+		Steps:          []contract.Step{{ID: "s1", URL: "https://{{host}}/overview"}},
+	})
+	if _, err := cat.ValidateAndResolveTask(ctx, "templated-host", nil, map[string]string{"host": "evil.invalid"}); err == nil {
+		t.Fatal("expected ValidateAndResolveTask to block host pivot via task vars on catalog recipe")
+	}
+
+	// 3. GCS SaveRecipe propagates reload error (never wiping existing recipes) and does not poison cache on write error.
+	var failGet, failPost bool
+	metaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"access_token":"tok","expires_in":3600}`))
+	}))
+	defer metaSrv.Close()
+
+	origPayload, _ := json.Marshal(Bundle{
+		Recipes: []contract.Recipe{
+			{Name: "r1", Topic: "t1", Description: "orig", Steps: []contract.Step{{ID: "s1", URL: "https://a.example.com"}}},
+			{Name: "r2", Topic: "t2", Description: "keep", Steps: []contract.Step{{ID: "s1", URL: "https://b.example.com"}}},
+		},
+	})
+	gcsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			if failGet {
+				http.Error(w, "transient gcs outage", http.StatusServiceUnavailable)
+				return
+			}
+			if r.Header.Get("If-None-Match") == `"v1"` {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			w.Header().Set("ETag", `"v1"`)
+			_, _ = w.Write(origPayload)
+			return
+		}
+		if failPost {
+			http.Error(w, "write denied", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer gcsSrv.Close()
+
+	// Unloaded catalog: failed reloadLocked must fail SaveRecipe instead of wiping GCS.
+	failGet = true
+	unloadedCat := NewReloadableCatalog("gs://bucket/recipes.json")
+	unloadedCat.GCSBaseURL = gcsSrv.URL
+	unloadedCat.GCSTokenURL = metaSrv.URL
+	if err := unloadedCat.SaveRecipe(ctx, contract.Recipe{
+		Name: "r1", Topic: "t1", Steps: []contract.Step{{ID: "s1", URL: "https://a.example.com"}},
+	}); err == nil {
+		t.Fatal("expected SaveRecipe to fail when initial reload fails")
+	}
+
+	// Loaded catalog: failed POST must NOT poison in-memory cache across subsequent 304 Not Modified.
+	failGet = false
+	failPost = true
+	loadedCat := NewReloadableCatalog("gs://bucket/recipes.json")
+	loadedCat.MinReloadInterval = 0
+	loadedCat.GCSBaseURL = gcsSrv.URL
+	loadedCat.GCSTokenURL = metaSrv.URL
+	r1, ok, err := loadedCat.Get(ctx, "r1")
+	if err != nil || !ok || r1.Description != "orig" {
+		t.Fatalf("initial Get(r1) = (%+v, %v, %v)", r1, ok, err)
+	}
+	r1Mut := r1
+	r1Mut.Description = "poisoned"
+	if err := loadedCat.SaveRecipe(ctx, r1Mut); err == nil {
+		t.Fatal("expected SaveRecipe to fail on GCS 500")
+	}
+	r1After, ok, err := loadedCat.Get(ctx, "r1")
+	if err != nil || !ok || r1After.Description != "orig" {
+		t.Fatalf("cache poisoned after failed SaveRecipe: got %q, want orig", r1After.Description)
+	}
+}

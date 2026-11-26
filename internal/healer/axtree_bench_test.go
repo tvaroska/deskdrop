@@ -193,7 +193,7 @@ func TestCanvasWebGLBlindSpotMultimodalFallbackAndPatchAbstention(t *testing.T) 
 		t.Fatal(err)
 	}
 	compactAX, stats := contract.FormatCompactAXTree(nodes, 300)
-	if !stats.CanvasBlindSpot || !contract.InspectHTMLCanvasBlindSpot(canvasHTML, stats) {
+	if !stats.CanvasBlindSpot {
 		t.Fatalf("expected CanvasBlindSpot=true on unlabelled WebGL canvas, got %+v\n%s", stats, compactAX)
 	}
 

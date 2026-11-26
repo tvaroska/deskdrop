@@ -664,6 +664,9 @@ func loadConfig(explicitPath string) (contract.Config, error) {
 	applyEnv(&cfg.RecipesURI, "DESKDROP_RECIPES_URI", "RECIPES_URI")
 	applyEnv(&cfg.FallbackGate, "DESKDROP_FALLBACK_GATE", "")
 	applyEnv(&cfg.Driver, "DESKDROP_DRIVER", "")
+	if localTerms := contract.LoadLocalGuardTerms(); len(localTerms) > 0 {
+		cfg.ForbiddenTerms = append(cfg.ForbiddenTerms, localTerms...)
+	}
 	return cfg, nil
 }
 

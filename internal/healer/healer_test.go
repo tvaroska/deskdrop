@@ -3,6 +3,7 @@ package healer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"iter"
 	"os"
 	"path/filepath"
@@ -367,5 +368,193 @@ func TestTier2FallbackEscalationAndDomainPivotGuard(t *testing.T) {
 	}
 	if res2.Proposal != nil {
 		t.Fatalf("expected nil proposal on blocked pivot, got %+v", res2.Proposal)
+	}
+}
+
+func TestA2A5A6HealerHardeningInvariantsAirGapModelLockAndStage1Recovery(t *testing.T) {
+	// 1. Pre-network model lock rejects unapproved HEALER_MODEL.
+	if _, err := New(context.Background(), Config{ModelName: "gemini-4.0-pro", Project: "test-proj"}); err == nil {
+		t.Fatal("expected healer.New to reject unapproved model name")
+	}
+
+	var v1Recipe contract.Recipe
+	_ = contract.ParseJSONStrict(loadFixture(t, "status_v1_recipe.json"), &v1Recipe)
+	v2HTML := string(loadFixture(t, "status_v2_drifted.html"))
+
+	// 2. Air-gap blocks LandedURL, ErrorMsg, and Recipe before LLM invocation.
+	hGuard, _ := New(context.Background(), Config{
+		LLM: &scriptedLLM{handler: func(_ *model.LLMRequest) *model.LLMResponse {
+			t.Fatal("LLM must not be called on air-gap failure")
+			return nil
+		}},
+		ForbiddenTerms: []string{"acme-secret"},
+	})
+	for _, tc := range []server.HealRequest{
+		{Recipe: v1Recipe, StepID: "status_overview", LandedURL: "https://status.example.com/acme-secret", DOMHTML: v2HTML},
+		{Recipe: v1Recipe, StepID: "status_overview", LandedURL: "https://status.example.com", ErrorMsg: "failed on acme-secret", DOMHTML: v2HTML},
+	} {
+		if _, err := hGuard.HealDrift(context.Background(), tc); err == nil {
+			t.Fatalf("expected air-gap to block HealDrift for %+v", tc)
+		}
+	}
+
+	// 3. Reject empty fallback report, stripped Expect, \uXXXX air-gap bypass, and pin "../state" name.
+	strippedExpect := v1Recipe
+	strippedExpect.Steps = []contract.Step{{ID: "status_overview", URL: "https://status.example.com/overview"}}
+	strippedJSON, _ := json.Marshal(strippedExpect)
+
+	escapedLeakJSON := `{"name":"../state","topic":"ops","steps":[{"id":"status_overview","url":"https://status.example.com/overview","fields":{"overall_status":{"selector":".\u0061cme-secret"}},"expect":{"min_items":3,"required_fields":["overall_status"]}}]}`
+
+	pinnedPatch := v1Recipe
+	pinnedPatch.Name = "../state" // Prompt-injected traversal name must be pinned back to v1Recipe.Name!
+	pinnedPatch.Steps = []contract.Step{
+		{
+			ID:  "status_overview",
+			URL: "https://status.example.com/overview",
+			Fields: map[string]contract.FieldRule{
+				"overall_status":   {Selector: "[data-testid='global-health']"},
+				"active_incidents": {Selector: "[data-testid='open-incidents']", Parse: "number"},
+			},
+			Items: &contract.ItemRule{
+				Container: "article.service-card",
+				DedupeBy:  "service",
+				Fields: map[string]contract.FieldRule{
+					"service":    {Selector: "h3.card-title"},
+					"state":      {Selector: "span.badge-health"},
+					"uptime_pct": {Selector: "span[data-kpi='uptime']", Parse: "float"},
+				},
+			},
+			Expect: v1Recipe.Steps[0].Expect,
+		},
+	}
+	pinnedJSON, _ := json.Marshal(pinnedPatch)
+
+	var sawEmptyReject, sawExpectReject, sawEscapedReject bool
+	fbCall := 0
+	patchCall := 0
+	m := &scriptedLLM{
+		handler: func(req *model.LLMRequest) *model.LLMResponse {
+			if hasTool(req, "submit_fallback_report") {
+				if resp, ok := lastFunctionResponse(req, "submit_fallback_report"); ok {
+					if accepted, _ := resp["accepted"].(bool); !accepted {
+						sawEmptyReject = true
+					}
+					return &model.LLMResponse{Content: genai.NewContentFromText("done", genai.RoleModel), TurnComplete: true}
+				}
+				fbCall++
+				return &model.LLMResponse{
+					Content: &genai.Content{
+						Role:  genai.RoleModel,
+						Parts: []*genai.Part{genai.NewPartFromFunctionCall("submit_fallback_report", map[string]any{})},
+					},
+					TurnComplete: true,
+				}
+			}
+			if hasTool(req, "verify_recipe_on_snapshot") {
+				if resp, ok := lastFunctionResponse(req, "verify_recipe_on_snapshot"); ok {
+					errStr, _ := resp["error"].(string)
+					if strings.Contains(errStr, "weaken expect") {
+						sawExpectReject = true
+					}
+					if strings.Contains(errStr, "air-gap") {
+						sawEscapedReject = true
+					}
+					if passed, _ := resp["passed"].(bool); passed {
+						return &model.LLMResponse{
+							Content:      &genai.Content{Role: genai.RoleModel, Parts: []*genai.Part{genai.NewPartFromFunctionCall("exit_loop", map[string]any{})}},
+							TurnComplete: true,
+						}
+					}
+				}
+				patchCall++
+				cand := string(strippedJSON)
+				if patchCall == 2 {
+					cand = escapedLeakJSON
+				} else if patchCall >= 3 {
+					cand = string(pinnedJSON)
+				}
+				return &model.LLMResponse{
+					Content: &genai.Content{
+						Role: genai.RoleModel,
+						Parts: []*genai.Part{genai.NewPartFromFunctionCall("verify_recipe_on_snapshot", map[string]any{
+							"recipe_json": cand,
+							"rationale":   "test patch",
+						})},
+					},
+					TurnComplete: true,
+				}
+			}
+			return &model.LLMResponse{Content: genai.NewContentFromText("done", genai.RoleModel), TurnComplete: true}
+		},
+	}
+	h3, _ := New(context.Background(), Config{LLM: m, MaxPatchIterations: 4, ForbiddenTerms: []string{"acme-secret"}})
+	res, err := h3.HealDrift(context.Background(), server.HealRequest{
+		Task:       contract.Task{ID: "task_h3", Recipe: v1Recipe.Name, Domain: "status.example.com"},
+		Recipe:     v1Recipe,
+		StepID:     "status_overview",
+		LandedURL:  "https://status.example.com/overview",
+		ErrorMsg:   "selector drift",
+		DOMHTML:    v2HTML,
+		AllowTier2: false,
+	})
+	if err != nil {
+		t.Fatalf("HealDrift failed: %v", err)
+	}
+	if !sawEmptyReject || res.FallbackReport != nil {
+		t.Fatalf("expected empty fallback report rejected: sawEmptyReject=%v report=%+v", sawEmptyReject, res.FallbackReport)
+	}
+	if !sawExpectReject {
+		t.Fatal("expected stripped Expect proposal to be rejected")
+	}
+	if !sawEscapedReject {
+		t.Fatal("expected \\uXXXX-escaped air-gap leak to be rejected")
+	}
+	if res.Proposal == nil || res.Proposal.ProposedRecipe.Name != v1Recipe.Name {
+		t.Fatalf("expected Proposal with pinned name %q, got %+v", v1Recipe.Name, res.Proposal)
+	}
+
+	// 4. Stage-2 error preserves valid Stage-1 FallbackReport.
+	errLLM := &stage2ErrLLM{}
+	h4, _ := New(context.Background(), Config{LLM: errLLM, MaxPatchIterations: 1})
+	res4, err := h4.HealDrift(context.Background(), server.HealRequest{
+		Task:       contract.Task{ID: "task_s1", Recipe: v1Recipe.Name, Domain: "status.example.com"},
+		Recipe:     v1Recipe,
+		StepID:     "status_overview",
+		LandedURL:  "https://status.example.com/overview",
+		ErrorMsg:   "selector drift",
+		DOMHTML:    v2HTML,
+		AllowTier2: false,
+	})
+	if err != nil {
+		t.Fatalf("expected Stage-1 report preserved on Stage-2 error, got err=%v", err)
+	}
+	if res4.FallbackReport == nil || res4.FallbackReport.Steps[0].Fields["overall_status"] != "OK" {
+		t.Fatalf("expected preserved Stage-1 FallbackReport, got %+v", res4.FallbackReport)
+	}
+}
+
+type stage2ErrLLM struct{}
+
+func (s *stage2ErrLLM) Name() string { return "stage2-err-llm" }
+
+func (s *stage2ErrLLM) GenerateContent(_ context.Context, req *model.LLMRequest, _ bool) iter.Seq2[*model.LLMResponse, error] {
+	return func(yield func(*model.LLMResponse, error) bool) {
+		if hasTool(req, "submit_fallback_report") {
+			if _, done := lastFunctionResponse(req, "submit_fallback_report"); done {
+				yield(&model.LLMResponse{Content: genai.NewContentFromText("done", genai.RoleModel), TurnComplete: true}, nil)
+				return
+			}
+			yield(&model.LLMResponse{
+				Content: &genai.Content{
+					Role: genai.RoleModel,
+					Parts: []*genai.Part{genai.NewPartFromFunctionCall("submit_fallback_report", map[string]any{
+						"fields": map[string]any{"overall_status": "OK"},
+					})},
+				},
+				TurnComplete: true,
+			}, nil)
+			return
+		}
+		yield(nil, errors.New("vertex quota exhausted in stage 2"))
 	}
 }

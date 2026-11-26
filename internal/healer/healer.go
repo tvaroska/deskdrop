@@ -59,6 +59,23 @@ type Healer struct {
 
 var _ server.ExceptionHealer = (*Healer)(nil)
 
+var approvedHealerModels = map[string]bool{
+	"gemini-3.8-flash":      true,
+	"gemini-3.5-flash-lite": true,
+	"gemini-4-hydrogen":     true,
+	"gemini-4-carbon":       true,
+	"gemini-4-argon":        true,
+}
+
+// ValidateModelName enforces the pre-network HEALER_MODEL allowlist.
+func ValidateModelName(name string) error {
+	m := strings.TrimSpace(name)
+	if !approvedHealerModels[m] {
+		return fmt.Errorf("unapproved healer model %q (allowed: gemini-3.8-flash, gemini-3.5-flash-lite, gemini-4-hydrogen, gemini-4-carbon, gemini-4-argon)", m)
+	}
+	return nil
+}
+
 // New initializes a Vertex AI (or Gemini API / injected test LLM) exception healer.
 func New(ctx context.Context, cfg Config) (*Healer, error) {
 	modelName := strings.TrimSpace(cfg.ModelName)
@@ -72,6 +89,9 @@ func New(ctx context.Context, cfg Config) (*Healer, error) {
 
 	llm := cfg.LLM
 	if llm == nil {
+		if err := ValidateModelName(modelName); err != nil {
+			return nil, err
+		}
 		clientCfg := &genai.ClientConfig{}
 		switch {
 		case strings.TrimSpace(cfg.Project) != "":
@@ -109,16 +129,39 @@ func (h *Healer) HealDrift(ctx context.Context, req server.HealRequest) (server.
 		return server.HealResult{Summary: "computer_use_fallback disabled by recipe"}, nil
 	}
 	scrubbedHTML := contract.ScrubHTML(req.DOMHTML)
+	axTree := strings.TrimSpace(req.AXTreeText)
+	canvasBlindSpot := hasUnlabelledCanvasBlindSpot(scrubbedHTML, axTree)
+
+	recipeBytes, _ := json.MarshalIndent(req.Recipe, "", "  ")
+	var promptBuilder strings.Builder
+	fmt.Fprintf(&promptBuilder,
+		"SELECTOR_DRIFT Exception Context\nRecipe: %s\nStep ID: %s\nLanded URL: %s\nError: %s\n",
+		req.Recipe.Name,
+		req.StepID,
+		req.LandedURL,
+		req.ErrorMsg,
+	)
+	if canvasBlindSpot {
+		promptBuilder.WriteString("Grounding Warning: UNLABELLED_CANVAS_SURFACE — page contains an unlabelled <canvas>/WebGL surface with minimal DOM/AXTree text. Recover visible values from screenshot.png only; CSS selectors cannot read canvas pixels.\n")
+	}
+	fmt.Fprintf(&promptBuilder, "\nFailed Recipe JSON:\n%s\n", string(recipeBytes))
+	if axTree != "" {
+		fmt.Fprintf(&promptBuilder, "\nCompact AXTree (axtree.txt):\n%s\n", truncateRunes(axTree, maxPromptAXTreeRunes))
+	}
+	fmt.Fprintf(&promptBuilder, "\nScrubbed dom.html:\n%s", truncateRunes(scrubbedHTML, maxPromptHTMLRunes))
+	prompt := promptBuilder.String()
+
 	if err := contract.EnforceAirGap(scrubbedHTML, h.forbiddenTerms); err != nil {
 		return server.HealResult{}, fmt.Errorf("air-gap blocked healer input: %w", err)
 	}
-	axTree := strings.TrimSpace(req.AXTreeText)
 	if axTree != "" {
 		if err := contract.EnforceAirGap(axTree, h.forbiddenTerms); err != nil {
 			return server.HealResult{}, fmt.Errorf("air-gap blocked healer axtree: %w", err)
 		}
 	}
-	canvasBlindSpot := hasUnlabelledCanvasBlindSpot(scrubbedHTML, axTree)
+	if err := contract.EnforceAirGap(prompt, h.forbiddenTerms); err != nil {
+		return server.HealResult{}, fmt.Errorf("air-gap blocked healer prompt: %w", err)
+	}
 
 	allowedDomains := contract.InferRecipeDomains(req.Recipe)
 
@@ -143,6 +186,9 @@ func (h *Healer) HealDrift(ctx context.Context, req server.HealRequest) (server.
 		Name:        "submit_fallback_report",
 		Description: "Submit extracted structured fields and/or items recovered directly from the offline screenshot and scrubbed dom.html.",
 	}, func(_ agent.Context, args submitReportArgs) (submitReportResult, error) {
+		if len(args.Fields) == 0 && len(args.Items) == 0 {
+			return submitReportResult{Accepted: false, Error: "submit_fallback_report requires non-empty fields or items"}, nil
+		}
 		stepID := req.StepID
 		if stepID == "" && len(req.Recipe.Steps) > 0 {
 			stepID = req.Recipe.Steps[0].ID
@@ -165,10 +211,6 @@ func (h *Healer) HealDrift(ctx context.Context, req server.HealRequest) (server.
 			},
 		}
 		if err := contract.ValidateDropReport(rep, h.forbiddenTerms); err != nil {
-			return submitReportResult{Accepted: false, Error: err.Error()}, nil
-		}
-		raw, _ := json.Marshal(rep)
-		if err := contract.EnforceAirGap(string(raw), h.forbiddenTerms); err != nil {
 			return submitReportResult{Accepted: false, Error: err.Error()}, nil
 		}
 		mu.Lock()
@@ -196,6 +238,9 @@ func (h *Healer) HealDrift(ctx context.Context, req server.HealRequest) (server.
 		if !req.AllowTier2 {
 			return tier2Result{Scheduled: false, Error: "tier-2 fallback already used; extract offline only"}, nil
 		}
+		if err := contract.EnforceAirGap(args.Reason, h.forbiddenTerms); err != nil {
+			return tier2Result{Scheduled: false, Error: err.Error()}, nil
+		}
 		targetURL := req.LandedURL
 		if targetURL == "" && len(req.Recipe.Steps) > 0 {
 			targetURL = req.Recipe.Steps[0].URL
@@ -210,6 +255,10 @@ func (h *Healer) HealDrift(ctx context.Context, req server.HealRequest) (server.
 			StepID:        req.StepID,
 			Reason:        args.Reason,
 			Actions:       args.Actions,
+		}
+		rawPlan, _ := json.Marshal(plan)
+		if err := contract.EnforceAirGap(string(rawPlan), h.forbiddenTerms); err != nil {
+			return tier2Result{Scheduled: false, Error: err.Error()}, nil
 		}
 		if err := contract.ValidateFallbackPlan(plan, allowedDomains); err != nil {
 			return tier2Result{Scheduled: false, Error: err.Error()}, nil
@@ -250,35 +299,41 @@ func (h *Healer) HealDrift(ctx context.Context, req server.HealRequest) (server.
 		iterNum := iterations
 		mu.Unlock()
 
+		if err := contract.EnforceAirGap(args.RecipeJSON, h.forbiddenTerms); err != nil {
+			return verifyRecipeResult{Passed: false, Error: err.Error(), NextAction: "remove forbidden terms"}, nil
+		}
+		if err := contract.EnforceAirGap(args.Rationale, h.forbiddenTerms); err != nil {
+			return verifyRecipeResult{Passed: false, Error: err.Error(), NextAction: "remove forbidden terms from rationale"}, nil
+		}
+
 		var candidate contract.Recipe
 		if err := contract.ParseJSONStrict([]byte(args.RecipeJSON), &candidate); err != nil {
 			return verifyRecipeResult{Passed: false, Error: "strict recipe schema error: " + err.Error(), NextAction: "fix JSON and retry"}, nil
 		}
-		if candidate.Name == "" {
-			candidate.Name = req.Recipe.Name
-		}
+		// Unconditionally pin candidate identity so prompt-injected proposals cannot retarget another recipe or path.
+		candidate.Name = req.Recipe.Name
 		if candidate.Topic == "" {
 			candidate.Topic = req.Recipe.Topic
 		}
-		// Enforce domain lock so a drifted DOM cannot pivot the recipe to an unapproved host.
-		for _, dom := range contract.InferRecipeDomains(candidate) {
-			matched := false
-			for _, allowed := range allowedDomains {
-				if contract.DomainsMatch(dom, allowed) {
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				return verifyRecipeResult{
-					Passed:     false,
-					Error:      fmt.Sprintf("domain pivot blocked: %q is outside approved domains %v", dom, allowedDomains),
-					NextAction: "keep original recipe URL/domain and retry",
-				}, nil
-			}
-		}
-		if err := contract.EnforceAirGap(args.RecipeJSON, h.forbiddenTerms); err != nil {
+
+		// Re-marshal decoded candidate to catch \uXXXX-escaped air-gap bypasses.
+		decodedBytes, _ := json.Marshal(candidate)
+		if err := contract.EnforceAirGap(string(decodedBytes), h.forbiddenTerms); err != nil {
 			return verifyRecipeResult{Passed: false, Error: err.Error(), NextAction: "remove forbidden terms"}, nil
+		}
+
+		// Preserve Rule-0 structural invariants: driver, step IDs, and non-weakened Expectations.
+		if err := validateHealedRecipeInvariants(req.Recipe, candidate); err != nil {
+			return verifyRecipeResult{Passed: false, Error: err.Error(), NextAction: "preserve original step IDs and expect invariants"}, nil
+		}
+
+		// Enforce post-resolution domain lock against non-empty approved domains.
+		if err := contract.ValidateRecipeDomains(candidate, allowedDomains, req.Task.Vars); err != nil {
+			return verifyRecipeResult{
+				Passed:     false,
+				Error:      fmt.Sprintf("domain pivot blocked: %v", err),
+				NextAction: "keep original recipe URL/domain and retry",
+			}, nil
 		}
 
 		outcome, verr := verify.VerifyRecipeOnHTML(candidate, req.Task.Vars, req.StepID, scrubbedHTML, req.LandedURL)
@@ -391,24 +446,6 @@ func (h *Healer) HealDrift(ctx context.Context, req server.HealRequest) (server.
 		return server.HealResult{}, err
 	}
 
-	recipeBytes, _ := json.MarshalIndent(req.Recipe, "", "  ")
-	var promptBuilder strings.Builder
-	fmt.Fprintf(&promptBuilder,
-		"SELECTOR_DRIFT Exception Context\nRecipe: %s\nStep ID: %s\nLanded URL: %s\nError: %s\n",
-		req.Recipe.Name,
-		req.StepID,
-		req.LandedURL,
-		req.ErrorMsg,
-	)
-	if canvasBlindSpot {
-		promptBuilder.WriteString("Grounding Warning: UNLABELLED_CANVAS_SURFACE — page contains an unlabelled <canvas>/WebGL surface with minimal DOM/AXTree text. Recover visible values from screenshot.png only; CSS selectors cannot read canvas pixels.\n")
-	}
-	fmt.Fprintf(&promptBuilder, "\nFailed Recipe JSON:\n%s\n", string(recipeBytes))
-	if axTree != "" {
-		fmt.Fprintf(&promptBuilder, "\nCompact AXTree (axtree.txt):\n%s\n", truncateRunes(axTree, maxPromptAXTreeRunes))
-	}
-	fmt.Fprintf(&promptBuilder, "\nScrubbed dom.html:\n%s", truncateRunes(scrubbedHTML, maxPromptHTMLRunes))
-	prompt := promptBuilder.String()
 	parts := []*genai.Part{genai.NewPartFromText(prompt)}
 	if len(req.ScreenshotPNG) > 0 {
 		parts = append(parts, genai.NewPartFromBytes(req.ScreenshotPNG, "image/png"))
@@ -416,14 +453,23 @@ func (h *Healer) HealDrift(ctx context.Context, req server.HealRequest) (server.
 	userMsg := genai.NewContentFromParts(parts, genai.RoleUser)
 
 	sessID := newSessionID()
+	var runFailure error
 	for _, runErr := range r.Run(ctx, "healer", sessID, userMsg, agent.RunConfig{}) {
 		if runErr != nil {
-			return server.HealResult{}, fmt.Errorf("adk healer run failed: %w", runErr)
+			runFailure = fmt.Errorf("adk healer run failed: %w", runErr)
+			break
 		}
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
+	if runFailure != nil {
+		if result.FallbackReport != nil || result.FallbackPlan != nil || result.Proposal != nil {
+			result.Summary = fmt.Sprintf("partial recovery before stage error: %v", runFailure)
+			return result, nil
+		}
+		return server.HealResult{}, runFailure
+	}
 	if result.Proposal != nil {
 		result.Summary = fmt.Sprintf("healed with verified proposal (%d iteration(s))", result.Proposal.Iterations)
 	} else if result.FallbackPlan != nil {
@@ -434,6 +480,89 @@ func (h *Healer) HealDrift(ctx context.Context, req server.HealRequest) (server.
 		result.Summary = "no fallback report or verified patch produced"
 	}
 	return result, nil
+}
+
+func validateHealedRecipeInvariants(orig contract.Recipe, cand contract.Recipe) error {
+	if cand.NormalizedDriver() != orig.NormalizedDriver() {
+		return fmt.Errorf("proposed recipe cannot change driver from %q to %q", orig.NormalizedDriver(), cand.NormalizedDriver())
+	}
+	if len(cand.Steps) != len(orig.Steps) {
+		return fmt.Errorf("proposed recipe must preserve %d step(s), got %d", len(orig.Steps), len(cand.Steps))
+	}
+	for i := range orig.Steps {
+		os := orig.Steps[i]
+		cs := cand.Steps[i]
+		if cs.ID != os.ID {
+			return fmt.Errorf("proposed recipe step[%d] must preserve id %q, got %q", i, os.ID, cs.ID)
+		}
+		if err := validateExpectPreserved(os.ID, os.Expect, cs.Expect); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateExpectPreserved(stepID string, orig contract.Expectation, cand contract.Expectation) error {
+	if cand.MinItems < orig.MinItems {
+		return fmt.Errorf("step %q cannot weaken expect.min_items (%d < %d)", stepID, cand.MinItems, orig.MinItems)
+	}
+	if cand.MinTables < orig.MinTables {
+		return fmt.Errorf("step %q cannot weaken expect.min_tables (%d < %d)", stepID, cand.MinTables, orig.MinTables)
+	}
+	if cand.MinMetrics < orig.MinMetrics {
+		return fmt.Errorf("step %q cannot weaken expect.min_metrics (%d < %d)", stepID, cand.MinMetrics, orig.MinMetrics)
+	}
+	if cand.MinSelectorHits < orig.MinSelectorHits {
+		return fmt.Errorf("step %q cannot weaken expect.min_selector_hits (%d < %d)", stepID, cand.MinSelectorHits, orig.MinSelectorHits)
+	}
+	if !containsAllStringsFold(cand.NotURLContains, orig.NotURLContains) {
+		return fmt.Errorf("step %q cannot drop expect.not_url_contains guards", stepID)
+	}
+	if !containsAllStringsFold(cand.MustContainText, orig.MustContainText) {
+		return fmt.Errorf("step %q cannot drop expect.must_contain_text guards", stepID)
+	}
+	if !containsAllStringsExact(cand.RequiredFields, orig.RequiredFields) {
+		return fmt.Errorf("step %q cannot drop expect.required_fields guards", stepID)
+	}
+	return nil
+}
+
+func containsAllStringsFold(have []string, want []string) bool {
+	for _, w := range want {
+		if strings.TrimSpace(w) == "" {
+			continue
+		}
+		found := false
+		for _, h := range have {
+			if strings.EqualFold(strings.TrimSpace(h), strings.TrimSpace(w)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func containsAllStringsExact(have []string, want []string) bool {
+	for _, w := range want {
+		if strings.TrimSpace(w) == "" {
+			continue
+		}
+		found := false
+		for _, h := range have {
+			if h == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func newSessionID() string {

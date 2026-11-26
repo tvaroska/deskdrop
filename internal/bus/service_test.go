@@ -185,3 +185,60 @@ func TestDesktopClientDoesNotRetry4xxClientErrors(t *testing.T) {
 		t.Fatalf("expected 404 to fail immediately without retry, got %d hits", hits.Load())
 	}
 }
+
+func TestS1FailClosedOnTruncatedHTTPAndInvalidJSONAndM25TransientClassifier(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/release/deskdrop":
+			// Advertise 100 bytes Content-Length but hijack and truncate at 10 bytes.
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				http.Error(w, "no hijack", http.StatusInternalServerError)
+				return
+			}
+			conn, bufrw, err := hj.Hijack()
+			if err != nil {
+				return
+			}
+			_, _ = bufrw.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n0123456789")
+			_ = bufrw.Flush()
+			_ = conn.Close()
+		case "/v1/release/SHA256SUMS.txt":
+			_, _ = w.Write([]byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  deskdrop\n"))
+		case "/v1/tasks/claim":
+			// 200 OK returning HTML error page instead of JSON must fail decode.
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte("<html><body>502 proxy page</body></html>"))
+		case "/v1/status":
+			http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := NewDesktopClient(contract.Config{
+		ServiceURL:   srv.URL,
+		ServiceToken: "desk-tok",
+	})
+	client.RetryBaseDelay = 1 * time.Millisecond
+	client.MaxRetryAttempts = 2
+
+	if _, _, err := client.DownloadReleaseBinary(context.Background(), "linux"); err == nil {
+		t.Fatal("expected truncated binary download to fail closed")
+	}
+	sums, err := client.DownloadReleaseChecksums(context.Background())
+	if err != nil || !bytes.Contains([]byte(sums), []byte("deskdrop")) {
+		t.Fatalf("DownloadReleaseChecksums failed: sums=%q err=%v", sums, err)
+	}
+	if _, err := client.ClaimNextTask(context.Background(), "win-pc", 30, nil); err == nil {
+		t.Fatal("expected 200 HTML response on ClaimNextTask to fail JSON decode")
+	}
+	_, statusErr := client.GetDesktopStatus(context.Background())
+	if !IsRelayTransientError(statusErr) {
+		t.Fatalf("expected 503 status error to classify as transient, got %v", statusErr)
+	}
+	if IsRelayTransientError(&HTTPStatusError{Prefix: "relay", StatusCode: http.StatusNotFound, Body: "nope"}) {
+		t.Fatal("404 must not classify as transient")
+	}
+}

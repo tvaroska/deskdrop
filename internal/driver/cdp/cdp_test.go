@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/tvaroska/deskdrop/internal/contract"
@@ -409,6 +410,298 @@ console.log(JSON.stringify({ imp, react }));
 	}
 	if got.Imp != 2450 || got.React != 64 {
 		t.Fatalf("JS evalFieldRule parity = %+v, want {Imp:2450 React:64}", got)
+	}
+
+	// A-7 JS runtime parity: parseCompactFloat \b boundary, inline span cleanText, group-2 alternation & RE2 flags/anchors.
+	parityScript := shadowDOMHelperJS + `
+const inlineCard = {
+	nodeType: 1,
+	tagName: "DIV",
+	childNodes: [
+		{ nodeType: 1, tagName: "SPAN", childNodes: [
+			{ nodeType: 1, tagName: "SPAN", childNodes: [{ nodeType: 3, nodeValue: "1," }] },
+			{ nodeType: 1, tagName: "SPAN", childNodes: [{ nodeType: 3, nodeValue: "234" }] },
+		]},
+		{ nodeType: 1, tagName: "SPAN", childNodes: [{ nodeType: 3, nodeValue: "impressions" }] }
+	]
+};
+console.log(JSON.stringify({
+	fiveMin: parseCompactFloat("5 min").val,
+	threeMonths: parseCompactFloat("3 months").val,
+	compactK: parseCompactFloat("1.2K").val,
+	inlineText: cleanText(inlineCard),
+	altGroup2: applyRegexCapture("impressions: 980", "(?i)(?:(\\d+)\\s+impressions|impressions:\\s*(\\d+))", 0),
+	anchorMatch: applyRegexCapture("Start 42 End", "\\A(?i)start\\s+(\\d+)\\s+end\\z", 0)
+}));
+`
+	out2, runErr2 := exec.Command(nodeBin, "-e", parityScript).CombinedOutput()
+	if runErr2 != nil {
+		t.Fatalf("node A-7 parity test failed: %v\n%s", runErr2, string(out2))
+	}
+	var got2 struct {
+		FiveMin     float64 `json:"fiveMin"`
+		ThreeMonths float64 `json:"threeMonths"`
+		CompactK    float64 `json:"compactK"`
+		InlineText  string  `json:"inlineText"`
+		AltGroup2   string  `json:"altGroup2"`
+		AnchorMatch string  `json:"anchorMatch"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out2), &got2); err != nil {
+		t.Fatalf("unmarshal A-7 output %q: %v", string(out2), err)
+	}
+	if got2.FiveMin != 5 || got2.ThreeMonths != 3 || got2.CompactK != 1200 {
+		t.Fatalf("JS parseCompactFloat boundary mismatch: %+v", got2)
+	}
+	if got2.InlineText != "1,234 impressions" {
+		t.Fatalf("JS cleanText inline span mismatch: got %q, want %q", got2.InlineText, "1,234 impressions")
+	}
+	if got2.AltGroup2 != "980" || got2.AnchorMatch != "42" {
+		t.Fatalf("JS applyRegexCapture parity mismatch: %+v", got2)
+	}
+}
+
+func TestS7ExecuteFallbackAndPaginationFailClosed(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		curURL   = "https://evil.invalid/phish"
+		clicks   int
+		urlError bool
+	)
+	srv := newMockCDPServer(t, func(method string, params map[string]any) (any, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch method {
+		case "Target.getTargets":
+			return map[string]any{"targetInfos": []TargetInfo{}}, nil
+		case "Target.createTarget":
+			return map[string]any{"targetId": "scratch-fb"}, nil
+		case "Target.attachToTarget":
+			return map[string]any{"sessionId": "sess-fb"}, nil
+		case "Target.closeTarget":
+			return map[string]any{"success": true}, nil
+		case "Runtime.evaluate":
+			expr, _ := params["expression"].(string)
+			switch {
+			case expr == "document.readyState":
+				return map[string]any{"result": map[string]any{"type": "string", "value": "complete"}}, nil
+			case strings.Contains(expr, "location.href || ''"):
+				if urlError {
+					return nil, errors.New("eval failed")
+				}
+				return map[string]any{"result": map[string]any{"type": "string", "value": curURL}}, nil
+			case strings.Contains(expr, "el.click()"):
+				clicks++
+				return map[string]any{"result": map[string]any{"type": "boolean", "value": true}}, nil
+			case strings.Contains(expr, "aria_disabled"):
+				return map[string]any{"result": map[string]any{"type": "object", "value": map[string]any{"clicked": true}}}, nil
+			case strings.Contains(expr, "evalItemRule"):
+				return map[string]any{"result": map[string]any{"type": "object", "value": map[string]any{"url": "https://example.com/list", "items": []map[string]any{{"id": "1"}}}}}, nil
+			default:
+				return map[string]any{"result": map[string]any{"type": "boolean", "value": true}}, nil
+			}
+		default:
+			return map[string]any{}, nil
+		}
+	})
+	defer srv.Close()
+
+	client, err := Connect(context.Background(), "ws://"+strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	step := contract.Step{
+		ID:     "dash",
+		URL:    "https://example.com/dash",
+		Expect: contract.Expectation{NotURLContains: []string{"/login"}},
+	}
+
+	// 1. Off-domain plan rejected before opening tab.
+	if _, err := client.ExecuteFallback(context.Background(), step, contract.FallbackPlan{
+		AllowedDomain: "evil.invalid",
+		TargetURL:     "https://evil.invalid/x",
+		Actions:       []contract.FallbackAction{{Action: "click", Selector: "button"}},
+	}); err == nil {
+		t.Fatal("expected ExecuteFallback to reject off-domain plan")
+	}
+
+	// 2. Immediate off-domain redirect aborts BEFORE executing click action.
+	if _, err := client.ExecuteFallback(context.Background(), step, contract.FallbackPlan{
+		AllowedDomain: "example.com",
+		TargetURL:     "https://example.com/dash",
+		Actions:       []contract.FallbackAction{{Action: "click", Selector: "button"}},
+	}); err == nil {
+		t.Fatal("expected ExecuteFallback to abort on off-domain redirect")
+	}
+	mu.Lock()
+	if clicks != 0 {
+		mu.Unlock()
+		t.Fatalf("expected 0 clicks after off-domain redirect, got %d", clicks)
+	}
+	curURL = "https://example.com/login"
+	mu.Unlock()
+
+	// 3. NotURLContains login URL aborts BEFORE click.
+	if _, err := client.ExecuteFallback(context.Background(), step, contract.FallbackPlan{
+		AllowedDomain: "example.com",
+		TargetURL:     "https://example.com/dash",
+		Actions:       []contract.FallbackAction{{Action: "click", Selector: "button"}},
+	}); err == nil || !strings.Contains(err.Error(), "blocked/login") {
+		t.Fatalf("expected blocked/login abort, got %v", err)
+	}
+
+	// 4. Pagination fails closed on non-HTTP file URL and on location.href eval error.
+	mu.Lock()
+	curURL = "file" + ":///etc/passwd"
+	mu.Unlock()
+	pagedStep := contract.Step{
+		ID:         "list",
+		URL:        "https://example.com/list",
+		Pagination: &contract.PaginationRule{NextSelector: "button.next", MaxPages: 3, WaitMs: 1},
+	}
+	if _, err := client.ExecuteStep(context.Background(), pagedStep); err == nil {
+		t.Fatal("expected pagination to fail closed on non-HTTP file URL")
+	}
+
+	mu.Lock()
+	urlError = true
+	mu.Unlock()
+	if _, err := client.ExecuteStep(context.Background(), pagedStep); err == nil {
+		t.Fatal("expected pagination to fail closed when location.href errors")
+	}
+}
+
+func TestS8MatchesTabPatternAndMultiProfileDriftPreservation(t *testing.T) {
+	// 1. matchesTabPattern host boundary and $-anchor query matching.
+	cases := []struct {
+		url     string
+		pattern string
+		want    bool
+	}{
+		{"https://scholar.google.com/", "scholar.google.com/$", true},
+		{"https://scholar.google.com?hl=en", "scholar.google.com/$", true},
+		{"https://scholar.google.com/citations?user=abc", "scholar.google.com/$", false},
+		{"https://evil-scholar.google.com/", "scholar.google.com/$", false},
+		{"https://other.com/scholar.google.com/", "scholar.google.com/$", false},
+		{"https://scholar.google.com/citations?user=abc", "scholar.google.com/citations?user=abc$", true},
+		{"https://scholar.google.com/citations?user=xyz", "scholar.google.com/citations?user=abc$", false},
+		{"https://evil-scholar.google.com/citations", "scholar.google.com/citations", false},
+		{"https://www.linkedin.com/in/demo/recent-activity/", "linkedin.com/in/demo/recent-activity", true},
+	}
+	for _, tc := range cases {
+		if got := matchesTabPattern(tc.url, tc.pattern); got != tc.want {
+			t.Errorf("matchesTabPattern(%q, %q) = %v, want %v", tc.url, tc.pattern, got, tc.want)
+		}
+	}
+
+	// 2. Multi-profile ExecuteStep stops on SELECTOR_DRIFT from logged-in profile 1 instead of masking with profile 2 /login.
+	var (
+		mu          sync.Mutex
+		createdCtxs []string
+	)
+	srv := newMockCDPServer(t, func(method string, params map[string]any) (any, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch method {
+		case "Target.getTargets":
+			return map[string]any{
+				"targetInfos": []TargetInfo{
+					{TargetID: "t1", Type: "page", URL: "https://status.example.com/home", BrowserContextID: "ctx-authed"},
+					{TargetID: "t2", Type: "page", URL: "https://other.example.org/", BrowserContextID: "ctx-loggedout"},
+				},
+			}, nil
+		case "Target.createTarget":
+			cid, _ := params["browserContextId"].(string)
+			createdCtxs = append(createdCtxs, cid)
+			return map[string]any{"targetId": "scratch-" + cid}, nil
+		case "Target.attachToTarget":
+			tid, _ := params["targetId"].(string)
+			return map[string]any{"sessionId": "sess-" + tid}, nil
+		case "Target.closeTarget":
+			return map[string]any{"success": true}, nil
+		case "Page.captureScreenshot":
+			return map[string]any{"data": base64.StdEncoding.EncodeToString([]byte{0x89, 0x50, 0x4E, 0x47})}, nil
+		case "Accessibility.getFullAXTree":
+			return map[string]any{"nodes": []any{}}, nil
+		case "Runtime.evaluate":
+			expr, _ := params["expression"].(string)
+			if expr == "document.readyState" {
+				return map[string]any{"result": map[string]any{"type": "string", "value": "complete"}}, nil
+			}
+			if strings.Contains(expr, "evalItemRule") {
+				// First profile is logged in on target domain but has selector drift (0 items).
+				return map[string]any{"result": map[string]any{"type": "object", "value": map[string]any{
+					"title": "Status",
+					"url":   "https://status.example.com/overview",
+				}}}, nil
+			}
+			return map[string]any{"result": map[string]any{"type": "string", "value": "<html><body></body></html>"}}, nil
+		default:
+			return map[string]any{}, nil
+		}
+	})
+	defer srv.Close()
+
+	client, err := Connect(context.Background(), "ws://"+strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	_, err = client.ExecuteStep(context.Background(), contract.Step{
+		ID:     "overview",
+		URL:    "https://status.example.com/overview",
+		Expect: contract.Expectation{MinItems: 1, NotURLContains: []string{"/login"}},
+	})
+	if err == nil {
+		t.Fatal("expected selector drift error")
+	}
+	mu.Lock()
+	ctxs := append([]string(nil), createdCtxs...)
+	mu.Unlock()
+	if len(ctxs) != 1 || ctxs[0] != "ctx-authed" {
+		t.Fatalf("expected ExecuteStep to stop after logged-in profile drift, tried contexts=%v", ctxs)
+	}
+
+	// 3. Pagination must block page-1 off-domain/login redirect BEFORE clicking NextSelector.
+	var pagClicked atomic.Int32
+	pagSrv := newMockCDPServer(t, func(method string, params map[string]any) (any, error) {
+		if method == "Runtime.evaluate" {
+			expr, _ := params["expression"].(string)
+			if strings.Contains(expr, "location.href") {
+				return map[string]any{"result": map[string]any{"type": "string", "value": "https://evil.invalid/login"}}, nil
+			}
+			if strings.Contains(expr, "deepQueryFirst") {
+				pagClicked.Add(1)
+				return map[string]any{"result": map[string]any{"type": "object", "value": map[string]any{"clicked": true}}}, nil
+			}
+		}
+		return map[string]any{}, nil
+	})
+	defer pagSrv.Close()
+	pagClient, err := Connect(context.Background(), "ws://"+strings.TrimPrefix(pagSrv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pagClient.Close()
+	_, err = pagClient.runPaginationLoop(
+		context.Background(),
+		"sess-1",
+		contract.Step{
+			ID:         "p1",
+			URL:        "https://approved.example.com/list",
+			Expect:     contract.Expectation{NotURLContains: []string{"/login"}},
+			Pagination: &contract.PaginationRule{NextSelector: "button.next", MaxPages: 3},
+		},
+		contract.StepResult{URL: "https://evil.invalid/login"},
+		500,
+	)
+	if err == nil {
+		t.Fatal("expected pagination to fail closed when page 1 redirected off approved step domain")
+	}
+	if pagClicked.Load() != 0 {
+		t.Fatalf("expected 0 Next clicks on off-domain page 1, got %d", pagClicked.Load())
 	}
 }
 
