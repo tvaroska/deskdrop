@@ -21,7 +21,7 @@ import (
 	"github.com/tvaroska/deskdrop/internal/driver/uia"
 )
 
-var version = "v1.4.2"
+var version = "v1.4.3"
 
 func main() {
 	unblockExecutableOnWindows()

@@ -33,7 +33,8 @@ steps:
         set -euo pipefail
         trap 'rm -f dist/cdp.test' EXIT
         (cd internal/driver/cdp && DESKDROP_REQUIRE_NODE=1 ../../../dist/cdp.test -test.v -test.run 'TestJSEval|TestT2JSRuntime')
-        npx --yes @ast-grep/cli@0.51.1 scan --rule specs/ast.rules.yaml
+        npm install -g --no-audit --no-fund @ast-grep/cli@0.51.1
+        ast-grep scan --rule specs/ast.rules.yaml
 
   - name: "gcr.io/cloud-builders/docker"
     id: "pull-cache"
@@ -84,9 +85,11 @@ steps:
         USER_CFG="$$(docker image inspect --format '{{.Config.User}}' deskdrop:ci)"
         test "$${USER_CFG}" = "65532:65532"
 
-        DATA_VOL="deskdrop-smoke-data-$${BUILD_ID:-ci}"
-        RECIPES_VOL="deskdrop-smoke-recipes-$${BUILD_ID:-ci}"
-        CLI_VOL="deskdrop-smoke-cli-$${BUILD_ID:-ci}"
+        CB_BUILD_ID="${BUILD_ID}"
+        VOL_SUFFIX="$${CB_BUILD_ID:-ci}"
+        DATA_VOL="deskdrop-smoke-data-$${VOL_SUFFIX}"
+        RECIPES_VOL="deskdrop-smoke-recipes-$${VOL_SUFFIX}"
+        CLI_VOL="deskdrop-smoke-cli-$${VOL_SUFFIX}"
         cleanup() {
           docker rm -f deskdrop-smoke >/dev/null 2>&1 || true
           docker volume rm -f "$${DATA_VOL}" "$${RECIPES_VOL}" "$${CLI_VOL}" >/dev/null 2>&1 || true
@@ -275,7 +278,7 @@ steps:
 
 substitutions:
   _REGION: "us-central1"
-  _VERSION: "v1.4.2"
+  _VERSION: "v1.4.3"
   _TAG: ""
   _PUSH: "auto"
 
