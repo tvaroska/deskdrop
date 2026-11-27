@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"golang.org/x/net/html"
+
 	"github.com/tvaroska/deskdrop/internal/contract"
 )
 
@@ -555,4 +557,91 @@ func TestA7VerifyNodeTextInlineSpansAriaHiddenAndCSSParity(t *testing.T) {
 	if err != nil || !qOut.Passed || qOut.StepResult.Fields["picked"] != "MATCH" {
 		t.Fatalf("quoted selector parity failed: passed=%v err=%v fields=%+v", qOut.Passed, err, qOut.StepResult.Fields)
 	}
+}
+
+func TestM85VerifySiblingCombinatorsAndMalformedSelectorFailClosed(t *testing.T) {
+	htmlDoc := `<!doctype html><html><body>
+		<span class="orphan">Wrong</span>
+		<h2>Release Summary</h2>
+		<p class="lead">First sibling paragraph</p>
+		<div>Separator block</div>
+		<p class="tail">Second general sibling</p>
+		<ul>
+			<li class="hdr">Header Row</li>
+			<li class="row">Row 1</li>
+			<li class="row">Row 2</li>
+		</ul>
+	</body></html>`
+
+	recipe := contract.Recipe{
+		Name:  "sibling-combinators",
+		Topic: "ops",
+		Steps: []contract.Step{{
+			ID:  "s1",
+			URL: "https://example.com/ops",
+			Selectors: map[string]string{
+				"adj":     "h2 + p",
+				"general": "h2 ~ p",
+				"no_adj":  "h2 + p.tail",
+			},
+			Items: &contract.ItemRule{
+				Container: "li.hdr ~ li.row",
+				Fields: map[string]contract.FieldRule{
+					"label": {Attr: "text"},
+				},
+			},
+			Expect: contract.Expectation{
+				MinItems:        2,
+				MinSelectorHits: 2,
+			},
+		}},
+	}
+
+	out, err := VerifyRecipeOnHTML(recipe, nil, "s1", htmlDoc, "https://example.com/ops")
+	if err != nil || !out.Passed {
+		t.Fatalf("VerifyRecipeOnHTML(siblings) failed: passed=%v err=%v outErr=%s", out.Passed, err, out.Error)
+	}
+	if got := out.StepResult.Selectors["adj"]; got != "First sibling paragraph" {
+		t.Fatalf("h2 + p = %q, want 'First sibling paragraph'", got)
+	}
+	if got := out.StepResult.Selectors["general"]; got != "First sibling paragraph | Second general sibling" {
+		t.Fatalf("h2 ~ p = %q, want both paragraphs", got)
+	}
+	if got := out.StepResult.Selectors["no_adj"]; got != "" {
+		t.Fatalf("h2 + p.tail = %q, want empty (separated by div)", got)
+	}
+	if len(out.StepResult.Items) != 2 || out.StepResult.Items[0]["label"] != "Row 1" || out.StepResult.Items[1]["label"] != "Row 2" {
+		t.Fatalf("li.hdr ~ li.row items = %+v, want [Row 1, Row 2]", out.StepResult.Items)
+	}
+
+	// Ensure div+span never silently degrades into matching bare span.
+	doc := parseHTMLForSelectorTest(t, `<html><body><span>orphan</span><div>x</div><span>adjacent</span></body></html>`)
+	matches := QueryAll(doc, "div+span")
+	if len(matches) != 1 || selectorTestText(matches[0]) != "adjacent" {
+		t.Fatalf("QueryAll(div+span) matched %d nodes, want [adjacent]", len(matches))
+	}
+	for _, bad := range []string{"", "div+", "+span", "div > + span", "div$span", "div[unclosed"} {
+		if got := QueryAll(doc, bad); len(got) != 0 {
+			t.Errorf("QueryAll(%q) = %d matches, want 0 (fail closed)", bad, len(got))
+		}
+	}
+}
+
+func parseHTMLForSelectorTest(t *testing.T, raw string) *html.Node {
+	t.Helper()
+	doc, err := html.Parse(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return doc
+}
+
+func selectorTestText(n *html.Node) string {
+	var b strings.Builder
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if c.Type == html.TextNode {
+			b.WriteString(c.Data)
+		}
+	}
+	return strings.TrimSpace(b.String())
 }

@@ -299,18 +299,37 @@ func matchSemChain(n *semNode, parts CSSComplexSelector, idx int) bool {
 	if idx == 0 {
 		return true
 	}
-	if parts[idx].Comb == CSSCombChild {
+	switch parts[idx].Comb {
+	case CSSCombChild:
 		if n.parent == nil || n.parent.role == "document" {
 			return false
 		}
 		return matchSemChain(n.parent, parts, idx-1)
-	}
-	for anc := n.parent; anc != nil && anc.role != "document"; anc = anc.parent {
-		if matchSemChain(anc, parts, idx-1) {
-			return true
+	case CSSCombNextSibling:
+		pos := semChildIndex(n) - 1
+		if pos <= 0 || n.parent == nil {
+			return false
 		}
+		return matchSemChain(n.parent.children[pos-1], parts, idx-1)
+	case CSSCombSubsequentSibling:
+		pos := semChildIndex(n) - 1
+		if pos <= 0 || n.parent == nil {
+			return false
+		}
+		for i := pos - 1; i >= 0; i-- {
+			if matchSemChain(n.parent.children[i], parts, idx-1) {
+				return true
+			}
+		}
+		return false
+	default:
+		for anc := n.parent; anc != nil && anc.role != "document"; anc = anc.parent {
+			if matchSemChain(anc, parts, idx-1) {
+				return true
+			}
+		}
+		return false
 	}
-	return false
 }
 
 func matchSemSimple(n *semNode, s CSSSimpleSelector) bool {

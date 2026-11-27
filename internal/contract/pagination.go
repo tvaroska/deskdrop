@@ -69,7 +69,21 @@ func (p PaginationRule) StopWhenNoNew() bool {
 
 // ValidatePaginationRule resolves defaults and enforces bounds on p without variable substitution.
 func ValidatePaginationRule(stepID string, in *PaginationRule) (*PaginationRule, error) {
-	return resolvePaginationRule(stepID, in, func(s string) string { return s })
+	resolved, err := resolvePaginationRule(stepID, in, func(s string) string { return s })
+	if err != nil || resolved == nil {
+		return resolved, err
+	}
+	if !varPlaceholderRe.MatchString(resolved.NextSelector) {
+		if err := validateOptionalSelector(fmt.Sprintf("step %q", stepID), "pagination.next_selector", resolved.NextSelector); err != nil {
+			return nil, err
+		}
+	}
+	if !varPlaceholderRe.MatchString(resolved.WaitSelector) {
+		if err := validateOptionalSelector(fmt.Sprintf("step %q", stepID), "pagination.wait_selector", resolved.WaitSelector); err != nil {
+			return nil, err
+		}
+	}
+	return resolved, nil
 }
 
 func resolvePaginationRule(stepID string, in *PaginationRule, sub func(string) string) (*PaginationRule, error) {

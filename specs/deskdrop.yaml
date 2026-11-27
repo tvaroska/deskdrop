@@ -289,6 +289,18 @@ components:
           type: array
           items: { type: string, enum: [cdp, uia] }
         worker: { $ref: "#/components/schemas/WorkerStatus" }
+    AttemptLog:
+      type: object
+      required: [attempt, timestamp_utc]
+      properties:
+        attempt: { type: integer }
+        host: { type: string }
+        error_code:
+          type: string
+          enum: [AUTH_EXPIRED, SELECTOR_DRIFT, CDP_TRANSIENT, CONTRACT_INVALID, FALLBACK_DECLINED, EXTRACTION_FAILED]
+        error: { type: string }
+        diagnostic_id: { type: string }
+        timestamp_utc: { type: string }
     Task:
       type: object
       required: [id, recipe, status]
@@ -316,6 +328,7 @@ components:
         proposal_id: { type: string }
         last_error: { type: string }
         last_code: { type: string }
+        attempts: { type: array, items: { $ref: "#/components/schemas/AttemptLog" } }
         created_at_utc: { type: string }
         updated_at_utc: { type: string }
     ClaimTaskResponse:
@@ -381,11 +394,13 @@ components:
         diagnostic_id: { type: string }
         status: { type: string, enum: [pending, approved, rejected] }
         rationale: { type: string }
+        proposed_recipe: { $ref: "#/components/schemas/Recipe" }
         verified: { type: boolean }
         verification_summary: { type: string }
         iterations: { type: integer }
         model: { type: string }
-        proposed_recipe: { $ref: "#/components/schemas/Recipe" }
+        created_at_utc: { type: string }
+        updated_at_utc: { type: string }
         reviewed_by: { type: string }
         review_note: { type: string }
         reviewed_at_utc: { type: string }
@@ -409,6 +424,14 @@ components:
         from: { type: string }
         status: { type: string, enum: [claim, claimed, done] }
         note: { type: string }
+    AckNote:
+      type: object
+      required: [from, status, timestamp_utc]
+      properties:
+        from: { type: string }
+        status: { type: string }
+        note: { type: string }
+        timestamp_utc: { type: string }
     BusMessage:
       type: object
       required: [id, short_id, from, to, status, body, timestamp]
@@ -421,6 +444,7 @@ components:
         status: { type: string, enum: [open, claimed, done] }
         body: { type: string }
         notes: { type: array, items: { type: string } }
+        ack_notes: { type: array, items: { $ref: "#/components/schemas/AckNote" } }
         meta: { type: object, additionalProperties: true }
         timestamp: { type: string }
 paths:

@@ -105,6 +105,20 @@ func matchPart(node *html.Node, parts contract.CSSComplexSelector, idx int) bool
 			return false
 		}
 		return matchPart(parent, parts, idx-1)
+	case contract.CSSCombNextSibling:
+		for prev := node.PrevSibling; prev != nil; prev = prev.PrevSibling {
+			if prev.Type == html.ElementNode {
+				return matchPart(prev, parts, idx-1)
+			}
+		}
+		return false
+	case contract.CSSCombSubsequentSibling:
+		for prev := node.PrevSibling; prev != nil; prev = prev.PrevSibling {
+			if prev.Type == html.ElementNode && matchPart(prev, parts, idx-1) {
+				return true
+			}
+		}
+		return false
 	default:
 		for anc := node.Parent; anc != nil; anc = anc.Parent {
 			if anc.Type == html.ElementNode && matchPart(anc, parts, idx-1) {

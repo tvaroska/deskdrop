@@ -478,6 +478,9 @@ func ValidateFallbackPlan(plan FallbackPlan, allowedDomains []string) error {
 			if strings.TrimSpace(act.Selector) == "" {
 				return fmt.Errorf("fallback_plan.actions[%d] click requires selector", i)
 			}
+			if err := ValidateCSSSelector(act.Selector); err != nil {
+				return fmt.Errorf("fallback_plan.actions[%d] click invalid selector %q: %w", i, act.Selector, err)
+			}
 		default:
 			return fmt.Errorf("fallback_plan.actions[%d] unsupported action %q (allowed: scroll, wait, click)", i, act.Action)
 		}

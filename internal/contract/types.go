@@ -359,10 +359,76 @@ func ResolveRecipe(r Recipe, cliVars map[string]string) (Recipe, error) {
 		return Recipe{}, fmt.Errorf("missing required recipe variable(s): %s (pass --var key=value)", strings.Join(uniqueStrings(missing), ", "))
 	}
 	r.Steps = steps
+	if err := validateStepSelectors(r); err != nil {
+		return Recipe{}, err
+	}
 	if err := validateResolvedTargets(r); err != nil {
 		return Recipe{}, err
 	}
 	return r, nil
+}
+
+func validateOptionalSelector(scope string, field string, sel string) error {
+	if strings.TrimSpace(sel) == "" {
+		return nil
+	}
+	if err := ValidateCSSSelector(sel); err != nil {
+		return fmt.Errorf("%s %s %q: %w", scope, field, sel, err)
+	}
+	return nil
+}
+
+func validateStepSelectors(r Recipe) error {
+	for _, s := range r.Steps {
+		scope := fmt.Sprintf("step %q", s.ID)
+		for _, pair := range [][2]string{
+			{"wait_selector", s.WaitSelector},
+			{"click_selector", s.ClickSelector},
+			{"click_if_present", s.ClickIfPresent},
+		} {
+			if err := validateOptionalSelector(scope, pair[0], pair[1]); err != nil {
+				return err
+			}
+		}
+		for k, sel := range s.Selectors {
+			if err := validateOptionalSelector(scope, fmt.Sprintf("selectors[%q]", k), sel); err != nil {
+				return err
+			}
+		}
+		for k, fr := range s.Fields {
+			if err := validateOptionalSelector(scope, fmt.Sprintf("fields[%q].selector", k), fr.Selector); err != nil {
+				return err
+			}
+			if err := validateOptionalSelector(scope, fmt.Sprintf("fields[%q].closest", k), fr.Closest); err != nil {
+				return err
+			}
+		}
+		if s.Items != nil {
+			if err := ValidateCSSSelector(s.Items.Container); err != nil {
+				return fmt.Errorf("%s items.container %q: %w", scope, s.Items.Container, err)
+			}
+			if err := validateOptionalSelector(scope, "items.anchor_closest", s.Items.AnchorClosest); err != nil {
+				return err
+			}
+			for k, fr := range s.Items.Fields {
+				if err := validateOptionalSelector(scope, fmt.Sprintf("items.fields[%q].selector", k), fr.Selector); err != nil {
+					return err
+				}
+				if err := validateOptionalSelector(scope, fmt.Sprintf("items.fields[%q].closest", k), fr.Closest); err != nil {
+					return err
+				}
+			}
+		}
+		if s.Pagination != nil {
+			if err := validateOptionalSelector(scope, "pagination.next_selector", s.Pagination.NextSelector); err != nil {
+				return err
+			}
+			if err := validateOptionalSelector(scope, "pagination.wait_selector", s.Pagination.WaitSelector); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func validateResolvedTargets(r Recipe) error {

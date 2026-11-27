@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -937,5 +938,330 @@ func TestM72DiffStepItemsAndComputeDropDiffWindowShiftGuard(t *testing.T) {
 	omittedStepDiff := ComputeDropDiff(d1, &multiPrev, rcp, "id", 5)
 	if omittedStepDiff.RemovedCount != 1 || omittedStepDiff.Removed[0]["id"] != "p1" {
 		t.Fatalf("omitted baseline step diff = %+v, want removed=[p1]", omittedStepDiff)
+	}
+}
+
+func TestM81ScrubHTMLQuoteSwallowClosingDeclarationCDATAAndEOF(t *testing.T) {
+	// 1. Unclosed quotes inside malformed closing tags must terminate at the first '>' (never swallowing <script> or <input>).
+	closingBypass := `<div>safe</div></div title="><script id="s">evilClosingScript()</script><input name="tok" value="secret-closing-tok"><p>after-close</p>`
+	out1 := ScrubHTML(closingBypass)
+	for _, banned := range []string{"evilClosingScript", "secret-closing-tok", "<script", "title="} {
+		if strings.Contains(out1, banned) {
+			t.Fatalf("ScrubHTML closing-tag quote bypass leaked %q:\n%s", banned, out1)
+		}
+	}
+	if !strings.Contains(out1, "</div>") || !strings.Contains(out1, "<p>after-close</p>") {
+		t.Fatalf("ScrubHTML closing-tag dropped legitimate content:\n%s", out1)
+	}
+
+	// 2. Bogus declarations (<!...>) and processing instructions (<?...>) with unclosed quotes terminate at first '>'.
+	declBypass := `<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN">` +
+		`<!bogus attr="><script>evilDeclScript()</script><input value="secret-decl-tok">` +
+		`<?xml version="1.0" bad='><textarea>secret-pi-notes</textarea><p>after-decl</p>`
+	out2 := ScrubHTML(declBypass)
+	for _, banned := range []string{"evilDeclScript", "secret-decl-tok", "secret-pi-notes", "bogus", "<?xml"} {
+		if strings.Contains(out2, banned) {
+			t.Fatalf("ScrubHTML declaration/PI quote bypass leaked %q:\n%s", banned, out2)
+		}
+	}
+	if !strings.HasPrefix(out2, "<!doctype html>") || !strings.Contains(out2, "<p>after-decl</p>") {
+		t.Fatalf("ScrubHTML declaration output unexpected:\n%s", out2)
+	}
+
+	// 3. CDATA sections (closed and unclosed) and nested SVG malformed closing tags never leak trailing tags.
+	cdataAndSVG := `<p>head</p><![CDATA[cdata-secret-payload]]><svg><g></g bad="></svg><script>evilAfterSVG()</script><input value="tok-svg"><span>tail</span><![CDATA[eof-cdata-secret`
+	out3 := ScrubHTML(cdataAndSVG)
+	for _, banned := range []string{"cdata-secret-payload", "evilAfterSVG", "tok-svg", "eof-cdata-secret", "<svg"} {
+		if strings.Contains(out3, banned) {
+			t.Fatalf("ScrubHTML CDATA/SVG leaked %q:\n%s", banned, out3)
+		}
+	}
+	if !strings.Contains(out3, "<p>head</p>") || !strings.Contains(out3, "<span>tail</span>") {
+		t.Fatalf("ScrubHTML CDATA/SVG dropped visible content:\n%s", out3)
+	}
+
+	// 4. HTML5 eof-in-tag drops unclosed opening tag at EOF; kept attributes strip on* handlers and escape '<'/'>'.
+	eofAndAttrs := `<div onclick="steal()" ONMOUSEOVER='bad()' data-expr="a<b && c>d">visible</div><span title="unclosed><input value='eof-tok'>`
+	out4 := ScrubHTML(eofAndAttrs)
+	for _, banned := range []string{"onclick", "ONMOUSEOVER", "steal()", "eof-tok", "unclosed", "<span"} {
+		if strings.Contains(out4, banned) {
+			t.Fatalf("ScrubHTML attribute/EOF sanitizer leaked %q:\n%s", banned, out4)
+		}
+	}
+	if !strings.Contains(out4, `data-expr="a&lt;b && c&gt;d"`) || !strings.Contains(out4, ">visible</div>") {
+		t.Fatalf("ScrubHTML attribute escaping mismatch:\n%s", out4)
+	}
+
+	// 5. Bare '<' followed by stripped comment, CDATA, or SVG must emit '&lt;' so trailing text never recombines into an HTML tag.
+	recomb := `<<!-- -->script>alert(1)<<!-- -->/script><<!-- -->input value="recomb-secret"><<svg></svg>img src=x onerror=alert(2)>`
+	out5 := ScrubHTML(recomb)
+	for _, banned := range []string{"<script", "</script>", "<input", "<img"} {
+		if strings.Contains(out5, banned) {
+			t.Fatalf("ScrubHTML tag-recombination bypass synthesized %q:\n%s", banned, out5)
+		}
+	}
+	if !strings.Contains(out5, "&lt;script>") || !strings.Contains(out5, "&lt;input") || !strings.Contains(out5, "&lt;img") {
+		t.Fatalf("expected escaped '&lt;' entities on tag-recombination input, got:\n%s", out5)
+	}
+}
+
+func TestM83EnforceAirGapUnderscoreBareDomainAndHashExtraTerms(t *testing.T) {
+	safeMod := "go" + "/mod"
+	mustBlock := []string{
+		"ref_" + "b" + "/123456",
+		"b" + "/654321_suffix",
+		"doc_" + "go" + "/internal_spec",
+		"https://" + "corp" + ".google.com/login",
+		"ping " + "corp" + ".google.com now",
+		safeMod + " " + "go" + "/secret_adjacent_roadmap",
+	}
+	for _, sample := range mustBlock {
+		if err := EnforceAirGap(sample, nil); err == nil {
+			t.Errorf("EnforceAirGap failed to block %q", sample)
+		}
+	}
+
+	// ValidateDropReport must also block forbidden tokens hidden behind JSON-escaped \n, \t, or \u003c boundaries.
+	for _, excerpt := range []string{
+		"line1\n" + "b" + "/123456",
+		"line1\t" + "go" + "/secret_doc",
+		"line1\n" + "corp" + ".google.com",
+		"angle <" + "b" + "/654321>",
+	} {
+		err := ValidateDropReport(DropReport{
+			Recipe: "r",
+			Topic:  "t",
+			Steps:  []StepResult{{StepID: "s1", TextExcerpt: excerpt}},
+		}, nil)
+		if err == nil {
+			t.Errorf("ValidateDropReport failed to block JSON-escaped excerpt %q", excerpt)
+		}
+	}
+
+	// Safe Go toolchain paths (including https:// URL followed by space) and unrelated domains still pass.
+	safeToolchain := "updated https://" + safeMod + " and " + safeMod + " and " + "go" + "/sum and " + "go" + "/build on mycorp.example.com"
+	if err := EnforceAirGap(safeToolchain, nil); err != nil {
+		t.Fatalf("EnforceAirGap false-blocked safe text: %v", err)
+	}
+
+	// Caller-supplied extraTerms starting with '#' MUST be enforced (only LoadLocalGuardTerms strips file comments).
+	if err := EnforceAirGap("posted in #confidential-launch room", []string{"#confidential-launch"}); err == nil {
+		t.Fatal("expected EnforceAirGap to block '#'-prefixed extraTerm")
+	}
+}
+
+func TestM84ParseCompactNumberLeadingDecimalAndInt64Overflow(t *testing.T) {
+	floatCases := []struct {
+		in   string
+		want float64
+		ok   bool
+	}{
+		{".5%", 0.5, true},
+		{"-.5", -0.5, true},
+		{"+.25K", 250, true},
+		{".125M", 125000, true},
+		{".", 0, false},
+		{"no-digits", 0, false},
+	}
+	for _, tc := range floatCases {
+		got, ok := ParseCompactFloat(tc.in)
+		if ok != tc.ok || (ok && got != tc.want) {
+			t.Errorf("ParseCompactFloat(%q) = (%v, %v), want (%v, %v)", tc.in, got, ok, tc.want, tc.ok)
+		}
+	}
+
+	if n, ok := ParseCompactNumber(".5"); !ok || n != 1 {
+		t.Fatalf("ParseCompactNumber('.5') = (%d, %v), want (1, true)", n, ok)
+	}
+	if n, ok := ParseCompactNumber(".4"); !ok || n != 0 {
+		t.Fatalf("ParseCompactNumber('.4') = (%d, %v), want (0, true)", n, ok)
+	}
+	for _, overflow := range []string{"9999999999999999999B", "-9999999999999999999B", "9223372036854775808"} {
+		if n, ok := ParseCompactNumber(overflow); ok {
+			t.Errorf("ParseCompactNumber(%q) = (%d, true), want (_, false) on int64 overflow", overflow, n)
+		}
+	}
+}
+
+func TestM85SelectorValidationAndSiblingCombinators(t *testing.T) {
+	validSelectors := []string{
+		"div + span",
+		"h2~p.lead",
+		"ul > li:first-child + li.active",
+		"my-host >>> .hdr + .val, .fallback ~ .item",
+		`div[data-expr="a\"=b" i]`,
+	}
+	for _, sel := range validSelectors {
+		if err := ValidateCSSSelector(sel); err != nil {
+			t.Errorf("ValidateCSSSelector(%q) failed: %v", sel, err)
+		}
+		if groups := ParseCSSSelectorList(sel); len(groups) == 0 {
+			t.Errorf("ParseCSSSelectorList(%q) returned empty", sel)
+		}
+	}
+
+	invalidSelectors := []string{
+		"",
+		"   ",
+		"+span",
+		"~span",
+		">span",
+		"div+",
+		"div~",
+		"div >",
+		"div > + span",
+		"div + ~ span",
+		"div, ",
+		", div",
+		"div[attr",
+		"div]",
+		"div[class~=active]",
+		"div[lang|=en]",
+		"div[foo bar]",
+		`div[a="x" bad]`,
+		"div:not(.a",
+		"div:not(host >>> span)",
+		"div)",
+		"div$span",
+		"div#",
+		"div.",
+		"div::before",
+		"div:hover",
+		"div:nth-child(0)",
+		"div:nth-child(-2)",
+		"div:nth-child(even)",
+		">>> .a",
+		"host >>>",
+	}
+	for _, bad := range invalidSelectors {
+		if err := ValidateCSSSelector(bad); err == nil {
+			t.Errorf("ValidateCSSSelector(%q) unexpectedly succeeded", bad)
+		}
+		if got := ParseCSSSelectorList(bad); got != nil {
+			t.Errorf("ParseCSSSelectorList(%q) = %+v, want nil (fail closed)", bad, got)
+		}
+	}
+
+	// ResolveRecipe and ValidateFallbackPlan fail closed on invalid selectors.
+	if _, err := ResolveRecipe(Recipe{
+		Name:  "bad-sel",
+		Topic: "t",
+		Steps: []Step{{ID: "s1", URL: "https://example.com", Fields: map[string]FieldRule{"x": {Selector: "div+"}}}},
+	}, nil); err == nil {
+		t.Fatal("expected ResolveRecipe to reject invalid field selector 'div+'")
+	}
+	if err := ValidateFallbackPlan(FallbackPlan{
+		AllowedDomain: "example.com",
+		TargetURL:     "https://example.com",
+		Actions:       []FallbackAction{{Action: "click", Selector: "button$bad"}},
+	}, []string{"example.com"}); err == nil {
+		t.Fatal("expected ValidateFallbackPlan to reject invalid click selector")
+	}
+
+	// Semantic AXNode tree evaluates '+' and '~' sibling combinators identically to HTML.
+	nodes := []AXNode{
+		{NodeID: "1", Role: &AXValue{Value: "window"}, Name: &AXValue{Value: "App"}, ChildIDs: []string{"2", "3", "4", "5"}},
+		{NodeID: "2", Role: &AXValue{Value: "heading"}, Name: &AXValue{Value: "Metrics"}},
+		{NodeID: "3", Role: &AXValue{Value: "StaticText"}, Name: &AXValue{Value: "First"}},
+		{NodeID: "4", Role: &AXValue{Value: "button"}, Name: &AXValue{Value: "Refresh"}},
+		{NodeID: "5", Role: &AXValue{Value: "StaticText"}, Name: &AXValue{Value: "Second"}},
+	}
+	res, err := ExtractStepFromAXNodes(Step{
+		ID: "sib",
+		Selectors: map[string]string{
+			"adj": "heading + statictext",
+			"gen": "heading ~ statictext",
+		},
+	}, nodes, "uia://window/App")
+	if err != nil {
+		t.Fatalf("ExtractStepFromAXNodes failed: %v", err)
+	}
+	if res.Selectors["adj"] != "First" {
+		t.Fatalf("semantic heading + statictext = %q, want 'First'", res.Selectors["adj"])
+	}
+	if res.Selectors["gen"] != "First | Second" {
+		t.Fatalf("semantic heading ~ statictext = %q, want 'First | Second'", res.Selectors["gen"])
+	}
+}
+
+func TestM814OpenAPITaskAndAttemptLogSchemaParity(t *testing.T) {
+	rawSpec, err := os.ReadFile(filepath.Join("..", "..", "specs", "deskdrop.yaml"))
+	if err != nil {
+		t.Fatalf("read specs/deskdrop.yaml: %v", err)
+	}
+	specLines := strings.Split(strings.ReplaceAll(string(rawSpec), "\r\n", "\n"), "\n")
+
+	extractSchemaProps := func(schemaName string) map[string]bool {
+		props := make(map[string]bool)
+		inSchema := false
+		inProps := false
+		header := "    " + schemaName + ":"
+		for _, ln := range specLines {
+			if !inSchema {
+				if ln == header {
+					inSchema = true
+				}
+				continue
+			}
+			if strings.HasPrefix(ln, "    ") && !strings.HasPrefix(ln, "      ") && strings.TrimSpace(ln) != "" {
+				break
+			}
+			if ln == "      properties:" {
+				inProps = true
+				continue
+			}
+			if inProps {
+				if strings.HasPrefix(ln, "      ") && !strings.HasPrefix(ln, "        ") && strings.TrimSpace(ln) != "" {
+					inProps = false
+					continue
+				}
+				if strings.HasPrefix(ln, "        ") && !strings.HasPrefix(ln, "          ") {
+					trimmed := strings.TrimSpace(ln)
+					if colon := strings.IndexByte(trimmed, ':'); colon > 0 {
+						props[trimmed[:colon]] = true
+					}
+				}
+			}
+		}
+		return props
+	}
+
+	extractStructJSONFields := func(rt reflect.Type) map[string]bool {
+		out := make(map[string]bool)
+		for i := 0; i < rt.NumField(); i++ {
+			tag := rt.Field(i).Tag.Get("json")
+			name := strings.Split(tag, ",")[0]
+			if name != "" && name != "-" {
+				out[name] = true
+			}
+		}
+		return out
+	}
+
+	for _, check := range []struct {
+		name string
+		typ  reflect.Type
+	}{
+		{"AttemptLog", reflect.TypeFor[AttemptLog]()},
+		{"Task", reflect.TypeFor[Task]()},
+		{"RecipePatchProposal", reflect.TypeFor[RecipePatchProposal]()},
+		{"AckNote", reflect.TypeFor[AckNote]()},
+		{"BusMessage", reflect.TypeFor[BusMessage]()},
+	} {
+		yamlProps := extractSchemaProps(check.name)
+		goFields := extractStructJSONFields(check.typ)
+		if len(yamlProps) == 0 {
+			t.Fatalf("found 0 OpenAPI properties for %s in specs/deskdrop.yaml", check.name)
+		}
+		for gf := range goFields {
+			if !yamlProps[gf] {
+				t.Errorf("Go struct %s JSON field %q missing from specs/deskdrop.yaml", check.name, gf)
+			}
+		}
+		for yp := range yamlProps {
+			if !goFields[yp] {
+				t.Errorf("specs/deskdrop.yaml %s property %q missing from Go struct", check.name, yp)
+			}
+		}
 	}
 }
