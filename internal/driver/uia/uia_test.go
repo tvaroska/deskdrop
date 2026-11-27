@@ -196,3 +196,124 @@ func TestUIATargetDriverConformanceAndRedaction(t *testing.T) {
 		}
 	}
 }
+
+func TestM82WalkUIASubtreeMaxNodesTruncationContextCancelAndHandleRelease(t *testing.T) {
+	// Tree of 5 integer handles: 1 -> [2, 3], 2 -> [4, 5].
+	children := map[int][]int{
+		1: {2, 3},
+		2: {4, 5},
+	}
+	runWalk := func(ctx context.Context, maxNodes int, maxDepth int, cancelAt int) ([]contract.AXNode, map[int]int, error) {
+		cctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		refs := make(map[int]int)
+		ops := uiaWalkOps[int]{
+			firstChild: func(p int) (int, error) {
+				kids := children[p]
+				if len(kids) == 0 {
+					return 0, nil
+				}
+				ch := kids[0]
+				refs[ch]++
+				if ch == cancelAt {
+					cancel()
+				}
+				return ch, nil
+			},
+			nextSibling: func(cur int) (int, error) {
+				for _, kids := range children {
+					for i, id := range kids {
+						if id == cur && i+1 < len(kids) {
+							nxt := kids[i+1]
+							refs[nxt]++
+							if nxt == cancelAt {
+								cancel()
+							}
+							return nxt, nil
+						}
+					}
+				}
+				return 0, nil
+			},
+			makeNode: func(el int, parentID string) contract.AXNode {
+				return contract.AXNode{
+					NodeID:   strings.Repeat("n", el),
+					ParentID: parentID,
+					Role:     axVal("Text"),
+				}
+			},
+			release: func(el int) {
+				refs[el]--
+			},
+		}
+		nodes, err := walkUIASubtree(cctx, 1, maxNodes, maxDepth, ops)
+		return nodes, refs, err
+	}
+
+	assertZeroLeaks := func(t *testing.T, label string, refs map[int]int) {
+		t.Helper()
+		for id, rc := range refs {
+			if rc != 0 {
+				t.Fatalf("%s leaked handle %d with refCount=%d (refs=%v)", label, id, rc, refs)
+			}
+		}
+	}
+
+	// 1. Exact cap (maxNodes == 5) succeeds with 0 handle leaks.
+	nodes, refs, err := runWalk(context.Background(), 5, 10, 0)
+	if err != nil || len(nodes) != 5 {
+		t.Fatalf("exact maxNodes=5 walk = (len=%d, err=%v), want (5, nil)", len(nodes), err)
+	}
+	assertZeroLeaks(t, "exact-5", refs)
+
+	// 2. Truncation (maxNodes == 4 on 5-node tree) fails closed with ErrTreeTruncated and 0 leaks.
+	truncNodes, truncRefs, truncErr := runWalk(context.Background(), 4, 10, 0)
+	if !errors.Is(truncErr, ErrTreeTruncated) || truncNodes != nil {
+		t.Fatalf("maxNodes=4 walk = (nodes=%v, err=%v), want (nil, ErrTreeTruncated)", truncNodes, truncErr)
+	}
+	assertZeroLeaks(t, "truncated-4", truncRefs)
+
+	// 3. Non-positive maxNodes fails closed immediately.
+	if _, _, zerr := runWalk(context.Background(), 0, 10, 0); !errors.Is(zerr, ErrTreeTruncated) {
+		t.Fatalf("maxNodes=0 err = %v, want ErrTreeTruncated", zerr)
+	}
+
+	// 4. Mid-walk context cancellation fails closed with context.Canceled and releases queued handles
+	// (both with queued siblings at depth>1 and at leaf maxDepth=1 where queue is empty).
+	cNodes, cRefs, cErr := runWalk(context.Background(), 10, 10, 4)
+	if !errors.Is(cErr, context.Canceled) || cNodes != nil {
+		t.Fatalf("mid-walk cancel = (nodes=%v, err=%v), want (nil, context.Canceled)", cNodes, cErr)
+	}
+	assertZeroLeaks(t, "mid-cancel", cRefs)
+
+	leafNodes, leafRefs, leafErr := runWalk(context.Background(), 10, 1, 3)
+	if !errors.Is(leafErr, context.Canceled) || leafNodes != nil {
+		t.Fatalf("leaf sibling cancel = (nodes=%v, err=%v), want (nil, context.Canceled)", leafNodes, leafErr)
+	}
+	assertZeroLeaks(t, "leaf-cancel", leafRefs)
+
+	// 5. Driver.ExecuteStep & StaticTreeProvider propagate ErrTreeTruncated and context.Canceled.
+	drv := NewDriverWithProvider(&StaticTreeProvider{
+		Windows: []StaticWindowFixture{{
+			Title: "Task Manager",
+			Nodes: sampleTaskManagerTree(), // 14 nodes
+		}},
+	})
+	drv.MaxNodes = 5
+	if _, derr := drv.ExecuteStep(context.Background(), contract.Step{
+		ID:          "trunc",
+		WindowTitle: "Task Manager",
+	}); !errors.Is(derr, ErrTreeTruncated) {
+		t.Fatalf("Driver.ExecuteStep(MaxNodes=5) err = %v, want ErrTreeTruncated", derr)
+	}
+
+	preCanceled, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
+	drv.MaxNodes = DefaultMaxNodes
+	if _, cerr := drv.ExecuteStep(preCanceled, contract.Step{ID: "c1", WindowTitle: "Task Manager"}); !errors.Is(cerr, context.Canceled) {
+		t.Fatalf("Driver.ExecuteStep(canceled) err = %v, want context.Canceled", cerr)
+	}
+	if st := drv.ProbeStatus(preCanceled); st.Connected {
+		t.Fatalf("ProbeStatus(canceled) Connected = true, want false (%+v)", st)
+	}
+}

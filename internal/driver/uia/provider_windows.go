@@ -164,6 +164,9 @@ func (win32Provider) Close() error {
 }
 
 func (win32Provider) ListWindows(ctx context.Context) ([]WindowSummary, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var out []WindowSummary
 	err := withUIAutomation(func(uia *iUIAutomation, walker *iUIAutomationTreeWalker, root *iUIAutomationElement) error {
 		cur, err := walkerFirstChild(walker, root)
@@ -194,12 +197,15 @@ func (win32Provider) ListWindows(ctx context.Context) ([]WindowSummary, error) {
 		if cur != nil {
 			releaseElement(cur)
 		}
-		return nil
+		return ctx.Err()
 	})
 	return out, err
 }
 
 func (win32Provider) CaptureWindowTree(ctx context.Context, windowQuery string, maxNodes int) ([]contract.AXNode, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
 	if maxNodes <= 0 {
 		maxNodes = DefaultMaxNodes
 	}
@@ -212,8 +218,9 @@ func (win32Provider) CaptureWindowTree(ctx context.Context, windowQuery string, 
 		q := strings.ToLower(strings.TrimSpace(windowQuery))
 		if q == "" || q == "*" || q == "desktop" {
 			matchedTitle = "Desktop"
-			nodes = walkSubtree(ctx, walker, root, maxNodes, maxUIATreeWalkDepth)
-			return nil
+			var werr error
+			nodes, werr = walkSubtree(ctx, walker, root, maxNodes, maxUIATreeWalkDepth)
+			return werr
 		}
 
 		var target *iUIAutomationElement
@@ -245,13 +252,20 @@ func (win32Provider) CaptureWindowTree(ctx context.Context, windowQuery string, 
 		if target == nil && cur != nil {
 			releaseElement(cur)
 		}
+		if err := ctx.Err(); err != nil {
+			if target != nil {
+				releaseElement(target)
+			}
+			return err
+		}
 		if target == nil {
 			return fmt.Errorf("no open desktop window matched %q", windowQuery)
 		}
 		defer releaseElement(target)
 
-		nodes = walkSubtree(ctx, walker, target, maxNodes, maxUIATreeWalkDepth)
-		return nil
+		var werr error
+		nodes, werr = walkSubtree(ctx, walker, target, maxNodes, maxUIATreeWalkDepth)
+		return werr
 	})
 	if err != nil {
 		return nil, "", err
@@ -309,18 +323,10 @@ func withUIAutomation(fn func(uia *iUIAutomation, walker *iUIAutomationTreeWalke
 	return fn(uia, walker, root)
 }
 
-func walkSubtree(ctx context.Context, walker *iUIAutomationTreeWalker, start *iUIAutomationElement, maxNodes int, maxDepth int) []contract.AXNode {
-	if start == nil || maxNodes <= 0 || ctx.Err() != nil {
-		return nil
+func walkSubtree(ctx context.Context, walker *iUIAutomationTreeWalker, start *iUIAutomationElement, maxNodes int, maxDepth int) ([]contract.AXNode, error) {
+	if start == nil {
+		return nil, nil
 	}
-	type queueItem struct {
-		el      *iUIAutomationElement
-		nodeIdx int
-		depth   int
-		ownsEl  bool
-	}
-
-	out := make([]contract.AXNode, 0, 128)
 	nextSeq := 0
 
 	makeNode := func(el *iUIAutomationElement, parentID string) contract.AXNode {
@@ -373,53 +379,16 @@ func walkSubtree(ctx context.Context, walker *iUIAutomationTreeWalker, start *iU
 		return node
 	}
 
-	out = append(out, makeNode(start, ""))
-	queue := []queueItem{{el: start, nodeIdx: 0, depth: 0, ownsEl: false}}
-	defer func() {
-		for _, rem := range queue {
-			if rem.ownsEl && rem.el != nil {
-				releaseElement(rem.el)
-			}
-		}
-	}()
-
-	for len(queue) > 0 && len(out) < maxNodes && ctx.Err() == nil {
-		cur := queue[0]
-		queue = queue[1:]
-
-		if cur.depth < maxDepth {
-			var childIDs []string
-			parentID := out[cur.nodeIdx].NodeID
-			ch, err := walkerFirstChild(walker, cur.el)
-			if err == nil {
-				for ch != nil {
-					if len(out) >= maxNodes || ctx.Err() != nil {
-						sib, _ := walkerNextSibling(walker, ch)
-						releaseElement(ch)
-						ch = sib
-						continue
-					}
-					sib, _ := walkerNextSibling(walker, ch)
-					cNode := makeNode(ch, parentID)
-					cIdx := len(out)
-					out = append(out, cNode)
-					childIDs = append(childIDs, cNode.NodeID)
-					if cur.depth+1 < maxDepth {
-						queue = append(queue, queueItem{el: ch, nodeIdx: cIdx, depth: cur.depth + 1, ownsEl: true})
-					} else {
-						releaseElement(ch)
-					}
-					ch = sib
-				}
-			}
-			out[cur.nodeIdx].ChildIDs = childIDs
-		}
-
-		if cur.ownsEl && cur.el != nil {
-			releaseElement(cur.el)
-		}
-	}
-	return out
+	return walkUIASubtree(ctx, start, maxNodes, maxDepth, uiaWalkOps[*iUIAutomationElement]{
+		firstChild: func(el *iUIAutomationElement) (*iUIAutomationElement, error) {
+			return walkerFirstChild(walker, el)
+		},
+		nextSibling: func(el *iUIAutomationElement) (*iUIAutomationElement, error) {
+			return walkerNextSibling(walker, el)
+		},
+		makeNode: makeNode,
+		release:  releaseElement,
+	})
 }
 
 func walkerFirstChild(walker *iUIAutomationTreeWalker, el *iUIAutomationElement) (*iUIAutomationElement, error) {

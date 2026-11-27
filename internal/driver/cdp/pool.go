@@ -3,6 +3,7 @@ package cdp
 import (
 	"context"
 	"errors"
+	"net"
 	"strings"
 	"sync"
 )
@@ -80,21 +81,31 @@ func (p *SessionPool) Acquire(ctx context.Context, cdpURL string, userDataDir st
 	if err != nil {
 		return nil, err
 	}
-	if src == SourceActivePort {
-		if p.activePortAttempted {
-			return nil, ErrApprovalLatchActive
-		}
-		p.activePortAttempted = true
+	if src == SourceActivePort && p.activePortAttempted {
+		return nil, ErrApprovalLatchActive
 	}
 
 	c, err := conn(ctx, wsURL)
 	if err != nil {
+		// Only latch when TCP connected (e.g. user denied or timed out on Chrome's approval banner);
+		// a dead/refused TCP dial means Chrome was not listening and never showed a prompt.
+		if src == SourceActivePort && !isDialError(err) {
+			p.activePortAttempted = true
+		}
 		return nil, err
+	}
+	if src == SourceActivePort {
+		p.activePortAttempted = true
 	}
 
 	p.client = c
 	p.wsURL = wsURL
 	return c, nil
+}
+
+func isDialError(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
 }
 
 // ProbeQuiet checks whether a persistent CDP connection is active or whether dedicated port :9222 is up,

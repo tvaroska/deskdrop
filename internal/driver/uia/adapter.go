@@ -203,7 +203,10 @@ func (s *StaticTreeProvider) Available() (bool, string) {
 	return true, "Connected (Static UIA Fixture)"
 }
 
-func (s *StaticTreeProvider) ListWindows(_ context.Context) ([]WindowSummary, error) {
+func (s *StaticTreeProvider) ListWindows(ctx context.Context) ([]WindowSummary, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	out := make([]WindowSummary, 0, len(s.Windows))
 	for _, w := range s.Windows {
 		out = append(out, WindowSummary{
@@ -215,18 +218,20 @@ func (s *StaticTreeProvider) ListWindows(_ context.Context) ([]WindowSummary, er
 	return out, nil
 }
 
-func (s *StaticTreeProvider) CaptureWindowTree(_ context.Context, windowQuery string, maxNodes int) ([]contract.AXNode, string, error) {
+func (s *StaticTreeProvider) CaptureWindowTree(ctx context.Context, windowQuery string, maxNodes int) ([]contract.AXNode, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
 	q := strings.ToLower(strings.TrimSpace(windowQuery))
 	for _, w := range s.Windows {
 		if q == "" || q == "*" || q == "desktop" ||
 			strings.Contains(strings.ToLower(w.Title), q) ||
 			strings.Contains(strings.ToLower(w.AutomationID), q) ||
 			strings.Contains(strings.ToLower(w.ClassName), q) {
-			nodes := w.Nodes
-			if maxNodes > 0 && len(nodes) > maxNodes {
-				nodes = nodes[:maxNodes]
+			if maxNodes > 0 && len(w.Nodes) > maxNodes {
+				return nil, "", fmt.Errorf("%w: limit %d reached", ErrTreeTruncated, maxNodes)
 			}
-			return nodes, w.Title, nil
+			return w.Nodes, w.Title, nil
 		}
 	}
 	return nil, "", fmt.Errorf("no open desktop window matched %q", windowQuery)

@@ -1364,3 +1364,266 @@ func TestT5ProbeQuietWaitConditionDiscoverAndLauncher(t *testing.T) {
 		t.Fatalf("ListBrowserProfiles(scan fallback) = %+v", scanned)
 	}
 }
+
+func TestM86M87M88LauncherArgsWindowsCandidatesAndApprovalLatch(t *testing.T) {
+	// M8.6: Browser launch args enforce http/https URL, safe profile dir, and "--" separator.
+	profArgs, err := buildLaunchProfileArgs(BrowserProfile{DirName: "Profile 2"}, "https://example.com/app")
+	if err != nil {
+		t.Fatalf("buildLaunchProfileArgs valid failed: %v", err)
+	}
+	wantProf := []string{"--profile-directory=Profile 2", "--", "https://example.com/app"}
+	if len(profArgs) != len(wantProf) || profArgs[1] != "--" || profArgs[2] != "https://example.com/app" {
+		t.Fatalf("buildLaunchProfileArgs = %v, want %v", profArgs, wantProf)
+	}
+	dedArgs, err := buildLaunchDedicatedArgs(9222, "/tmp/dd-prof", "http://127.0.0.1:8080/ok")
+	if err != nil || len(dedArgs) < 6 || dedArgs[len(dedArgs)-2] != "--" {
+		t.Fatalf("buildLaunchDedicatedArgs = (%v, %v), want trailing ['--', url]", dedArgs, err)
+	}
+
+	for _, badDir := range []string{"", ".", "..", "-inject", "a/b", `a\b`} {
+		if _, err := buildLaunchProfileArgs(BrowserProfile{DirName: badDir}, ""); err == nil {
+			t.Errorf("buildLaunchProfileArgs(%q) unexpectedly succeeded", badDir)
+		}
+	}
+	for _, badURL := range []string{
+		"--gpu-launcher=calc",
+		"-headless",
+		"javascript:alert(1)",
+		"file" + ":///etc/passwd",
+		"ftp://evil.example.com/payload",
+		"ws://127.0.0.1:9222/devtools",
+		"data:text/html,hi",
+		"https:///missing-host",
+	} {
+		if _, err := buildLaunchProfileArgs(BrowserProfile{DirName: "Default"}, badURL); err == nil {
+			t.Errorf("buildLaunchProfileArgs allowed unsafe URL %q", badURL)
+		}
+		if _, err := buildLaunchDedicatedArgs(9222, "/tmp/dd", badURL); err == nil {
+			t.Errorf("buildLaunchDedicatedArgs allowed unsafe URL %q", badURL)
+		}
+	}
+	if _, err := buildLaunchDedicatedArgs(9222, "-bad-dir", ""); err == nil {
+		t.Fatal("expected '-' userDataDir to fail buildLaunchDedicatedArgs")
+	}
+
+	// M8.7: Unset or relative Windows environment roots never produce relative CWD paths.
+	if got := windowsBrowserCandidates("", "", "", "chrome"); len(got) != 0 {
+		t.Fatalf("windowsBrowserCandidates(empty) = %v, want empty", got)
+	}
+	if got := windowsBrowserCandidates("relative/pf", ".", `..\local`, "edge"); len(got) != 0 {
+		t.Fatalf("windowsBrowserCandidates(relative) = %v, want empty", got)
+	}
+	winPaths := windowsBrowserCandidates(`C:\Program Files`, `C:\Program Files (x86)`, `C:\Users\Ada\AppData\Local`, "edge")
+	if len(winPaths) != 5 || !strings.Contains(winPaths[0], "msedge.exe") {
+		t.Fatalf("windowsBrowserCandidates(edge) = %v, want 5 abs paths starting with msedge.exe", winPaths)
+	}
+
+	// M8.8: Stale unreachable DevToolsActivePort must NOT return a dead WS URL or poison SessionPool latch.
+	t.Setenv("HOME", t.TempDir())
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedPort := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+
+	staleDir := t.TempDir()
+	staleContent := fmt.Sprintf("%d\n/devtools/browser/stale-id\n", closedPort)
+	if err := os.WriteFile(filepath.Join(staleDir, "DevToolsActivePort"), []byte(staleContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ws, _, derr := DiscoverBrowserWSWithSource(context.Background(), "", staleDir); derr == nil && strings.Contains(ws, "stale-id") {
+		t.Fatalf("DiscoverBrowserWSWithSource returned unreachable stale DevToolsActivePort %q", ws)
+	}
+
+	// Even if DevToolsActivePort dies in the race window between discovery and Connect (dial refused),
+	// SessionPool must NOT latch activePortAttempted; only post-TCP rejections latch.
+	pool := NewSessionPool()
+	pool.discoverFn = func(_ context.Context, _ string, _ string) (string, DiscoverySource, error) {
+		return fmt.Sprintf("ws://127.0.0.1:%d/devtools/browser/dead", closedPort), SourceActivePort, nil
+	}
+	if _, err := pool.Acquire(context.Background(), "", staleDir); err == nil {
+		t.Fatal("expected Acquire on closed port to fail")
+	}
+	if pool.ActivePortAttempted() {
+		t.Fatal("TCP dial refusal must NOT poison SessionPool.ActivePortAttempted()")
+	}
+
+	// Post-TCP WebSocket HTTP 403 rejection (user denied Chrome prompt) MUST latch activePortAttempted.
+	denySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "denied", http.StatusForbidden)
+	}))
+	defer denySrv.Close()
+	pool.discoverFn = func(_ context.Context, _ string, _ string) (string, DiscoverySource, error) {
+		return "ws://" + strings.TrimPrefix(denySrv.URL, "http://") + "/devtools/browser/live", SourceActivePort, nil
+	}
+	if _, err := pool.Acquire(context.Background(), "", staleDir); err == nil {
+		t.Fatal("expected HTTP 403 WS upgrade to fail")
+	}
+	if !pool.ActivePortAttempted() {
+		t.Fatal("expected post-TCP HTTP 403 rejection to set ActivePortAttempted=true")
+	}
+}
+
+func TestM84M89M810JSRuntimeDecimalOverflowShadowCommaAndVisibleTextParity(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		if os.Getenv("CI") != "" || os.Getenv("DESKDROP_REQUIRE_NODE") == "1" {
+			t.Fatalf("node required in CI: %v", err)
+		}
+		t.Skipf("node not found: %v", err)
+	}
+
+	visHTML := `<!doctype html><html><body><div><span>1,</span><span>234</span><span>%</span></div><div>Next block</div><p>😀😀😀</p></body></html>`
+	goStep, err := verify.ExtractStepFromHTML(contract.Step{ID: "vis", MaxTextChars: 100}, visHTML, "https://example.com/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	script := shadowDOMHelperJS + `
+class TNode {
+	constructor(v) { this.nodeType = 3; this.nodeValue = v; }
+}
+class ENode {
+	constructor(tag, attrs = {}, kids = [], shadowKids = null) {
+		this.nodeType = 1;
+		this.tagName = tag.toUpperCase();
+		this._a = attrs;
+		this.childNodes = [];
+		this.children = [];
+		this.parentElement = null;
+		for (const k of kids) {
+			this.childNodes.push(k);
+			if (k.nodeType === 1) { k.parentElement = this; this.children.push(k); }
+		}
+		this.shadowRoot = shadowKids ? new ShadowFrag(shadowKids) : null;
+	}
+	getAttribute(k) { return this._a[k] ?? null; }
+	hasAttribute(k) { return Object.prototype.hasOwnProperty.call(this._a, k); }
+	matches(sel) {
+		const s = sel.trim();
+		if (s.startsWith(".")) return (this._a.class || "").split(/\s+/).includes(s.slice(1));
+		return this.tagName.toLowerCase() === s.toLowerCase();
+	}
+	querySelectorAll(sel) {
+		const out = [];
+		const walk = (n) => {
+			for (const c of n.children) {
+				if (c.matches(sel)) out.push(c);
+				walk(c);
+			}
+		};
+		walk(this);
+		return out;
+	}
+}
+class ShadowFrag {
+	constructor(kids) {
+		this.nodeType = 11;
+		this.childNodes = kids;
+		this.children = kids.filter(k => k.nodeType === 1);
+	}
+	querySelectorAll(sel) {
+		const out = [];
+		const walk = (n) => {
+			for (const c of (n.children || [])) {
+				if (c.matches(sel)) out.push(c);
+				walk(c);
+			}
+		};
+		walk(this);
+		return out;
+	}
+}
+global.window = { getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }) };
+
+// 1. Comma + Shadow-DOM >>> when first host is absent AND pre-order preservation (both single-group and multi-group).
+const leadRow = new ENode("div", { class: "lead-row" }, [new TNode("First")]);
+const shadowKPI = new ENode("span", { class: "kpi item" }, [new TNode("Second")]);
+const hostLight = new ENode("span", { class: "item" }, [new TNode("Third")]);
+const host = new ENode("my-host", {}, [hostLight], [shadowKPI]);
+const tailItem = new ENode("span", { class: "item" }, [new TNode("Fourth")]);
+const body1 = new ENode("body", {}, [leadRow, host, tailItem]);
+const doc1 = { nodeType: 9, body: body1, children: [body1], childNodes: [body1], querySelectorAll: (s) => body1.querySelectorAll(s) };
+
+const fallbackHits = deepQueryAll(doc1, "missing-host >>> .kpi, .lead-row").map(n => cleanText(n));
+const orderedHits = deepQueryAll(doc1, "my-host >>> .kpi, .lead-row").map(n => cleanText(n));
+const singleGroupShadowOrder = deepQueryAll(doc1, ".item").map(n => cleanText(n));
+
+// 2. collectVisibleText inline span joining + emoji rune truncation + evalFieldRule max_chars surrogate safety.
+const visBody = new ENode("body", {}, [
+	new ENode("div", {}, [
+		new ENode("span", {}, [new TNode("1,")]),
+		new ENode("span", {}, [new TNode("234")]),
+		new ENode("span", {}, [new TNode("%")]),
+	]),
+	new ENode("div", {}, [new TNode("Next block")]),
+	new ENode("p", {}, [new TNode("😀😀😀")]),
+]);
+const visDoc = { nodeType: 9, body: visBody, children: [visBody], childNodes: [visBody] };
+const fullExcerpt = collectVisibleText(visDoc, 100);
+const emojiSlice = collectVisibleText({ body: new ENode("body", {}, [new ENode("p", {}, [new TNode("😀😀😀")])]) }, 2);
+const rocketField = evalFieldRule(new ENode("span", {}, [new TNode("🚀 ok")]), { max_chars: 1 }, false);
+
+// 3. Leading-decimal parseCompactFloat and int64 overflow guard.
+const overflowEl = new ENode("span", {}, [new TNode("9999999999999999999B")]);
+console.log(JSON.stringify({
+	leadHalf: parseCompactFloat(".5%"),
+	negQuarterK: parseCompactFloat("-.25K"),
+	overflowTop: evalFieldRule(overflowEl, { parse: "number" }, true) === undefined,
+	overflowItem: evalFieldRule(overflowEl, { parse: "number" }, false),
+	fallbackHits,
+	orderedHits,
+	singleGroupShadowOrder,
+	fullExcerpt,
+	emojiSlice,
+	rocketField,
+}));
+`
+	out, runErr := exec.Command(nodeBin, "-e", script).CombinedOutput()
+	if runErr != nil {
+		t.Fatalf("node M8 parity failed: %v\n%s", runErr, string(out))
+	}
+	var got struct {
+		LeadHalf struct {
+			OK  bool
+			Val float64
+		} `json:"leadHalf"`
+		NegQuarterK struct {
+			OK  bool
+			Val float64
+		} `json:"negQuarterK"`
+		OverflowTop            bool     `json:"overflowTop"`
+		OverflowItem           int64    `json:"overflowItem"`
+		FallbackHits           []string `json:"fallbackHits"`
+		OrderedHits            []string `json:"orderedHits"`
+		SingleGroupShadowOrder []string `json:"singleGroupShadowOrder"`
+		FullExcerpt            string   `json:"fullExcerpt"`
+		EmojiSlice             string   `json:"emojiSlice"`
+		RocketField            string   `json:"rocketField"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &got); err != nil {
+		t.Fatalf("unmarshal M8 node output %q: %v", string(out), err)
+	}
+	if !got.LeadHalf.OK || got.LeadHalf.Val != 0.5 || !got.NegQuarterK.OK || got.NegQuarterK.Val != -250 {
+		t.Fatalf("leading decimal mismatch: %+v", got)
+	}
+	if !got.OverflowTop || got.OverflowItem != 0 {
+		t.Fatalf("JS int64 overflow guard mismatch: topOmitted=%v item=%d", got.OverflowTop, got.OverflowItem)
+	}
+	if len(got.FallbackHits) != 1 || got.FallbackHits[0] != "First" {
+		t.Fatalf("missing-host >>> .kpi, .lead-row = %v, want [First]", got.FallbackHits)
+	}
+	if len(got.OrderedHits) != 2 || got.OrderedHits[0] != "First" || got.OrderedHits[1] != "Second" {
+		t.Fatalf("DOM pre-order mismatch on comma+shadow selector: got %v, want [First Second]", got.OrderedHits)
+	}
+	if len(got.SingleGroupShadowOrder) != 3 || got.SingleGroupShadowOrder[0] != "Second" || got.SingleGroupShadowOrder[1] != "Third" || got.SingleGroupShadowOrder[2] != "Fourth" {
+		t.Fatalf("single-group Shadow+Light pre-order = %v, want [Second Third Fourth]", got.SingleGroupShadowOrder)
+	}
+	if got.FullExcerpt != goStep.TextExcerpt {
+		t.Fatalf("collectVisibleText = %q != Go verify TextExcerpt %q", got.FullExcerpt, goStep.TextExcerpt)
+	}
+	if got.EmojiSlice != "😀😀" || got.RocketField != "🚀" {
+		t.Fatalf("surrogate code-point slice = (%q, %q), want ('😀😀', '🚀')", got.EmojiSlice, got.RocketField)
+	}
+}

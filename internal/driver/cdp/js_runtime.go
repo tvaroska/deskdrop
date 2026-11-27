@@ -131,13 +131,13 @@ function allShadowElements(root) {
 		const cur = stack.pop();
 		if (!cur) continue;
 		if (cur.nodeType === 1) out.push(cur);
-		if (cur.shadowRoot) stack.push(cur.shadowRoot);
 		const children = cur.children || cur.childNodes || [];
 		for (let i = children.length - 1; i >= 0; i--) {
 			if (children[i].nodeType === 1 || children[i].nodeType === 11) {
 				stack.push(children[i]);
 			}
 		}
+		if (cur.shadowRoot) stack.push(cur.shadowRoot);
 	}
 	return out;
 }
@@ -215,14 +215,15 @@ function cleanText(el) {
 
 function parseCompactFloat(raw) {
 	const cleaned = normalizeWS(raw).replace(/,/g, "");
-	const m = cleaned.match(/(-?\d+(?:\.\d+)?)(?:\s*([KkMmBb])\b)?/);
+	const m = cleaned.match(/([+-]?(?:\d+(?:\.\d+)?|\.\d+))(?:\s*([KkMmBb])\b)?/);
 	if (!m) return { ok: false, val: 0 };
 	let n = parseFloat(m[1]);
-	if (Number.isNaN(n)) return { ok: false, val: 0 };
+	if (!Number.isFinite(n)) return { ok: false, val: 0 };
 	const suf = (m[2] || "").toUpperCase();
 	if (suf === "K") n *= 1000;
 	else if (suf === "M") n *= 1000000;
 	else if (suf === "B") n *= 1000000000;
+	if (!Number.isFinite(n)) return { ok: false, val: 0 };
 	return { ok: true, val: n };
 }
 
@@ -356,15 +357,23 @@ function evalFieldRule(scopeEl, rule, omitUnmatchedNumeric) {
 		}
 		return "";
 	}
-	if (rule.max_chars && rule.max_chars > 0 && raw.length > rule.max_chars) {
-		raw = raw.slice(0, rule.max_chars).trim();
+	if (rule.max_chars && rule.max_chars > 0) {
+		const runes = Array.from(raw);
+		if (runes.length > rule.max_chars) {
+			raw = runes.slice(0, rule.max_chars).join("").trim();
+		}
 	}
 	if (rule.prefix) raw = rule.prefix + raw;
 	if (rule.suffix) raw = raw + rule.suffix;
 
 	if (rule.parse === "number") {
 		const p = parseCompactFloat(raw);
-		if (p.ok) return Math.round(p.val);
+		if (p.ok) {
+			const r = Math.round(p.val);
+			if (Number.isFinite(r) && r >= -9223372036854775808 && r < 9223372036854775808) {
+				return r;
+			}
+		}
 		return omitUnmatchedNumeric ? undefined : 0;
 	}
 	if (rule.parse === "float") {
@@ -420,8 +429,74 @@ function evalItemRule(root, itemRule) {
 	return out;
 }
 
-function deepQueryAll(root, selector) {
-	const parts = selector.split(">>>").map(s => s.trim()).filter(Boolean);
+function splitCSSTopLevel(str, sep) {
+	const s = String(str || "");
+	const out = [];
+	let start = 0;
+	let inBracket = false;
+	let inParen = 0;
+	let inQuote = "";
+	for (let i = 0; i < s.length; i++) {
+		const c = s[i];
+		if (inQuote) {
+			if (c === "\\" && i + 1 < s.length) {
+				i++;
+				continue;
+			}
+			if (c === inQuote) inQuote = "";
+			continue;
+		}
+		if (c === "'" || c === "\"") inQuote = c;
+		else if (c === "[") inBracket = true;
+		else if (c === "]") inBracket = false;
+		else if (c === "(") inParen++;
+		else if (c === ")" && inParen > 0) inParen--;
+		else if (c === sep && !inBracket && inParen === 0) {
+			out.push(s.slice(start, i).trim());
+			start = i + 1;
+		}
+	}
+	out.push(s.slice(start).trim());
+	return out;
+}
+
+function splitShadowHops(group) {
+	const s = String(group || "");
+	const out = [];
+	let start = 0;
+	let inBracket = false;
+	let inParen = 0;
+	let inQuote = "";
+	for (let i = 0; i < s.length; i++) {
+		const c = s[i];
+		if (inQuote) {
+			if (c === "\\" && i + 1 < s.length) {
+				i++;
+				continue;
+			}
+			if (c === inQuote) inQuote = "";
+			continue;
+		}
+		if (c === "'" || c === "\"") inQuote = c;
+		else if (c === "[") inBracket = true;
+		else if (c === "]") inBracket = false;
+		else if (c === "(") inParen++;
+		else if (c === ")" && inParen > 0) inParen--;
+		else if (!inBracket && inParen === 0 && c === ">" && s[i + 1] === ">" && s[i + 2] === ">") {
+			const part = s.slice(start, i).trim();
+			if (part) out.push(part);
+			i += 2;
+			start = i + 1;
+		}
+	}
+	const tail = s.slice(start).trim();
+	if (tail) out.push(tail);
+	return out;
+}
+
+function deepQueryGroup(root, group) {
+	const parts = splitShadowHops(group);
+	if (!parts.length) return [];
 	let scopes = [root];
 	for (const part of parts) {
 		const next = [];
@@ -448,37 +523,86 @@ function deepQueryAll(root, selector) {
 	return scopes;
 }
 
+function deepQueryAll(root, selector) {
+	const groups = splitCSSTopLevel(selector, ",").filter(Boolean);
+	if (groups.length === 0) return [];
+	const matched = new Set();
+	for (const g of groups) {
+		for (const m of deepQueryGroup(root, g)) {
+			matched.add(m);
+		}
+	}
+	if (matched.size <= 1) return Array.from(matched);
+	const ordered = [];
+	for (const el of allShadowElements(root)) {
+		if (matched.has(el)) {
+			ordered.push(el);
+			matched.delete(el);
+		}
+	}
+	for (const rem of matched) ordered.push(rem);
+	return ordered;
+}
+
 function deepQueryFirst(root, selector) {
 	const all = deepQueryAll(root, selector);
 	return all.length ? all[0] : null;
 }
 
+const blockBoundaryTags = {
+	DIV: 1, P: 1, LI: 1, UL: 1, OL: 1, DL: 1, DT: 1, DD: 1,
+	TR: 1, TD: 1, TH: 1, TABLE: 1, THEAD: 1, TBODY: 1, TFOOT: 1,
+	H1: 1, H2: 1, H3: 1, H4: 1, H5: 1, H6: 1,
+	SECTION: 1, ARTICLE: 1, HEADER: 1, FOOTER: 1, NAV: 1, ASIDE: 1, MAIN: 1,
+	BR: 1, HR: 1, BLOCKQUOTE: 1, PRE: 1, BUTTON: 1, A: 1, LABEL: 1, SUMMARY: 1, FIGCAPTION: 1
+};
+
 function collectVisibleText(root, maxChars) {
-	const chunks = [];
-	let total = 0;
+	const start = (root && root.body) ? root.body : root;
+	if (!start || maxChars <= 0) return "";
+	let buf = "";
+	let pendingSpace = false;
+	const skipTags = { SCRIPT: 1, STYLE: 1, NOSCRIPT: 1, SVG: 1 };
 	const walk = (node) => {
-		if (!node || total >= maxChars) return;
+		if (!node || buf.length >= maxChars * 4) return;
 		if (node.nodeType === 3) {
-			const t = normalizeWS(node.nodeValue || "");
-			if (t) {
-				chunks.push(t);
-				total += t.length + 1;
+			const txt = String(node.nodeValue || "");
+			if (!txt) return;
+			if (pendingSpace && buf.length > 0) {
+				if (shouldInsertBoundarySpace(buf, txt)) buf += " ";
+				pendingSpace = false;
 			}
+			buf += txt;
 			return;
 		}
 		if (node.nodeType === 1) {
 			const tag = (node.tagName || "").toUpperCase();
-			if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT" || tag === "SVG") return;
-			if (!isVisible(node)) return;
-			if (node.shadowRoot) walk(node.shadowRoot);
+			if (skipTags[tag] || node.hidden) return;
+			if (typeof window !== "undefined" && window.getComputedStyle) {
+				try {
+					const st = window.getComputedStyle(node);
+					if (st && (st.display === "none" || st.visibility === "hidden" || st.opacity === "0")) return;
+				} catch (_) {}
+			}
+			if (blockBoundaryTags[tag] && buf.length > 0) {
+				pendingSpace = true;
+			}
+			if (node.shadowRoot) {
+				for (const sc of (node.shadowRoot.childNodes || [])) walk(sc);
+			}
+			for (const ch of (node.childNodes || [])) walk(ch);
+			if (buf.length > 0) {
+				pendingSpace = true;
+			}
+			return;
 		}
-		const kids = node.childNodes || [];
-		for (let i = 0; i < kids.length && total < maxChars; i++) {
-			walk(kids[i]);
-		}
+		for (const ch of (node.childNodes || [])) walk(ch);
 	};
-	walk(root.body || root);
-	return chunks.join(" ").slice(0, maxChars);
+	walk(start);
+	const norm = normalizeWS(buf);
+	const runes = Array.from(norm);
+	if (runes.length <= maxChars) return norm;
+	return runes.slice(0, maxChars).join("").trim();
 }
 
 function extractMetricCards(root) {

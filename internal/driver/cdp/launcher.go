@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -234,15 +235,15 @@ func LaunchBrowserProfile(browser string, prof BrowserProfile, targetURL string)
 		return bin, err
 	}
 
+	args, err := buildLaunchProfileArgs(prof, targetURL)
+	if err != nil {
+		return "", err
+	}
 	bin, err := findBrowserBinary(browser)
 	if err != nil {
 		return "", err
 	}
 
-	args := []string{fmt.Sprintf("--profile-directory=%s", prof.DirName)}
-	if strings.TrimSpace(targetURL) != "" {
-		args = append(args, strings.TrimSpace(targetURL))
-	}
 	cmd := exec.Command(bin, args...)
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("failed to start %s (%s): %w", bin, prof.DirName, err)
@@ -258,11 +259,18 @@ func LaunchDedicatedBrowser(browser string, port int, userDataDir string) (strin
 
 // LaunchDedicatedBrowserWithURL spawns Chrome or Edge on a dedicated profile and opens startURL if non-empty.
 func LaunchDedicatedBrowserWithURL(browser string, port int, userDataDir string, startURL string) (string, string, error) {
-	if port <= 0 {
+	if port <= 0 || port > 65535 {
 		port = 9222
 	}
 	if strings.TrimSpace(userDataDir) == "" {
 		userDataDir = defaultDedicatedProfileDir()
+	}
+	if absDir, aerr := filepath.Abs(userDataDir); aerr == nil {
+		userDataDir = absDir
+	}
+	args, err := buildLaunchDedicatedArgs(port, userDataDir, startURL)
+	if err != nil {
+		return "", "", err
 	}
 	if err := os.MkdirAll(userDataDir, 0o700); err != nil {
 		return "", "", err
@@ -273,21 +281,72 @@ func LaunchDedicatedBrowserWithURL(browser string, port int, userDataDir string,
 		return "", "", err
 	}
 
-	args := []string{
-		fmt.Sprintf("--remote-debugging-port=%d", port),
-		fmt.Sprintf("--user-data-dir=%s", userDataDir),
-		"--no-first-run",
-		"--no-default-browser-check",
-	}
-	if strings.TrimSpace(startURL) != "" {
-		args = append(args, strings.TrimSpace(startURL))
-	}
 	cmd := exec.Command(bin, args...)
 	if err := cmd.Start(); err != nil {
 		return "", "", fmt.Errorf("failed to start %s: %w", bin, err)
 	}
 	go func() { _ = cmd.Wait() }()
 	return bin, userDataDir, nil
+}
+
+func validateLaunchURL(raw string) (string, error) {
+	u := strings.TrimSpace(raw)
+	if u == "" {
+		return "", nil
+	}
+	if strings.HasPrefix(u, "-") || strings.ContainsAny(u, "\x00\r\n") {
+		return "", fmt.Errorf("unsafe browser launch URL %q", raw)
+	}
+	parsed, err := url.Parse(u)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return "", fmt.Errorf("browser launch URL %q must use http or https scheme", raw)
+	}
+	return u, nil
+}
+
+func validateProfileDirName(raw string) (string, error) {
+	d := strings.TrimSpace(raw)
+	if d == "" || d == "." || d == ".." || strings.HasPrefix(d, "-") || strings.ContainsAny(d, "/\\\x00\r\n") {
+		return "", fmt.Errorf("invalid browser profile directory %q", raw)
+	}
+	return d, nil
+}
+
+func buildLaunchProfileArgs(prof BrowserProfile, targetURL string) ([]string, error) {
+	dirName, err := validateProfileDirName(prof.DirName)
+	if err != nil {
+		return nil, err
+	}
+	cleanURL, err := validateLaunchURL(targetURL)
+	if err != nil {
+		return nil, err
+	}
+	args := []string{fmt.Sprintf("--profile-directory=%s", dirName)}
+	if cleanURL != "" {
+		args = append(args, "--", cleanURL)
+	}
+	return args, nil
+}
+
+func buildLaunchDedicatedArgs(port int, userDataDir string, startURL string) ([]string, error) {
+	dir := strings.TrimSpace(userDataDir)
+	if dir == "" || strings.HasPrefix(dir, "-") || strings.ContainsAny(dir, "\x00\r\n") {
+		return nil, fmt.Errorf("invalid browser user_data_dir %q", userDataDir)
+	}
+	cleanURL, err := validateLaunchURL(startURL)
+	if err != nil {
+		return nil, err
+	}
+	args := []string{
+		fmt.Sprintf("--remote-debugging-port=%d", port),
+		fmt.Sprintf("--user-data-dir=%s", dir),
+		"--no-first-run",
+		"--no-default-browser-check",
+	}
+	if cleanURL != "" {
+		args = append(args, "--", cleanURL)
+	}
+	return args, nil
 }
 
 func defaultDedicatedProfileDir() string {
@@ -307,29 +366,45 @@ func defaultDedicatedProfileDir() string {
 	return filepath.Join(os.TempDir(), "deskdrop-profile")
 }
 
+func isWindowsAbsRoot(root string) bool {
+	r := strings.TrimSpace(root)
+	if len(r) >= 3 && ((r[0] >= 'A' && r[0] <= 'Z') || (r[0] >= 'a' && r[0] <= 'z')) && r[1] == ':' && (r[2] == '\\' || r[2] == '/') {
+		return true
+	}
+	return strings.HasPrefix(r, `\\`)
+}
+
+func windowsBrowserCandidates(pf string, pfx86 string, local string, preferred string) []string {
+	var chromePaths []string
+	for _, root := range []string{pf, pfx86, local} {
+		if isWindowsAbsRoot(root) {
+			chromePaths = append(chromePaths, filepath.Join(root, "Google", "Chrome", "Application", "chrome.exe"))
+		}
+	}
+	var edgePaths []string
+	for _, root := range []string{pf, pfx86} {
+		if isWindowsAbsRoot(root) {
+			edgePaths = append(edgePaths, filepath.Join(root, "Microsoft", "Edge", "Application", "msedge.exe"))
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(preferred), "edge") {
+		return append(edgePaths, chromePaths...)
+	}
+	return append(chromePaths, edgePaths...)
+}
+
 func findBrowserBinary(preferred string) (string, error) {
 	pref := strings.ToLower(strings.TrimSpace(preferred))
 	var candidates []string
 
 	switch runtime.GOOS {
 	case "windows":
-		pf := os.Getenv("ProgramFiles")
-		pfx86 := os.Getenv("ProgramFiles(x86)")
-		local := os.Getenv("LOCALAPPDATA")
-		chromePaths := []string{
-			filepath.Join(pf, "Google", "Chrome", "Application", "chrome.exe"),
-			filepath.Join(pfx86, "Google", "Chrome", "Application", "chrome.exe"),
-			filepath.Join(local, "Google", "Chrome", "Application", "chrome.exe"),
-		}
-		edgePaths := []string{
-			filepath.Join(pf, "Microsoft", "Edge", "Application", "msedge.exe"),
-			filepath.Join(pfx86, "Microsoft", "Edge", "Application", "msedge.exe"),
-		}
-		if pref == "edge" {
-			candidates = append(edgePaths, chromePaths...)
-		} else {
-			candidates = append(chromePaths, edgePaths...)
-		}
+		candidates = windowsBrowserCandidates(
+			os.Getenv("ProgramFiles"),
+			os.Getenv("ProgramFiles(x86)"),
+			os.Getenv("LOCALAPPDATA"),
+			pref,
+		)
 	case "darwin":
 		chrome := "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 		edge := "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"

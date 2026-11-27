@@ -45,24 +45,15 @@ func DiscoverBrowserWSWithSource(ctx context.Context, cdpURL string, userDataDir
 	}
 
 	candidates := candidateUserDataDirs(userDataDir)
-	var firstFoundWS string
 	for _, dir := range candidates {
 		wsURL, err := readDevToolsActivePort(dir)
-		if err == nil && wsURL != "" {
-			if firstFoundWS == "" {
-				firstFoundWS = wsURL
-			}
-			if isWSReachable(wsURL) {
-				return wsURL, SourceActivePort, nil
-			}
+		if err == nil && wsURL != "" && isWSReachable(wsURL) {
+			return wsURL, SourceActivePort, nil
 		}
 	}
 
 	if wsURL, err := resolveHTTPVersionEndpoint(ctx, "http://127.0.0.1:9222"); err == nil && wsURL != "" {
 		return wsURL, SourceHTTP9222, nil
-	}
-	if firstFoundWS != "" {
-		return firstFoundWS, SourceActivePort, nil
 	}
 
 	return "", "", errors.New(
