@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -8,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tvaroska/deskdrop/internal/server"
 )
 
 func mapGetenv(vals map[string]string) func(string) string {
@@ -132,5 +137,42 @@ func TestBuildServerRuntimeValidationAndWiring(t *testing.T) {
 	rtFile.httpSrv.Handler.ServeHTTP(recW, recReq)
 	if recW.Code != http.StatusOK || !strings.Contains(recW.Body.String(), `"status-board"`) {
 		t.Fatalf("GET /desktop/v1/recipes = %d (%s), want 200 with status-board", recW.Code, recW.Body.String())
+	}
+}
+
+type failingCloseStore struct {
+	server.Store
+	closeErr error
+}
+
+func (f *failingCloseStore) Close() error {
+	return f.closeErr
+}
+
+func TestM813ShutdownServerRuntimeAndCloseJoinErrors(t *testing.T) {
+	rt, err := buildServerRuntime(mapGetenv(map[string]string{
+		"STORE_BACKEND":   "memory",
+		"STORAGE_BACKEND": "memory",
+		"HEALER_ENABLED":  "false",
+		"ADMIN_TOKEN":     "tok",
+	}), nil)
+	if err != nil {
+		t.Fatalf("buildServerRuntime failed: %v", err)
+	}
+	rt.store = &failingCloseStore{Store: rt.store, closeErr: errors.New("simulated store close failure")}
+
+	var logs []string
+	logFn := func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}
+	serr := shutdownServerRuntime(context.Background(), rt, logFn)
+	if serr == nil || !strings.Contains(serr.Error(), "simulated store close failure") {
+		t.Fatalf("shutdownServerRuntime err = %v, want simulated store close failure", serr)
+	}
+	if len(logs) == 0 || !strings.Contains(strings.Join(logs, "\n"), "WARN store close error") {
+		t.Fatalf("expected WARN store close error in logs, got %v", logs)
+	}
+	if cerr := rt.Close(); cerr == nil || !strings.Contains(cerr.Error(), "simulated store close failure") {
+		t.Fatalf("rt.Close() err = %v, want simulated store close failure", cerr)
 	}
 }

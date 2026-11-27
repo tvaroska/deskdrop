@@ -85,7 +85,8 @@ type FallbackApprover func(plan contract.FallbackPlan) (bool, error)
 
 func makeFallbackApprover(gate string) FallbackApprover {
 	if strings.EqualFold(strings.TrimSpace(gate), "tray") {
-		return confirmFallbackPlan
+		// Returning nil routes execFallbackTaskWithOptions into confirmFallbackPlanWithTimeout(parentCtx, promptTimeout, plan).
+		return nil
 	}
 	return func(_ contract.FallbackPlan) (bool, error) {
 		return true, nil
@@ -150,7 +151,9 @@ func drainQueueWithDispatcher(
 	wrapDriverExec func(fn func()),
 ) (int, error) {
 	ws := collectWorkerStatus(ctx, drv, cfg, hostLabel, false, "sync", "")
-	_ = svcClient.ReportWorkerStatus(ctx, ws)
+	if herr := svcClient.ReportWorkerStatus(ctx, ws); herr != nil {
+		fmt.Fprintf(os.Stderr, "WARN worker status report failed: %v\n", herr)
+	}
 
 	uiaAvail := strings.EqualFold(drv.Name(), "uia") && ws.BrowserConnected
 	if !strings.EqualFold(drv.Name(), "uia") {
@@ -271,9 +274,14 @@ func execExtractTaskWithWrap(
 			if errors.As(stepErr, &execErr) {
 				landedURL = execErr.Partial.URL
 				if cfg.ShouldSendErrorBundle() {
-					zipBytes, _ = driver.BuildDiagnosticZip(recipe.Name, execErr, cfg.ForbiddenTerms)
-					if len(zipBytes) > 0 && cfg.DebugDir != "" {
-						_, _ = driver.SaveDiagnosticZip(cfg.DebugDir, recipe.Topic, zipBytes)
+					var zerr error
+					zipBytes, zerr = driver.BuildDiagnosticZip(recipe.Name, execErr, cfg.ForbiddenTerms)
+					if zerr != nil {
+						fmt.Fprintf(os.Stderr, "WARN task %s diagnostic zip build failed: %v\n", task.ID, zerr)
+					} else if len(zipBytes) > 0 && cfg.DebugDir != "" {
+						if _, serr := driver.SaveDiagnosticZip(cfg.DebugDir, recipe.Topic, zipBytes); serr != nil {
+							fmt.Fprintf(os.Stderr, "WARN task %s diagnostic zip save failed: %v\n", task.ID, serr)
+						}
 					}
 				}
 			}

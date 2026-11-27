@@ -824,3 +824,130 @@ func TestM63TrayCoordinatorNonBlockingFallbackKeepsTickersAndActionsResponsive(t
 		t.Fatal("workerLoop hung on stopCh close")
 	}
 }
+
+type failingStepDriver struct {
+	fakeDriver
+	stepErr error
+}
+
+func (d *failingStepDriver) ExecuteStep(_ context.Context, _ contract.Step) (contract.StepResult, error) {
+	return contract.StepResult{}, d.stepErr
+}
+
+func TestM813CLIWarningSurfaceOnDroppedErrors(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	captureStderr := func(fn func()) string {
+		orig := os.Stderr
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.Stderr = w
+		done := make(chan string, 1)
+		go func() {
+			var b strings.Builder
+			buf := make([]byte, 1024)
+			for {
+				n, rerr := r.Read(buf)
+				if n > 0 {
+					b.Write(buf[:n])
+				}
+				if rerr != nil {
+					break
+				}
+			}
+			done <- b.String()
+		}()
+		fn()
+		_ = w.Close()
+		os.Stderr = orig
+		out := <-done
+		_ = r.Close()
+		return out
+	}
+
+	// 1. cmdStatus logs WARN when ReportWorkerStatus fails.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/workers/heartbeat" {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"server_version":"v1.5.0"}`))
+	}))
+	defer srv.Close()
+
+	cfgPath := filepath.Join(t.TempDir(), "cfg.json")
+	_ = os.WriteFile(cfgPath, []byte(`{"service_url":"`+srv.URL+`","service_token":"tok","driver":"uia"}`), 0o600)
+	stderr1 := captureStderr(func() {
+		_ = cmdStatus([]string{"--config", cfgPath, "--driver", "uia"})
+	})
+	if !strings.Contains(stderr1, "WARN status heartbeat failed") {
+		t.Fatalf("expected heartbeat warning on stderr, got:\n%s", stderr1)
+	}
+
+	// 2. executeRecipeAndDeliver logs WARN on BuildDiagnosticZip air-gap block and SaveDiagnosticZip ENOTDIR error.
+	origMake := makeTargetDriver
+	defer func() { makeTargetDriver = origMake }()
+
+	rcp := contract.Recipe{
+		Name:  "diag-warn",
+		Topic: "ops",
+		Steps: []contract.Step{{ID: "s1", URL: "https://example.com"}},
+	}
+
+	makeTargetDriver = func(_ string, _ *cdp.SessionPool, _ contract.Config) driver.TargetDriver {
+		return &failingStepDriver{
+			stepErr: &driver.StepExecError{
+				StepID:  "s1",
+				Err:     errors.New("drift"),
+				DOMHTML: "<html><body>blocked-secret-term</body></html>",
+			},
+		}
+	}
+	stderr2 := captureStderr(func() {
+		_ = executeRecipeAndDeliver(rcp, "cdp", contract.Config{
+			ForbiddenTerms: []string{"blocked-secret-term"},
+		}, "", true)
+	})
+	if !strings.Contains(stderr2, "WARN failed building diagnostic bundle") {
+		t.Fatalf("expected diagnostic build warning on stderr, got:\n%s", stderr2)
+	}
+
+	// Use a regular file as DebugDir parent so SaveDiagnosticZip fails deterministically even as uid=0 in CI.
+	notADir := filepath.Join(t.TempDir(), "regular-file")
+	_ = os.WriteFile(notADir, []byte("x"), 0o600)
+	makeTargetDriver = func(_ string, _ *cdp.SessionPool, _ contract.Config) driver.TargetDriver {
+		return &failingStepDriver{
+			stepErr: &driver.StepExecError{
+				StepID:  "s1",
+				Err:     errors.New("drift"),
+				DOMHTML: "<html><body>clean</body></html>",
+			},
+		}
+	}
+	stderr3 := captureStderr(func() {
+		_ = executeRecipeAndDeliver(rcp, "cdp", contract.Config{
+			DebugDir: filepath.Join(notADir, "nested"),
+		}, "", true)
+	})
+	if !strings.Contains(stderr3, "WARN failed saving diagnostic bundle") {
+		t.Fatalf("expected diagnostic save warning on stderr, got:\n%s", stderr3)
+	}
+
+	// 3. SendErrorWithContext failure during non-dry-run escalation logs WARN to stderr.
+	errRelay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "relay down", http.StatusBadRequest)
+	}))
+	defer errRelay.Close()
+	stderr4 := captureStderr(func() {
+		_ = executeRecipeAndDeliver(rcp, "cdp", contract.Config{
+			From:         "win-pc",
+			ServiceURL:   errRelay.URL,
+			ServiceToken: "tok",
+			DebugDir:     t.TempDir(),
+		}, "ops-agent", false)
+	})
+	if !strings.Contains(stderr4, "WARN failed escalating error bundle") {
+		t.Fatalf("expected error bundle escalation warning on stderr, got:\n%s", stderr4)
+	}
+}

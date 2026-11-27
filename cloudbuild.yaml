@@ -14,8 +14,11 @@ steps:
         go vet ./...
         GOOS=windows GOARCH=amd64 go vet ./cmd/deskdrop ./internal/driver/...
         go test -race -count=1 ./...
-        mkdir -p dist/latest
+        mkdir -p dist/latest dist/e2e-bins
         go test -c -o dist/cdp.test ./internal/driver/cdp
+        go test -c -o dist/root.test .
+        go build -o dist/e2e-bins/deskdrop ./cmd/deskdrop
+        go build -o dist/e2e-bins/deskdrop-server ./cmd/server
         CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=$${VERSION_STR}" -o dist/latest/deskdrop ./cmd/deskdrop
         CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=$${VERSION_STR}" -o dist/latest/deskdrop.exe ./cmd/deskdrop
         cp deskdrop.example.json dist/latest/deskdrop.example.json
@@ -31,8 +34,9 @@ steps:
       - "-c"
       - |
         set -euo pipefail
-        trap 'rm -f dist/cdp.test' EXIT
-        (cd internal/driver/cdp && DESKDROP_REQUIRE_NODE=1 ../../../dist/cdp.test -test.v -test.run 'TestJSEval|TestT2JSRuntime')
+        trap 'rm -rf dist/cdp.test dist/root.test dist/e2e-bins' EXIT
+        (cd internal/driver/cdp && DESKDROP_REQUIRE_NODE=1 ../../../dist/cdp.test -test.v -test.run 'TestJSEval|TestT2JSRuntime|TestM8')
+        DESKDROP_REQUIRE_NODE=1 DESKDROP_PREBUILT_BIN_DIR="$$PWD/dist/e2e-bins" ./dist/root.test -test.v -test.run TestE2ECompiledCLIToRelayLoopback
         npm install -g --no-audit --no-fund @ast-grep/cli@0.51.1
         ast-grep scan --rule specs/ast.rules.yaml
 

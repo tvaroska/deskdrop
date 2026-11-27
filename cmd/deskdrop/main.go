@@ -464,7 +464,9 @@ func cmdStatus(args []string) error {
 	if strings.TrimSpace(cfg.ServiceURL) != "" && strings.TrimSpace(cfg.ServiceToken) != "" {
 		svcClient := bus.NewDesktopClient(cfg)
 		svcClient.ClientVersion = version
-		_ = svcClient.ReportWorkerStatus(ctx, ws)
+		if herr := svcClient.ReportWorkerStatus(ctx, ws); herr != nil {
+			fmt.Fprintf(os.Stderr, "WARN status heartbeat failed: %v\n", herr)
+		}
 		remote, rerr := svcClient.GetDesktopStatus(ctx)
 		if rerr != nil {
 			fmt.Printf("Relay Backend:     ERROR: %v\n", rerr)
@@ -528,8 +530,12 @@ func executeRecipeAndDeliver(recipe contract.Recipe, driverName string, cfg cont
 			var execErr *driver.StepExecError
 			if errors.As(stepErr, &execErr) {
 				zipBytes, zerr := driver.BuildDiagnosticZip(recipe.Name, execErr, cfg.ForbiddenTerms)
-				if zerr == nil {
-					if savedPath, serr := driver.SaveDiagnosticZip(cfg.DebugDir, recipe.Topic, zipBytes); serr == nil {
+				if zerr != nil {
+					fmt.Fprintf(os.Stderr, "WARN failed building diagnostic bundle: %v\n", zerr)
+				} else {
+					if savedPath, serr := driver.SaveDiagnosticZip(cfg.DebugDir, recipe.Topic, zipBytes); serr != nil {
+						fmt.Fprintf(os.Stderr, "WARN failed saving diagnostic bundle: %v\n", serr)
+					} else {
 						fmt.Fprintf(os.Stderr, "Saved diagnostic bundle: %s\n", savedPath)
 					}
 					if !dryRun && cfg.ShouldSendErrorBundle() && transport.ValidateAuth() == nil {
@@ -543,7 +549,9 @@ func executeRecipeAndDeliver(recipe contract.Recipe, driverName string, cfg cont
 							Domain:    contract.InferRecipeDomain(recipe),
 							Error:     execErr.Error(),
 						}
-						if sent, berr := transport.SendErrorWithContext(ctx, to, meta, zipBytes); berr == nil {
+						if sent, berr := transport.SendErrorWithContext(ctx, to, meta, zipBytes); berr != nil {
+							fmt.Fprintf(os.Stderr, "WARN failed escalating error bundle: %v\n", berr)
+						} else {
 							fmt.Fprintf(os.Stderr, "Escalated error bundle (%s, ref=%s)\n", sent.ShortID, sent.Attachment)
 						}
 					}
@@ -655,7 +663,9 @@ func loadConfig(explicitPath string) (contract.Config, error) {
 			return cfg, fmt.Errorf("failed parsing config %s: %w", p, perr)
 		}
 		if hadDup {
-			_ = saveConfigChromeSession(p, cfg.PreferredChromeSession())
+			if serr := saveConfigChromeSession(p, cfg.PreferredChromeSession()); serr != nil {
+				fmt.Fprintf(os.Stderr, "WARN failed saving deduplicated config %s: %v\n", p, serr)
+			}
 		}
 		break
 	}

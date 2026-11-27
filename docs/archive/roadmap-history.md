@@ -4,6 +4,13 @@ Archived shipped milestones moved out of [`../roadmap.md`](../roadmap.md).
 
 ---
 
+## v1.5.0 M6.4 and M7.3 Live Tier-2 Healing and Scroll Recipe Verification
+
+*Archived from [`../roadmap.md`](../roadmap.md) on 2026-11-27 (verified live on 2026-11-26).*
+
+- [x] **M6.4 (P1, 0.1d) — Verify live Chrome Tier-2 drift healing on `v1.5.0`:** Connected Chrome in the `v1.5.0` Windows tray (`fallback_gate=tray`) and verified fast `/v1/tasks/{id}/fail` return (`healing_queued: true`) and non-blocking Tier-2 confirmation handling (`2026-11-26`).
+- [x] **M7.3 (P2, 0.25d) — Publish `mode: "scroll"` recipe to `RECIPES_URI` & verify live feed diff:** Published a `mode: "scroll"` virtualized-feed recipe (`scroll_delta_y: 1400`, `max_pages: 6`, `limit: 10`) to `RECIPES_URI` (`10` approved recipes) and verified live Windows `v1.5.0` scroll extraction and `/v1/drops/{id}/diff` end-to-end (`2026-11-26`).
+
 ## v1.5.0 M6.1-M6.3 Async Healer & Tray Fallback and M7.1-M7.2 Scroll Pagination & Drop Diffing
 
 *Archived from [`../roadmap.md`](../roadmap.md) on 2026-11-26.*

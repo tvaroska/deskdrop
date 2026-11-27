@@ -108,3 +108,32 @@ func TestScheduleCLIRegInstallStatusUninstallAndRejectsRetiredFlags(t *testing.T
 		t.Fatal("expected retired --hide-console flag on sync to fail")
 	}
 }
+
+func TestM811TrailingBackslashEscapingInRegRunAndPreview(t *testing.T) {
+	args, err := BuildRegAddRunArgs(LogonSpec{
+		Name:         "DeskDrop",
+		ExePath:      `C:\Program Files\DeskDrop\deskdrop.exe`,
+		ConfigPath:   `C:\Users\Alice Smith\DeskDrop\`,
+		CDPURL:       "http://127.0.0.1:9222",
+		FallbackGate: "tray",
+	})
+	if err != nil {
+		t.Fatalf("BuildRegAddRunArgs failed: %v", err)
+	}
+	cmdData := args[7]
+	// Trailing '\' inside quoted --config must be doubled so '\"' never swallows '--cdp'.
+	wantCfg := `--config "C:\Users\Alice Smith\DeskDrop\\"`
+	if !strings.Contains(cmdData, wantCfg) {
+		t.Fatalf("expected doubled trailing backslash %q in REG_SZ command:\n%s", wantCfg, cmdData)
+	}
+
+	escaped := escapeWindowsCLIArg(`C:\My Path\sub\"end\`)
+	if escaped != `"C:\My Path\sub\\\"end\\"` {
+		t.Fatalf("escapeWindowsCLIArg = %s, want %s", escaped, `"C:\My Path\sub\\\"end\\"`)
+	}
+
+	preview := FormatRegCommand(args)
+	if !strings.Contains(preview, `\"C:\Users\Alice Smith\DeskDrop\\\\\"`) {
+		t.Fatalf("FormatRegCommand failed to CommandLineToArgvW-escape quoted REG_SZ payload:\n%s", preview)
+	}
+}

@@ -232,12 +232,12 @@ func BuildRegAddRunArgs(spec LogonSpec) ([]string, error) {
 
 	// Always quote executable path in the HKCU Run REG_SZ command line so paths with spaces
 	// cannot trigger Windows CreateProcessW unquoted-path ambiguity at user logon.
-	runTokens := []string{`"` + exe + `"`, "tray", "--fallback-gate", gate}
+	runTokens := []string{quoteWindowsCmdArg(exe, true), "tray", "--fallback-gate", gate}
 	if cfg := strings.TrimSpace(spec.ConfigPath); cfg != "" {
-		runTokens = append(runTokens, "--config", quoteIfSpaces(cfg))
+		runTokens = append(runTokens, "--config", quoteWindowsCmdArg(cfg, false))
 	}
 	if cdp := strings.TrimSpace(spec.CDPURL); cdp != "" {
-		runTokens = append(runTokens, "--cdp", quoteIfSpaces(cdp))
+		runTokens = append(runTokens, "--cdp", quoteWindowsCmdArg(cdp, false))
 	}
 
 	cmdValue := strings.Join(runTokens, " ")
@@ -262,14 +262,14 @@ func BuildRegQueryRunArgs(rawName string) ([]string, error) {
 	return []string{"query", RunRegistryKey, "/v", name}, nil
 }
 
-// FormatRegCommand formats a preview reg.exe command line for --dry-run output.
+// FormatRegCommand formats a preview reg.exe command line for --dry-run output
+// using CommandLineToArgvW backslash-and-quote escaping rules.
 func FormatRegCommand(args []string) string {
 	parts := make([]string, 0, len(args)+1)
 	parts = append(parts, "reg.exe")
 	for _, a := range args {
-		if strings.ContainsAny(a, " \t\"") {
-			escaped := strings.ReplaceAll(a, `"`, `\"`)
-			parts = append(parts, `"`+escaped+`"`)
+		if a == "" || strings.ContainsAny(a, " \t\"") {
+			parts = append(parts, escapeWindowsCLIArg(a))
 		} else {
 			parts = append(parts, a)
 		}
@@ -295,11 +295,46 @@ func rejectUnsafeRunArg(flagName string, val string) error {
 	return nil
 }
 
-func quoteIfSpaces(val string) string {
-	if strings.ContainsAny(val, " \t") {
-		return `"` + val + `"`
+// quoteWindowsCmdArg wraps val in double quotes (when forceQuote or whitespace is present)
+// and doubles trailing backslashes so a trailing '\' never escapes the closing '"' under CommandLineToArgvW.
+func quoteWindowsCmdArg(val string, forceQuote bool) string {
+	if !forceQuote && val != "" && !strings.ContainsAny(val, " \t") {
+		return val
 	}
-	return val
+	trailingSlashes := 0
+	for i := len(val) - 1; i >= 0 && val[i] == '\\'; i-- {
+		trailingSlashes++
+	}
+	return `"` + val + strings.Repeat(`\`, trailingSlashes) + `"`
+}
+
+func escapeWindowsCLIArg(val string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	slashes := 0
+	for i := 0; i < len(val); i++ {
+		c := val[i]
+		if c == '\\' {
+			slashes++
+			continue
+		}
+		if c == '"' {
+			b.WriteString(strings.Repeat(`\`, slashes*2+1))
+			b.WriteByte('"')
+			slashes = 0
+			continue
+		}
+		if slashes > 0 {
+			b.WriteString(strings.Repeat(`\`, slashes))
+			slashes = 0
+		}
+		b.WriteByte(c)
+	}
+	if slashes > 0 {
+		b.WriteString(strings.Repeat(`\`, slashes*2))
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 func isWindowsAbsPath(p string) bool {

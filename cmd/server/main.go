@@ -33,13 +33,18 @@ type serverRuntime struct {
 }
 
 func (rt *serverRuntime) Close() error {
+	var errs []error
 	if rt.svc != nil {
-		_ = rt.svc.Close()
+		if err := rt.svc.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("service close: %w", err))
+		}
 	}
 	if rt.store != nil {
-		return rt.store.Close()
+		if err := rt.store.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("store close: %w", err))
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func buildServerRuntime(getenv func(string) string, loadLocalTerms func() []string) (*serverRuntime, error) {
@@ -180,12 +185,40 @@ func parseWriteTimeout(raw string) time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
+func shutdownServerRuntime(ctx context.Context, rt *serverRuntime, logf func(string, ...any)) error {
+	if rt == nil {
+		return nil
+	}
+	if logf == nil {
+		logf = log.Printf
+	}
+	var errs []error
+	if rt.httpSrv != nil {
+		if err := rt.httpSrv.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logf("WARN http server shutdown error: %v", err)
+			errs = append(errs, fmt.Errorf("http shutdown: %w", err))
+		}
+	}
+	if rt.svc != nil {
+		if err := rt.svc.Shutdown(ctx); err != nil {
+			logf("WARN service shutdown error: %v", err)
+			errs = append(errs, fmt.Errorf("service shutdown: %w", err))
+		}
+	}
+	if rt.store != nil {
+		if err := rt.store.Close(); err != nil {
+			logf("WARN store close error: %v", err)
+			errs = append(errs, fmt.Errorf("store close: %w", err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func main() {
 	rt, err := buildServerRuntime(os.Getenv, contract.LoadLocalGuardTerms)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer rt.store.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -201,8 +234,5 @@ func main() {
 	<-ctx.Done()
 	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	_ = rt.httpSrv.Shutdown(shutCtx)
-	if rt.svc != nil {
-		_ = rt.svc.Shutdown(shutCtx)
-	}
+	_ = shutdownServerRuntime(shutCtx, rt, log.Printf)
 }

@@ -1,6 +1,7 @@
 package main_test
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"context"
@@ -18,8 +19,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/net/html"
 
 	"github.com/tvaroska/deskdrop/internal/contract"
 	"github.com/tvaroska/deskdrop/internal/verify"
@@ -30,19 +34,23 @@ const e2ePNG1x1Base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR
 // mockCDPServer speaks /json/version and RFC 6455 CDP JSON-RPC over loopback so the compiled
 // deskdrop binary can run full end-to-end extraction and drift diagnostics without Chrome.
 type mockCDPServer struct {
-	mu     sync.Mutex
-	html   string
-	url    string
-	step   contract.Step
-	server *httptest.Server
+	mu         sync.Mutex
+	html       string
+	url        string
+	step       contract.Step
+	nodeBin    string
+	usedNodeJS atomic.Bool
+	server     *httptest.Server
 }
 
 func startMockCDPServer(t *testing.T, step contract.Step, targetURL string, initialHTML string) *mockCDPServer {
 	t.Helper()
+	nodeBin, _ := exec.LookPath("node")
 	m := &mockCDPServer{
-		html: initialHTML,
-		url:  targetURL,
-		step: step,
+		html:    initialHTML,
+		url:     targetURL,
+		step:    step,
+		nodeBin: nodeBin,
 	}
 	m.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -150,9 +158,30 @@ func (m *mockCDPServer) handleCDPMethod(method string, rawParams json.RawMessage
 		switch {
 		case strings.Contains(expr, "document.readyState"):
 			return map[string]any{"result": map[string]any{"value": "complete"}}
-		case strings.Contains(expr, "cloneNode(true)"):
+		case strings.Contains(expr, "cloneNode(true)") || strings.Contains(expr, "cloneClean"):
+			if m.nodeBin != "" {
+				val, err := evalExprInNodeDOM(m.nodeBin, html, targetURL, expr)
+				if err != nil {
+					return map[string]any{"exceptionDetails": map[string]any{"text": err.Error()}}
+				}
+				return map[string]any{"result": map[string]any{"value": val}}
+			}
+			if os.Getenv("DESKDROP_REQUIRE_NODE") == "1" {
+				return map[string]any{"exceptionDetails": map[string]any{"text": "node required by DESKDROP_REQUIRE_NODE=1"}}
+			}
 			return map[string]any{"result": map[string]any{"value": contract.ScrubHTML(html)}}
 		case strings.Contains(expr, "evalFieldRule"):
+			if m.nodeBin != "" {
+				val, err := evalExprInNodeDOM(m.nodeBin, html, targetURL, expr)
+				if err != nil {
+					return map[string]any{"exceptionDetails": map[string]any{"text": err.Error()}}
+				}
+				m.usedNodeJS.Store(true)
+				return map[string]any{"result": map[string]any{"value": val}}
+			}
+			if os.Getenv("DESKDROP_REQUIRE_NODE") == "1" {
+				return map[string]any{"exceptionDetails": map[string]any{"text": "node required by DESKDROP_REQUIRE_NODE=1"}}
+			}
 			extracted, _ := verify.ExtractStepFromHTML(step, html, targetURL)
 			return map[string]any{"result": map[string]any{"value": extracted}}
 		case strings.Contains(expr, "location.href"):
@@ -163,6 +192,365 @@ func (m *mockCDPServer) handleCDPMethod(method string, rawParams json.RawMessage
 	default:
 		return map[string]any{}
 	}
+}
+
+type e2eDOMAttr struct {
+	K string `json:"k"`
+	V string `json:"v"`
+}
+
+type e2eDOMNode struct {
+	Type     int          `json:"t"`
+	Tag      string       `json:"g,omitempty"`
+	Text     string       `json:"v,omitempty"`
+	Attrs    []e2eDOMAttr `json:"a,omitempty"`
+	Children []e2eDOMNode `json:"c,omitempty"`
+}
+
+func serializeHTMLForNode(rawHTML string) (e2eDOMNode, error) {
+	doc, err := html.Parse(strings.NewReader(rawHTML))
+	if err != nil {
+		return e2eDOMNode{}, err
+	}
+	var conv func(*html.Node) (e2eDOMNode, bool)
+	conv = func(n *html.Node) (e2eDOMNode, bool) {
+		switch n.Type {
+		case html.DocumentNode:
+			out := e2eDOMNode{Type: 9}
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				if ch, ok := conv(c); ok {
+					out.Children = append(out.Children, ch)
+				}
+			}
+			return out, true
+		case html.ElementNode:
+			out := e2eDOMNode{Type: 1, Tag: strings.ToUpper(n.Data)}
+			for _, a := range n.Attr {
+				out.Attrs = append(out.Attrs, e2eDOMAttr{K: a.Key, V: a.Val})
+			}
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				if ch, ok := conv(c); ok {
+					out.Children = append(out.Children, ch)
+				}
+			}
+			return out, true
+		case html.TextNode:
+			return e2eDOMNode{Type: 3, Text: n.Data}, true
+		default:
+			return e2eDOMNode{}, false
+		}
+	}
+	root, _ := conv(doc)
+	return root, nil
+}
+
+const e2eNodeDOMShimJS = `
+class TextNode {
+	constructor(val) { this.nodeType = 3; this.nodeValue = val || ""; this.parentElement = null; }
+	get textContent() { return this.nodeValue; }
+	get outerHTML() {
+		return this.nodeValue.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+	}
+}
+class ShadowFrag {
+	constructor(host, kids) {
+		this.nodeType = 11;
+		this.host = host;
+		this.childNodes = [];
+		this.children = [];
+		for (const k of kids) this.appendChild(k);
+	}
+	appendChild(ch) {
+		this.childNodes.push(ch);
+		if (ch.nodeType === 1) { ch.parentElement = null; this.children.push(ch); }
+	}
+	querySelectorAll(sel) { return queryDesc(this, sel); }
+}
+class Elem {
+	constructor(tag, attrs = []) {
+		this.nodeType = 1;
+		this.tagName = String(tag || "").toUpperCase();
+		this._attrs = [];
+		for (const { k, v } of attrs) this._attrs.push({ name: k, value: String(v) });
+		this.childNodes = [];
+		this.children = [];
+		this.parentElement = null;
+		this.shadowRoot = null;
+	}
+	get hidden() { return this.hasAttribute("hidden"); }
+	get disabled() { return this.hasAttribute("disabled"); }
+	get attributes() { return this._attrs.map(a => ({ name: a.name, value: a.value })); }
+	getAttribute(k) {
+		const kl = String(k).toLowerCase();
+		const hit = this._attrs.find(a => a.name.toLowerCase() === kl);
+		return hit ? hit.value : null;
+	}
+	hasAttribute(k) { return this.getAttribute(k) !== null; }
+	setAttribute(k, v) {
+		const kl = String(k).toLowerCase();
+		const hit = this._attrs.find(a => a.name.toLowerCase() === kl);
+		if (hit) hit.value = String(v);
+		else this._attrs.push({ name: k, value: String(v) });
+	}
+	appendChild(ch) {
+		this.childNodes.push(ch);
+		if (ch.nodeType === 1) { ch.parentElement = this; this.children.push(ch); }
+		return ch;
+	}
+	get textContent() { return this.childNodes.map(c => c.textContent || "").join(""); }
+	get innerText() { return this.textContent; }
+	get outerHTML() {
+		const tag = this.tagName.toLowerCase();
+		const aStr = this._attrs.map(a => ' ' + a.name + '="' + a.value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;") + '"').join("");
+		const voidTags = new Set(["area","base","br","col","embed","hr","img","input","link","meta","param","source","track","wbr"]);
+		if (voidTags.has(tag)) return "<" + tag + aStr + ">";
+		return "<" + tag + aStr + ">" + this.childNodes.map(c => c.outerHTML || "").join("") + "</" + tag + ">";
+	}
+	querySelectorAll(sel) { return queryDesc(this, sel); }
+	closest(sel) {
+		let cur = this;
+		while (cur && cur.nodeType === 1) {
+			if (matchSelectorList(cur, sel)) return cur;
+			cur = cur.parentElement;
+		}
+		return null;
+	}
+}
+function splitTop(str, sep) {
+	const out = [];
+	let start = 0, inB = false, inP = 0, inQ = "";
+	for (let i = 0; i < str.length; i++) {
+		const c = str[i];
+		if (inQ) { if (c === "\\" && i + 1 < str.length) { i++; continue; } if (c === inQ) inQ = ""; continue; }
+		if (c === "'" || c === "\"") inQ = c;
+		else if (c === "[") inB = true;
+		else if (c === "]") inB = false;
+		else if (c === "(") inP++;
+		else if (c === ")" && inP > 0) inP--;
+		else if (c === sep && !inB && inP === 0) { out.push(str.slice(start, i).trim()); start = i + 1; }
+	}
+	out.push(str.slice(start).trim());
+	return out.filter(Boolean);
+}
+function tokenizeComplex(raw) {
+	const s = raw.trim();
+	const parts = [];
+	let comb = " ", explicit = false, i = 0;
+	while (i < s.length) {
+		while (i < s.length && /\s/.test(s[i])) i++;
+		if (i >= s.length) break;
+		if (s[i] === ">" || s[i] === "+" || s[i] === "~") {
+			comb = s[i]; explicit = true; i++; continue;
+		}
+		const start = i;
+		let inB = false, inP = 0, inQ = "";
+		while (i < s.length) {
+			const c = s[i];
+			if (inQ) { if (c === "\\" && i + 1 < s.length) { i += 2; continue; } if (c === inQ) inQ = ""; i++; continue; }
+			if (c === "'" || c === "\"") inQ = c;
+			else if (c === "[") inB = true;
+			else if (c === "]") inB = false;
+			else if (c === "(") inP++;
+			else if (c === ")" && inP > 0) inP--;
+			else if (!inB && inP === 0 && (/\s/.test(c) || c === ">" || c === "+" || c === "~")) break;
+			i++;
+		}
+		parts.push({ comb: parts.length === 0 ? "" : (explicit ? comb : " "), tok: s.slice(start, i).trim() });
+		comb = " "; explicit = false;
+	}
+	return parts;
+}
+function elemIndex(el) {
+	if (!el.parentElement) return 0;
+	return el.parentElement.children.indexOf(el) + 1;
+}
+function matchSimple(el, tok) {
+	if (!el || el.nodeType !== 1 || !tok) return false;
+	let i = 0;
+	if (tok[0] === "*") i = 1;
+	else if (/[a-zA-Z0-9_-]/.test(tok[0])) {
+		while (i < tok.length && /[a-zA-Z0-9_-]/.test(tok[i])) i++;
+		if (el.tagName !== tok.slice(0, i).toUpperCase()) return false;
+	}
+	while (i < tok.length) {
+		const c = tok[i];
+		if (c === "#") {
+			i++; const st = i;
+			while (i < tok.length && /[a-zA-Z0-9_-]/.test(tok[i])) i++;
+			if ((el.getAttribute("id") || "") !== tok.slice(st, i)) return false;
+		} else if (c === ".") {
+			i++; const st = i;
+			while (i < tok.length && /[a-zA-Z0-9_-]/.test(tok[i])) i++;
+			const classes = (el.getAttribute("class") || "").trim().split(/\s+/).filter(Boolean);
+			if (!classes.includes(tok.slice(st, i))) return false;
+		} else if (c === "[") {
+			i++; const st = i; let inQ = "";
+			while (i < tok.length) {
+				if (inQ) { if (tok[i] === inQ) inQ = ""; i++; continue; }
+				if (tok[i] === "'" || tok[i] === "\"") inQ = tok[i];
+				else if (tok[i] === "]") break;
+				i++;
+			}
+			const expr = tok.slice(st, i).trim(); i++;
+			const m = expr.match(/^([a-zA-Z0-9_:-]+)\s*(?:([*^$]?=)\s*(.*))?$/);
+			if (!m) return false;
+			const [, attrName, op, rhsRaw] = m;
+			if (!el.hasAttribute(attrName)) return false;
+			if (op) {
+				let rhs = (rhsRaw || "").trim(), ci = false;
+				if ((rhs.startsWith("\"") || rhs.startsWith("'"))) {
+					const q = rhs[0], end = rhs.indexOf(q, 1);
+					const rest = end >= 0 ? rhs.slice(end + 1).trim() : "";
+					rhs = end >= 0 ? rhs.slice(1, end) : rhs.slice(1);
+					ci = rest.toLowerCase() === "i";
+				} else if (/\s+i$/i.test(rhs)) {
+					rhs = rhs.replace(/\s+i$/i, "").trim(); ci = true;
+				}
+				let got = el.getAttribute(attrName) || "";
+				if (ci) { got = got.toLowerCase(); rhs = rhs.toLowerCase(); }
+				if (op === "=" && got !== rhs) return false;
+				if (op === "*=" && !got.includes(rhs)) return false;
+				if (op === "^=" && !got.startsWith(rhs)) return false;
+				if (op === "$=" && !got.endsWith(rhs)) return false;
+			}
+		} else if (c === ":") {
+			i++; const st = i; let inP = 0, inQ = "";
+			while (i < tok.length) {
+				if (inQ) { if (tok[i] === inQ) inQ = ""; i++; continue; }
+				if (tok[i] === "'" || tok[i] === "\"") inQ = tok[i];
+				else if (tok[i] === "(") inP++;
+				else if (tok[i] === ")" && inP > 0) inP--;
+				else if (inP === 0 && (tok[i] === "." || tok[i] === "#" || tok[i] === "[" || tok[i] === ":")) break;
+				i++;
+			}
+			const ps = tok.slice(st, i);
+			const psl = ps.toLowerCase();
+			if (psl === "first-child") { if (elemIndex(el) !== 1) return false; }
+			else if (psl === "last-child") { if (!el.parentElement || el.parentElement.children[el.parentElement.children.length - 1] !== el) return false; }
+			else if (psl.startsWith("nth-child(") && psl.endsWith(")")) {
+				const n = parseInt(psl.slice(10, -1).trim(), 10);
+				if (elemIndex(el) !== n) return false;
+			} else if (psl.startsWith("not(") && ps.endsWith(")")) {
+				if (matchSelectorList(el, ps.slice(4, -1))) return false;
+			} else return false;
+		} else return false;
+	}
+	return true;
+}
+function matchChain(el, parts, idx) {
+	if (!el || el.nodeType !== 1 || !matchSimple(el, parts[idx].tok)) return false;
+	if (idx === 0) return true;
+	const comb = parts[idx].comb;
+	const p = el.parentElement;
+	if (comb === ">") return !!p && matchChain(p, parts, idx - 1);
+	if (comb === "+") {
+		if (!p) return false;
+		const pos = p.children.indexOf(el);
+		return pos > 0 && matchChain(p.children[pos - 1], parts, idx - 1);
+	}
+	if (comb === "~") {
+		if (!p) return false;
+		const pos = p.children.indexOf(el);
+		for (let k = pos - 1; k >= 0; k--) if (matchChain(p.children[k], parts, idx - 1)) return true;
+		return false;
+	}
+	let anc = p;
+	while (anc) { if (matchChain(anc, parts, idx - 1)) return true; anc = anc.parentElement; }
+	return false;
+}
+function matchSelectorList(el, rawSel) {
+	for (const g of splitTop(String(rawSel || ""), ",")) {
+		const parts = tokenizeComplex(g);
+		if (parts.length > 0 && matchChain(el, parts, parts.length - 1)) return true;
+	}
+	return false;
+}
+function queryDesc(root, sel) {
+	const out = [];
+	const walk = (n) => {
+		for (const ch of (n.children || [])) {
+			if (matchSelectorList(ch, sel)) out.push(ch);
+			walk(ch);
+		}
+	};
+	walk(root);
+	return out;
+}
+function buildTree(raw) {
+	if (raw.t === 3) return new TextNode(raw.v);
+	const el = new Elem(raw.g, raw.a || []);
+	const shadowWrapKids = [];
+	for (const c of (raw.c || [])) {
+		if (c.t === 1 && (c.a || []).some(a => a.k.toLowerCase() === "data-shadowroot" && a.v === "open")) {
+			for (const sc of (c.c || [])) shadowWrapKids.push(buildTree(sc));
+			continue;
+		}
+		el.appendChild(buildTree(c));
+	}
+	if (shadowWrapKids.length > 0) el.shadowRoot = new ShadowFrag(el, shadowWrapKids);
+	return el;
+}
+function findFirstTag(n, tag) {
+	if (n.nodeType === 1 && n.tagName === tag) return n;
+	for (const c of (n.children || [])) { const hit = findFirstTag(c, tag); if (hit) return hit; }
+	return null;
+}
+const rootDocChildren = (__DOM_JSON__.c || []).map(buildTree);
+const htmlRoot = rootDocChildren.find(n => n.nodeType === 1 && n.tagName === "HTML") || new Elem("HTML");
+const bodyEl = findFirstTag(htmlRoot, "BODY") || htmlRoot;
+const titleEl = findFirstTag(htmlRoot, "TITLE");
+global.location = { href: __PAGE_URL__ };
+global.window = {
+	location: global.location,
+	getComputedStyle(el) {
+		const st = (el && el.getAttribute && el.getAttribute("style")) || "";
+		return {
+			display: /display\s*:\s*none/i.test(st) ? "none" : "block",
+			visibility: /visibility\s*:\s*hidden/i.test(st) ? "hidden" : "visible",
+			opacity: /opacity\s*:\s*0(?:\b|;|$)/i.test(st) ? "0" : "1",
+		};
+	}
+};
+global.document = {
+	nodeType: 9,
+	title: titleEl ? titleEl.textContent.trim() : "",
+	documentElement: htmlRoot,
+	body: bodyEl,
+	children: [htmlRoot],
+	childNodes: [htmlRoot],
+	createElement: (tag) => new Elem(tag),
+	createTextNode: (v) => new TextNode(v),
+	querySelectorAll: (sel) => htmlRoot.querySelectorAll(sel),
+};
+`
+
+func evalExprInNodeDOM(nodeBin string, rawHTML string, pageURL string, expr string) (any, error) {
+	domTree, err := serializeHTMLForNode(rawHTML)
+	if err != nil {
+		return nil, err
+	}
+	domBytes, _ := json.Marshal(domTree)
+	urlBytes, _ := json.Marshal(pageURL)
+	script := fmt.Sprintf(
+		"const __DOM_JSON__ = %s;\nconst __PAGE_URL__ = %s;\n%s\nconst __OUT__ = (%s);\nprocess.stdout.write(JSON.stringify({ value: __OUT__ }));\n",
+		string(domBytes),
+		string(urlBytes),
+		e2eNodeDOMShimJS,
+		expr,
+	)
+	cmd := exec.Command(nodeBin, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, runErr := cmd.CombinedOutput()
+	if runErr != nil {
+		return nil, fmt.Errorf("node eval failed: %w (%s)", runErr, string(out))
+	}
+	var env struct {
+		Value any `json:"value"`
+	}
+	if err := json.Unmarshal(out, &env); err != nil {
+		return nil, fmt.Errorf("decode node eval output %q: %w", string(out), err)
+	}
+	return env.Value, nil
 }
 
 func readE2EWSFrame(br *bufio.Reader) ([]byte, error) {
@@ -287,20 +675,25 @@ func TestE2ECompiledCLIToRelayLoopback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 1. Build real deskdrop CLI and deskdrop-server binaries.
+	// 1. Build real deskdrop CLI and deskdrop-server binaries (or reuse prebuilt binaries in CI Step 2).
 	serverBin := filepath.Join(tmp, "deskdrop-server")
 	cliBin := filepath.Join(tmp, "deskdrop")
-	for _, target := range []struct {
-		out string
-		pkg string
-	}{
-		{serverBin, "./cmd/server"},
-		{cliBin, "./cmd/deskdrop"},
-	} {
-		buildCmd := exec.Command("go", "build", "-o", target.out, target.pkg)
-		buildCmd.Dir = repoRoot
-		if out, err := buildCmd.CombinedOutput(); err != nil {
-			t.Fatalf("go build %s failed: %v\n%s", target.pkg, err, string(out))
+	if prebuiltDir := strings.TrimSpace(os.Getenv("DESKDROP_PREBUILT_BIN_DIR")); prebuiltDir != "" {
+		serverBin = filepath.Join(prebuiltDir, "deskdrop-server")
+		cliBin = filepath.Join(prebuiltDir, "deskdrop")
+	} else {
+		for _, target := range []struct {
+			out string
+			pkg string
+		}{
+			{serverBin, "./cmd/server"},
+			{cliBin, "./cmd/deskdrop"},
+		} {
+			buildCmd := exec.Command("go", "build", "-o", target.out, target.pkg)
+			buildCmd.Dir = repoRoot
+			if out, err := buildCmd.CombinedOutput(); err != nil {
+				t.Fatalf("go build %s failed: %v\n%s", target.pkg, err, string(out))
+			}
 		}
 	}
 
@@ -419,6 +812,15 @@ func TestE2ECompiledCLIToRelayLoopback(t *testing.T) {
 	if len(drop1.Report.Steps) != 1 || len(drop1.Report.Steps[0].Items) != 3 {
 		t.Fatalf("expected 3 extracted items in drop 1, got %+v", drop1.Report.Steps)
 	}
+	if (mockCDP.nodeBin != "" || os.Getenv("DESKDROP_REQUIRE_NODE") == "1") && !mockCDP.usedNodeJS.Load() {
+		t.Fatal("expected mockCDPServer to execute real generated JS runtime via node")
+	}
+	if drop1.Report.Steps[0].Fields["overall_status"] != "All Systems Operational" || drop1.Report.Steps[0].Fields["active_incidents"] != float64(0) {
+		t.Fatalf("unexpected drop 1 JS-extracted fields: %+v", drop1.Report.Steps[0].Fields)
+	}
+	if drop1.Report.Steps[0].Items[0]["uptime_pct"] != 99.98 {
+		t.Fatalf("unexpected drop 1 item[0] uptime_pct: %+v", drop1.Report.Steps[0].Items[0])
+	}
 
 	code, msgRaw := e2eAPIRequest(t, http.MethodGet, relayBase+"/v1/messages?for=e2e-agent", "e2e-agent-tok", nil)
 	if code != http.StatusOK || !strings.Contains(string(msgRaw), "service-status-board") {
@@ -456,6 +858,22 @@ func TestE2ECompiledCLIToRelayLoopback(t *testing.T) {
 	code, zipBytes := e2eAPIRequest(t, http.MethodGet, relayBase+"/v1/diagnostics/"+task2.DiagnosticID+"/bundle.zip", "e2e-agent-tok", nil)
 	if code != http.StatusOK || len(zipBytes) < 4 || string(zipBytes[:2]) != "PK" {
 		t.Fatalf("GET diagnostic zip = %d len=%d, want 200 PK zip", code, len(zipBytes))
+	}
+	zr, zerr := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
+	if zerr != nil {
+		t.Fatalf("invalid diagnostic zip: %v", zerr)
+	}
+	foundV2DOM := false
+	for _, zf := range zr.File {
+		if zf.Name == "dom.html" {
+			rc, _ := zf.Open()
+			domRaw, _ := io.ReadAll(rc)
+			_ = rc.Close()
+			foundV2DOM = strings.Contains(string(domRaw), "service-grid-v2")
+		}
+	}
+	if !foundV2DOM {
+		t.Fatal("expected diagnostic zip dom.html to contain scrubbed service-grid-v2 markup")
 	}
 
 	// 5. FileStore restart persistence: stop relay, start fresh deskdrop-server on same state.json, verify drop + diagnostic + tasks survive.
